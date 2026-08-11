@@ -1,0 +1,50 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-t', 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:$COMMIT_SHA',
+      '-t', 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:latest',
+      '.'
+    ]
+
+  # Push the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:$COMMIT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:latest']
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'spiked-ai-liveavatar'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+      - '--memory'
+      - '1Gi'
+      - '--cpu'
+      - '1'
+      - '--max-instances'
+      - '10'
+      - '--set-env-vars'
+      - 'SPIKED_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app,RECALL_WEBHOOK_URL=https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript,LIVEAVATAR_API_URL=https://api.liveavatar.com,LIVEAVATAR_AVATAR_ID=dd73ea75-1218-4ef3-92ce-606d5f7fbc0a,BOT_NAME=SpikedAI'
+      - '--set-secrets'
+      - 'DEEPGRAM_API=projects/409019309412/secrets/DEEPGRAM_API:latest,LIVEAVATAR_API_KEY=projects/409019309412/secrets/LIVEAVATAR_API_KEY:latest,RECALL_API_KEY=projects/409019309412/secrets/RECALL_API_KEY:latest,GEMINI_API_KEY=projects/409019309412/secrets/GEMINI_API_KEY:latest'
+
+images:
+  - 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
