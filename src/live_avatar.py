@@ -249,8 +249,10 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY:
    - Tone: Confident, helpful, concise, and professional.
 """
 
-    logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services}', Domain='{product_domain}', Bot='{bot_name}'")
+    preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services[:100]}...', Domain='{product_domain}', Bot='{bot_name}'")
     logger.info(f"[Prompt Debug] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
+    
     candidate_models = [
         preferred_model,
         "gemini-3.5-flash-lite",
@@ -308,9 +310,16 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY:
                         query_arg = fn_call.args.get("query", transcript)
                         logger.info(f"[Gemini Agent] >>> TOOL CALL (round {tool_round+1}): generate_system_answer(query='{query_arg}')")
                         
-                        # Execute RAG query
+                        # Execute RAG query against SpikedAI-Backend-One
                         rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
-                        logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
+                        
+                        # If RAG returned no matching docs, fallback to injected company product catalog
+                        if not rag_result or "No relevant information found" in rag_result or "could not retrieve" in rag_result:
+                            fallback_facts = f"Verified company knowledge: {company_name} offers {products_services}. Domain: {product_domain}."
+                            logger.info(f"[Gemini Agent] RAG empty -> Enhancing with user_configs: '{fallback_facts[:120]}...'")
+                            rag_result = f"{rag_result}\n\n{fallback_facts}"
+                        else:
+                            logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
                         
                         tool_response_part = genai.protos.Part(
                             function_response=genai.protos.FunctionResponse(
