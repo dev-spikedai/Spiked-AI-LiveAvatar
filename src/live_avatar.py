@@ -199,29 +199,38 @@ RULES OF ENGAGEMENT:
    - Never output markdown formatting or bullet points (your response will be spoken aloud by a video avatar).
 """
 
-    # Prefer Gemini 2.0 Flash for sub-200ms TTFT and state-of-the-art agentic tool calling
-    model_name = "gemini-2.0-flash"
-    try:
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": 200
-            },
-            system_instruction=system_instruction,
-            tools=[{"function_declarations": [rag_tool_def]}]
-        )
-    except Exception:
-        # Fallback to gemini-1.5-flash if 2.0 is not yet enabled on the key
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": 200
-            },
-            system_instruction=system_instruction,
-            tools=[{"function_declarations": [rag_tool_def]}]
-        )
+    # Primary: gemini-3.5-flash-lite for ultra-low latency and superior tool calling
+    preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    candidate_models = [
+        preferred_model,
+        "gemini-3.5-flash-lite",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
+
+    model = None
+    for m_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(
+                model_name=m_name,
+                generation_config={
+                    "temperature": 0.2,
+                    "max_output_tokens": 200
+                },
+                system_instruction=system_instruction,
+                tools=[{"function_declarations": [rag_tool_def]}]
+            )
+            break
+        except Exception as e:
+            logger.warning(f"Could not initialize model {m_name}: {e}")
+
+    if not model:
+        logger.error("Failed to initialize any Gemini model candidate")
+        return None
 
     # Build conversation context
     formatted_context = ""

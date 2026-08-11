@@ -38,7 +38,7 @@ steps:
       - '--max-instances'
       - '10'
       - '--set-env-vars'
-      - 'SPIKED_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app,RECALL_WEBHOOK_URL=https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript,LIVEAVATAR_API_URL=https://api.liveavatar.com,LIVEAVATAR_AVATAR_ID=dd73ea75-1218-4ef3-92ce-606d5f7fbc0a,BOT_NAME=SpikedAI'
+      - 'SPIKED_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app,RECALL_WEBHOOK_URL=https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript,LIVEAVATAR_API_URL=https://api.liveavatar.com,LIVEAVATAR_AVATAR_ID=dd73ea75-1218-4ef3-92ce-606d5f7fbc0a,BOT_NAME=SpikedAI,GEMINI_MODEL=gemini-3.5-flash-lite'
       - '--set-secrets'
       - 'DEEPGRAM_API=projects/409019309412/secrets/DEEPGRAM_API:latest,LIVEAVATAR_API_KEY=projects/409019309412/secrets/LIVEAVATAR_API_KEY:latest,RECALL_API_KEY=projects/409019309412/secrets/RECALL_API_KEY:latest,GEMINI_API_KEY=projects/409019309412/secrets/GEMINI_API_KEY:latest'
 
