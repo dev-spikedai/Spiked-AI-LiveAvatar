@@ -683,7 +683,14 @@ async def websocket_audio_endpoint(
                 """Forwards incoming binary audio frames from Recall browser to Deepgram."""
                 try:
                     while True:
-                        message = await websocket.receive()
+                        try:
+                            message = await websocket.receive()
+                        except (WebSocketDisconnect, RuntimeError):
+                            break
+
+                        if message.get("type") == "websocket.disconnect":
+                            break
+
                         if "bytes" in message and message["bytes"]:
                             await dg_ws.send(message["bytes"])
                         elif "text" in message:
@@ -694,7 +701,9 @@ async def websocket_audio_endpoint(
                                     token = cmd.get("token", token)
                             except Exception:
                                 pass
-                except (WebSocketDisconnect, asyncio.CancelledError):
+                except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError):
+                    pass
+                finally:
                     logger.info("[WS] Audio forwarding stream ended")
 
             async def receive_transcripts():
@@ -744,10 +753,17 @@ async def websocket_audio_endpoint(
                 except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
                     logger.info("[WS] Deepgram receiver stream closed")
 
-            await asyncio.gather(forward_audio(), receive_transcripts())
+            forward_task = asyncio.create_task(forward_audio())
+            receive_task = asyncio.create_task(receive_transcripts())
+            done, pending = await asyncio.wait(
+                [forward_task, receive_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
 
-    except WebSocketDisconnect:
-        logger.info(f"[WS] Client disconnected for session {session_id}")
+    except (WebSocketDisconnect, RuntimeError):
+        logger.info(f"[WS] Client disconnected cleanly for session {session_id}")
     except Exception as e:
         logger.error(f"[WS] WebSocket error: {e}", exc_info=True)
     finally:
