@@ -33,6 +33,7 @@ DEFAULT_CORE_KEYWORDS: List[str] = [
     "Recall",
     "Recall.ai",
     "Deepgram",
+    "Nova-3",
     "Nova-2",
     "Gemini",
     "SLA",
@@ -54,6 +55,8 @@ PHONETIC_REPLACEMENTS = [
     (re.compile(r"\blive avatar\b", re.IGNORECASE), "LiveAvatar"),
     (re.compile(r"\brecall ai\b", re.IGNORECASE), "Recall.ai"),
     (re.compile(r"\bdeep gram\b", re.IGNORECASE), "Deepgram"),
+    (re.compile(r"\bnova 3\b", re.IGNORECASE), "Nova-3"),
+    (re.compile(r"\bnova three\b", re.IGNORECASE), "Nova-3"),
     (re.compile(r"\bnova 2\b", re.IGNORECASE), "Nova-2"),
     (re.compile(r"\bnova two\b", re.IGNORECASE), "Nova-2"),
 ]

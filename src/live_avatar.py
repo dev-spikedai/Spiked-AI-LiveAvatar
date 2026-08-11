@@ -792,7 +792,7 @@ async def websocket_audio_endpoint(
     # MediaRecorder in avatar.js sends WebM containerized Opus audio.
     # Omit encoding & sample_rate so Deepgram automatically detects the container!
     deepgram_params = {
-        "model": "nova-2",
+        "model": "nova-3",
         "diarize": "true",
         "smart_format": "true",
         "interim_results": "false",
