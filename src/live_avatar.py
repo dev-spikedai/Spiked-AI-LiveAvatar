@@ -499,13 +499,18 @@ async def _deploy_live_avatar_bot(
         bot_id = bot_data.get("id")
         _ACTIVE_RUNS[run_id]["bot_id"] = bot_id
 
+        status_changes = bot_data.get("status_changes")
+        latest_status = "created"
+        if isinstance(status_changes, list) and len(status_changes) > 0 and isinstance(status_changes[-1], dict):
+            latest_status = status_changes[-1].get("code", "created")
+
         return {
             "id": bot_id,
             "bot_id": bot_id,
             "run_id": run_id,
             "liveavatar_session_id": avatar_session.get("session_id"),
             "avatar_page_url": avatar_page_url,
-            "status": bot_data.get("status_changes", [{}])[-1].get("code", "created")
+            "status": latest_status
         }
 
 @app.post("/start")
@@ -651,7 +656,13 @@ async def websocket_audio_endpoint(
     conversation_history: List[Dict[str, str]] = []
 
     try:
-        async with websockets.connect(deepgram_ws_url, extra_headers=deepgram_headers) as dg_ws:
+        # websockets >= 13.0 uses 'additional_headers', older versions use 'extra_headers'
+        try:
+            ws_client_cm = websockets.connect(deepgram_ws_url, additional_headers=deepgram_headers)
+        except TypeError:
+            ws_client_cm = websockets.connect(deepgram_ws_url, extra_headers=deepgram_headers)
+
+        async with ws_client_cm as dg_ws:
             logger.info("[WS] Successfully connected to Deepgram Live Streaming STT")
 
             async def forward_audio():
