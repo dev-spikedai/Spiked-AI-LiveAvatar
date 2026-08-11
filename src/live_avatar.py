@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import asyncio
 import logging
 import uuid
@@ -8,10 +9,10 @@ from urllib.parse import urlencode
 
 import httpx
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request, Header, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -29,6 +30,7 @@ logger = logging.getLogger("LiveAvatar-Spiked")
 # Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API") or os.getenv("DEEPGRAM_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://us-west-2.recall.ai")
@@ -38,9 +40,12 @@ RECALL_WEBHOOK_URL = os.getenv(
 )
 LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
-LIVEAVATAR_AVATAR_ID = os.getenv("LIVEAVATAR_AVATAR_ID", "")
+LIVEAVATAR_AVATAR_ID = os.getenv("LIVEAVATAR_AVATAR_ID", "dd73ea75-1218-4ef3-92ce-606d5f7fbc0a")
 LIVEAVATAR_SANDBOX = os.getenv("LIVEAVATAR_SANDBOX", "false").lower() == "true"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL", 
+    "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
+)
 
 # Configure Gemini Client
 if GEMINI_API_KEY:
@@ -63,6 +68,22 @@ app.add_middleware(
 _ACTIVE_RUNS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
+# Helper: Extract User ID from Supabase JWT
+# ---------------------------------------------------------------------------
+
+def extract_user_id_from_jwt(token: str) -> str:
+    """Extracts the 'sub' claim (user_id) from Supabase JWT without needing secret."""
+    try:
+        parts = token.strip().replace("Bearer ", "").split(".")
+        if len(parts) >= 2:
+            padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+            return payload.get("sub") or payload.get("user_id") or "unknown_user"
+    except Exception as e:
+        logger.warning(f"Could not parse user_id from JWT: {e}")
+    return "unknown_user"
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 
@@ -74,8 +95,8 @@ class CreateLiveAvatarRequest(BaseModel):
 
 class CreateBotWithLiveAvatarRequest(BaseModel):
     meeting_url: str = Field(..., description="Zoom, Google Meet, or MS Teams URL")
-    user_id: str = Field(..., description="Supabase user ID")
-    token: str = Field(..., description="User's Supabase JWT access token for document RAG")
+    user_id: Optional[str] = Field(default=None, description="Supabase user ID")
+    token: Optional[str] = Field(default=None, description="User's Supabase JWT access token for document RAG")
     client_id: Optional[str] = Field(default=None, description="Client/Company scope identifier")
     bot_name: str = Field(default="SpikedAI", description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
@@ -131,7 +152,6 @@ async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[s
                 logger.error(f"[RAG] Failed with status {response.status_code}: {response.text}")
                 return "I could not retrieve the relevant company documents for this question."
             
-            # Read streaming response or text
             full_text = ""
             async for line in response.aiter_lines():
                 if line.startswith("data:"):
@@ -149,7 +169,7 @@ async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[s
         return "An error occurred while accessing the company knowledge base."
 
 # ---------------------------------------------------------------------------
-# Gemini 2.0 Flash Agent with Dynamic RAG Tool Calling
+# Gemini Agent with Dynamic RAG Tool Calling
 # ---------------------------------------------------------------------------
 
 async def process_transcript_with_gemini(
@@ -160,7 +180,7 @@ async def process_transcript_with_gemini(
     client_id: Optional[str] = None
 ) -> Optional[str]:
     """
-    Evaluates transcript turn with Gemini 2.0 Flash equipped with the RAG tool.
+    Evaluates transcript turn with Gemini 3.5 Flash Lite equipped with the RAG tool.
     Returns the final answer text to speak, or None if the bot should stay silent.
     """
     if not GEMINI_API_KEY:
@@ -199,7 +219,6 @@ RULES OF ENGAGEMENT:
    - Never output markdown formatting or bullet points (your response will be spoken aloud by a video avatar).
 """
 
-    # Primary: gemini-3.5-flash-lite for ultra-low latency and superior tool calling
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     candidate_models = [
         preferred_model,
@@ -208,7 +227,6 @@ RULES OF ENGAGEMENT:
         "gemini-2.0-flash",
         "gemini-1.5-flash"
     ]
-    # Deduplicate while preserving order
     seen = set()
     candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
 
@@ -242,18 +260,16 @@ RULES OF ENGAGEMENT:
         chat = model.start_chat(enable_automatic_function_calling=False)
         response = await asyncio.to_thread(chat.send_message, formatted_context)
         
-        # Check if model requested a tool call
         if response.candidates and response.candidates[0].content.parts:
             for part in response.candidates[0].content.parts:
                 fn_call = getattr(part, "function_call", None)
                 if fn_call and fn_call.name == "generate_system_answer":
                     query_arg = fn_call.args.get("query", transcript)
-                    logger.info(f"[Gemini 2.0] Tool call triggered: generate_system_answer(query='{query_arg}')")
+                    logger.info(f"[Gemini Agent] Tool call triggered: generate_system_answer(query='{query_arg}')")
                     
                     # Execute RAG query against SpikedAI-Backend-One
                     rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
                     
-                    # Feed tool output back to Gemini for final spoken formulation
                     tool_response_part = genai.protos.Part(
                         function_response=genai.protos.FunctionResponse(
                             name="generate_system_answer",
@@ -267,14 +283,13 @@ RULES OF ENGAGEMENT:
                         return None
                     return reply_text
 
-        # If direct text was returned without tool calling
         reply_text = response.text.strip()
         if reply_text == "[SILENT]" or not reply_text:
             return None
         return reply_text
 
     except Exception as e:
-        logger.error(f"[Gemini 2.0] Inference error: {e}", exc_info=True)
+        logger.error(f"[Gemini Agent] Inference error: {e}", exc_info=True)
         return None
 
 # ---------------------------------------------------------------------------
@@ -288,9 +303,11 @@ def health_check():
         "service": "LiveAvatar-Spiked",
         "deepgram_configured": bool(DEEPGRAM_API_KEY),
         "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_model": GEMINI_MODEL,
         "recall_configured": bool(RECALL_API_KEY),
         "spiked_backend_url": SPIKED_BACKEND_URL,
-        "recall_webhook_url": RECALL_WEBHOOK_URL
+        "recall_webhook_url": RECALL_WEBHOOK_URL,
+        "public_base_url": PUBLIC_BASE_URL
     }
 
 @app.get("/api/runs/{run_id}/credentials")
@@ -366,50 +383,57 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             "session_token": session_token
         }
 
-@app.post("/create-live-avatar-bot")
-async def create_live_avatar_bot(payload: CreateBotWithLiveAvatarRequest):
-    """
-    Creates a full LiveAvatar Bot in Recall.ai:
-    1. Initializes LiveAvatar LITE session ($0.10/min).
-    2. Registers the run with local registry.
-    3. Deploys Recall bot with Output Media camera pointing to self-hosted avatar.html.
-    4. Sets realtime_endpoints webhook to recall_backend to preserve all dashboard features.
-    5. Injects metadata: { user_id, client_id } for fail-safe webhook user resolution.
-    """
+async def _deploy_live_avatar_bot(
+    meeting_url: str,
+    token: str,
+    user_id: Optional[str] = None,
+    client_id: Optional[str] = None,
+    bot_name: str = "SpikedAI",
+    avatar_id: Optional[str] = None,
+    request: Optional[Request] = None
+) -> Dict[str, Any]:
+    """Internal core method to deploy the LiveAvatar Bot into a meeting."""
     if not RECALL_API_KEY:
         raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
 
+    if not user_id:
+        user_id = extract_user_id_from_jwt(token)
+
     run_id = f"run_{uuid.uuid4().hex[:12]}"
 
-    # 1. Create LiveAvatar session
+    # 1. Create LiveAvatar LITE Session ($0.10/min)
     avatar_session = await create_avatar(CreateLiveAvatarRequest(
-        avatar_id=payload.avatar_id,
+        avatar_id=avatar_id,
         mode="LITE"
     ))
 
     # 2. Store session credentials for Recall's avatar.html
     _ACTIVE_RUNS[run_id] = {
         "run_id": run_id,
-        "user_id": payload.user_id,
-        "client_id": payload.client_id,
-        "token": payload.token,
+        "user_id": user_id,
+        "client_id": client_id,
+        "token": token,
         "session_id": avatar_session.get("session_id"),
         "livekit_url": avatar_session.get("livekit_url"),
         "livekit_token": avatar_session.get("livekit_token"),
     }
 
     # 3. Build Output Media URL
+    base_url = PUBLIC_BASE_URL.rstrip('/')
+    if request and "localhost" in base_url and not "localhost" in str(request.base_url):
+        base_url = str(request.base_url).rstrip('/')
+
     avatar_page_url = (
-        f"{PUBLIC_BASE_URL.rstrip('/')}/avatar.html"
+        f"{base_url}/avatar.html"
         f"?run={run_id}"
-        f"&token={payload.token}"
-        f"&client_id={payload.client_id or ''}"
+        f"&token={token}"
+        f"&client_id={client_id or ''}"
     )
 
-    # 4. Recall Bot Payload with Dual-Track Webhook and Metadata
+    # 4. Recall Bot Payload with Output Media + Dual-Track Webhook
     recall_payload = {
-        "meeting_url": payload.meeting_url,
-        "bot_name": payload.bot_name,
+        "meeting_url": meeting_url,
+        "bot_name": bot_name,
         "variant": {
             "zoom": "web_4_core",
             "google_meet": "web_4_core",
@@ -424,8 +448,8 @@ async def create_live_avatar_bot(payload: CreateBotWithLiveAvatarRequest):
             }
         },
         "metadata": {
-            "user_id": payload.user_id,
-            "client_id": payload.client_id or ""
+            "user_id": user_id,
+            "client_id": client_id or ""
         },
         "recording_config": {
             "retention": {
@@ -474,13 +498,113 @@ async def create_live_avatar_bot(payload: CreateBotWithLiveAvatarRequest):
         _ACTIVE_RUNS[run_id]["bot_id"] = bot_id
 
         return {
-            "success": True,
+            "id": bot_id,
             "bot_id": bot_id,
             "run_id": run_id,
             "liveavatar_session_id": avatar_session.get("session_id"),
             "avatar_page_url": avatar_page_url,
             "status": bot_data.get("status_changes", [{}])[-1].get("code", "created")
         }
+
+@app.post("/start")
+async def start_bot_endpoint(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Unified Start Endpoint compatible with Frontend recallBotService.ts:
+    Accepts both JSON and Multipart/FormData payloads.
+    """
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "").strip()
+
+    meeting_url = ""
+    client_id = None
+    bot_name = "SpikedAI"
+    avatar_id = None
+
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        meeting_url = body.get("meeting_url", "")
+        client_id = body.get("client_id")
+        bot_name = body.get("bot_name", "SpikedAI")
+        avatar_id = body.get("avatar_id")
+        if not token:
+            token = body.get("token", "")
+    else:
+        form = await request.form()
+        meeting_url = form.get("meeting_url", "")
+        client_id = form.get("client_id")
+        bot_name = form.get("bot_name", "SpikedAI")
+        avatar_id = form.get("avatar_id")
+        if not token:
+            token = form.get("token", "")
+
+    if not meeting_url:
+        raise HTTPException(status_code=400, detail="meeting_url is required")
+
+    return await _deploy_live_avatar_bot(
+        meeting_url=meeting_url,
+        token=token,
+        client_id=client_id,
+        bot_name=bot_name,
+        avatar_id=avatar_id,
+        request=request
+    )
+
+@app.post("/create-live-avatar-bot")
+async def create_live_avatar_bot(
+    payload: CreateBotWithLiveAvatarRequest,
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
+    """Explicit JSON endpoint to deploy a LiveAvatar bot."""
+    token = payload.token
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "").strip()
+
+    return await _deploy_live_avatar_bot(
+        meeting_url=payload.meeting_url,
+        token=token or "",
+        user_id=payload.user_id,
+        client_id=payload.client_id,
+        bot_name=payload.bot_name,
+        avatar_id=payload.avatar_id,
+        request=request
+    )
+
+@app.post("/remove-bot/{bot_id}")
+@app.post("/leave-call/{bot_id}")
+async def leave_call_endpoint(bot_id: str):
+    """Instructs Recall bot to leave meeting call immediately."""
+    if not RECALL_API_KEY:
+        raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
+
+    headers = {"Authorization": f"Token {RECALL_API_KEY}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/{bot_id}/leave_call/",
+            headers=headers
+        )
+        return {"ok": True, "status": resp.status_code}
+
+@app.get("/bot/{bot_id}")
+async def get_bot_endpoint(bot_id: str):
+    """Retrieves live status of a bot from Recall API."""
+    if not RECALL_API_KEY:
+        raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
+
+    headers = {"Authorization": f"Token {RECALL_API_KEY}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/{bot_id}/",
+            headers=headers
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return resp.json()
 
 # ---------------------------------------------------------------------------
 # WebSocket Audio Ingress & Real-Time Orchestration Pipeline
@@ -496,7 +620,7 @@ async def websocket_audio_endpoint(
 ):
     """
     Receives raw meeting audio stream from avatar.html (inside Recall headless browser).
-    Pipes audio to Deepgram Streaming STT -> Detects Speech Turns -> Evaluates with Gemini 2.0 Flash
+    Pipes audio to Deepgram Streaming STT -> Detects Speech Turns -> Evaluates with Gemini 3.5 Flash Lite
     -> Executes SpikedAI Document RAG -> Sends Avatar Speak instructions back to avatar.html.
     """
     await websocket.accept()
@@ -564,7 +688,6 @@ async def websocket_audio_endpoint(
                                     
                                     logger.info(f"[Deepgram] Speaker {speaker_id}: '{transcript_text}'")
                                     
-                                    # Process turn with Gemini 2.0 Flash & RAG Tool
                                     answer_to_speak = await process_transcript_with_gemini(
                                         transcript=transcript_text,
                                         speaker=speaker_id,
@@ -578,7 +701,6 @@ async def websocket_audio_endpoint(
                                         "text": transcript_text
                                     })
                                     
-                                    # If Gemini formulated an answer to speak
                                     if answer_to_speak:
                                         logger.info(f"[Agent] Speaking response: '{answer_to_speak}'")
                                         conversation_history.append({
@@ -586,7 +708,6 @@ async def websocket_audio_endpoint(
                                             "text": answer_to_speak
                                         })
                                         
-                                        # Send speak instruction to avatar.html
                                         await websocket.send_json({
                                             "type": "avatar_speak",
                                             "text": answer_to_speak,
@@ -596,7 +717,6 @@ async def websocket_audio_endpoint(
                 except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
                     logger.info("[WS] Deepgram receiver stream closed")
 
-            # Run audio forwarding and transcript processing concurrently
             await asyncio.gather(forward_audio(), receive_transcripts())
 
     except WebSocketDisconnect:
