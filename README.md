@@ -1,4 +1,4 @@
-# Spiked-AI-LiveAvatar
+# Spiked-AI-LiveAvatar.
 
 Real-time Live Avatar Orchestrator for SpikedAI.
 
