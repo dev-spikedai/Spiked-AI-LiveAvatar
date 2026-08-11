@@ -5,7 +5,9 @@ import asyncio
 import logging
 import uuid
 from typing import Optional, List, Dict, Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
+
+from src.supabase_client import get_user_keywords_and_products, correct_stt_text
 
 import httpx
 import websockets
@@ -177,51 +179,70 @@ async def process_transcript_with_gemini(
     speaker: str,
     conversation_history: List[Dict[str, str]],
     auth_token: str,
-    client_id: Optional[str] = None
+    client_id: Optional[str] = None,
+    user_context: Optional[Dict[str, Any]] = None
 ) -> Optional[str]:
     """
     Evaluates transcript turn with Gemini 3.5 Flash Lite equipped with the RAG tool.
+    Uses SOTA conversational meeting bot dialogue policy with intelligent intent classification.
     Returns the final answer text to speak, or None if the bot should stay silent.
     """
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API key is missing")
         return None
 
+    # Extract dynamic company context
+    ctx = user_context or {}
+    company_name = ctx.get("company_name", "SpikedAI")
+    products_services = ctx.get("products_services", "")
+    bot_name = ctx.get("bot_name", "SpikedAI")
+    product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
+
     # Define tool declaration for Gemini
     rag_tool_def = {
         "name": "generate_system_answer",
-        "description": "Retrieves verified company knowledge, pricing, SLAs, technical specs, and seller persona guidelines from the user's document RAG database.",
+        "description": f"Retrieves verified knowledge, pricing, architecture, SLAs, product features, and seller persona guidelines for {company_name} from the company document RAG database.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "query": {
                     "type": "STRING",
-                    "description": "The specific question or topic to look up in the company knowledge base."
+                    "description": f"The specific question or topic to look up in {company_name}'s knowledge base."
                 }
             },
             "required": ["query"]
         }
     }
 
-    system_instruction = """
-You are SpikedAI, a live interactive AI meeting assistant and sales representative avatar.
-You are a participant in this meeting. You can hear what everyone says via real-time speaker diarization.
+    system_instruction = f"""
+You are {bot_name}, a live interactive AI meeting participant and sales engineer representing {company_name}.
+You are actively listening to this live call with real-time speaker diarization.
 
-RULES OF ENGAGEMENT:
-1. WHEN TO SPEAK:
-   - ALWAYS respond to greetings, hellos, questions directed at you, or any product/business question.
-   - If someone says "hello", "hey", "hi", "can you hear me", or addresses you in any way -> RESPOND warmly.
-   - ONLY output "[SILENT]" if the speakers are clearly having a private side-conversation not involving you at all.
-   - When in doubt, RESPOND rather than staying silent. You are a helpful meeting participant.
+COMPANY BACKGROUND & OFFERINGS:
+- Company: {company_name}
+- Domain & Products: {products_services or product_domain or "Enterprise AI Solutions & Meeting Intelligence"}
+
+RULES OF ENGAGEMENT & DIALOGUE POLICY:
+1. INTENT CLASSIFICATION & DECISION TO SPEAK:
+   - PRODUCT / PRICING / TECHNICAL / KNOWLEDGE QUESTIONS:
+     When any attendee asks about {company_name}'s features, pricing, architecture, roadmap, security, SLAs, integration, or raises objections -> You MUST call the `generate_system_answer` tool to retrieve verified facts from the company knowledge base.
+   - CASUAL GREETINGS & SOCIAL INTERACTION:
+     When an attendee greets you (e.g., "Hello {bot_name}", "Hey", "How are you?"), introduces someone, or asks social/meta questions ("Can you hear me?", "Who are you?", "Thanks for joining") -> Respond DIRECTLY, WARMLY, and CONVERSATIONALLY without calling tools.
+   - HUMAN SIDE-CONVERSATIONS & INTERNAL DISCUSSIONS:
+     When participants are talking to each other about their own internal matters, screen sharing, or not addressing {bot_name}/{company_name} -> Respond with the exact string: "[SILENT]".
+   - BACKCHANNELS & FILLERS:
+     Ignore short filler words or simple acknowledgments ("yeah", "okay", "cool", "right", "uh-huh") by outputting "[SILENT]".
+
 2. USING THE RAG TOOL:
-   - For questions about company offerings, pricing, architecture, SLAs, product features, or onboarding -> call `generate_system_answer`.
-   - If the tool returns "No relevant information found" or similar, respond honestly: "I don't have specific information on that topic in my knowledge base, but I'd be happy to help with anything else."
-   - Do NOT call the tool again if it already returned no results for the same query.
-   - For casual greetings or social pleasantries, respond conversationally without calling tools.
-3. OUTPUT STYLE:
-   - Keep answers natural, confident, concise, and direct (max 2 to 4 sentences).
-   - Never output markdown formatting or bullet points (your response will be spoken aloud by a video avatar).
-   - Always produce a plain text response. Never produce a function call without accompanying text.
+   - Pass a concise, self-contained search query to `generate_system_answer`.
+   - If the tool returns "No relevant information found", summarize politely: "I don't have specific details on that in our knowledge base yet, but I'd be glad to check with the team."
+   - Never loop or call the tool more than once for the same question.
+
+3. SPOKEN DELIVERY & CADENCE:
+   - Your response will be spoken aloud by a live avatar in a video meeting.
+   - Maximum 1 to 3 punchy, natural sentences.
+   - NO markdown, NO bullet points, NO asterisks, NO numbered lists.
+   - Tone: Confident, helpful, concise, and professional.
 """
 
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
@@ -720,6 +741,14 @@ async def websocket_audio_endpoint(
         await websocket.close()
         return
 
+    user_id = extract_user_id_from_jwt(token)
+    user_context = await get_user_keywords_and_products(
+        user_id=user_id,
+        client_id=client_id,
+        auth_token=token
+    )
+    user_keywords = user_context.get("keywords", [])
+
     # Deepgram WebSocket Live Transcription URL
     # MediaRecorder in avatar.js sends WebM containerized Opus audio.
     # Omit encoding & sample_rate so Deepgram automatically detects the container!
@@ -732,11 +761,20 @@ async def websocket_audio_endpoint(
         "punctuate": "true"
     }
     deepgram_ws_url = f"wss://api.deepgram.com/v1/listen?{urlencode(deepgram_params)}"
+    
+    # Inject Boosted Keywords into Deepgram query string
+    if user_keywords:
+        boosted_kw_params = [f"keywords={quote(kw)}:5" for kw in user_keywords[:50] if kw]
+        if boosted_kw_params:
+            deepgram_ws_url = f"{deepgram_ws_url}&{'&'.join(boosted_kw_params)}"
+            logger.info(f"[Deepgram] Injected {len(boosted_kw_params)} boosted keywords into STT URL")
+
     deepgram_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
     conversation_history: List[Dict[str, str]] = []
     chunk_count = 0
     total_bytes = 0
+    last_speak_timestamp = 0.0
 
     try:
         # websockets >= 13.0 uses 'additional_headers', older versions use 'extra_headers'
@@ -782,6 +820,7 @@ async def websocket_audio_endpoint(
 
             async def receive_transcripts():
                 """Receives transcribed turns from Deepgram, routes to Gemini + RAG, and triggers avatar speak."""
+                nonlocal last_speak_timestamp
                 try:
                     while True:
                         raw_msg = await dg_ws.recv()
@@ -792,19 +831,30 @@ async def websocket_audio_endpoint(
                             channel = data.get("channel", {})
                             alternatives = channel.get("alternatives", [])
                             if alternatives:
-                                transcript_text = alternatives[0].get("transcript", "").strip()
-                                if transcript_text:
+                                raw_transcript = alternatives[0].get("transcript", "").strip()
+                                if raw_transcript:
                                     words = alternatives[0].get("words", [])
                                     speaker_id = str(words[0].get("speaker", "0")) if words else "0"
                                     
-                                    logger.info(f"[Deepgram STT] Speaker {speaker_id} Turn: '{transcript_text}'")
+                                    # Apply phonetic & keyword correction
+                                    transcript_text = correct_stt_text(raw_transcript, user_keywords)
+                                    logger.info(f"[Deepgram STT] Speaker {speaker_id} Turn: '{raw_transcript}' -> Corrected: '{transcript_text}'")
                                     
+                                    # Barge-in: If user speaks within 6s of avatar speaking, notify avatar to interrupt
+                                    if time.time() - last_speak_timestamp < 6.0:
+                                        logger.info("[Barge-In] User spoke while avatar was active — sending interrupt")
+                                        await websocket.send_json({
+                                            "type": "avatar_interrupt",
+                                            "session_id": session_id
+                                        })
+
                                     answer_to_speak = await process_transcript_with_gemini(
                                         transcript=transcript_text,
                                         speaker=speaker_id,
                                         conversation_history=conversation_history,
                                         auth_token=token or "",
-                                        client_id=client_id
+                                        client_id=client_id,
+                                        user_context=user_context
                                     )
                                     
                                     conversation_history.append({
@@ -815,10 +865,11 @@ async def websocket_audio_endpoint(
                                     if answer_to_speak:
                                         logger.info(f"[Agent] >>> Sending avatar_speak instruction: '{answer_to_speak}'")
                                         conversation_history.append({
-                                            "speaker": "SpikedAI Avatar",
+                                            "speaker": user_context.get("bot_name", "SpikedAI"),
                                             "text": answer_to_speak
                                         })
                                         
+                                        last_speak_timestamp = time.time()
                                         await websocket.send_json({
                                             "type": "avatar_speak",
                                             "text": answer_to_speak,

@@ -55,11 +55,25 @@
       }
     });
 
+    let isAvatarSpeaking = false;
     const decoder = new TextDecoder();
     room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
       try {
         const decoded = JSON.parse(decoder.decode(payload));
+        const eventType = decoded.event_type || decoded.type;
         console.log(`[LiveKit DataReceived] topic=${topic}:`, decoded);
+        
+        if (eventType === "avatar.speak_started") {
+          isAvatarSpeaking = true;
+          updateStatus("Avatar Speaking", "active");
+        } else if (eventType === "avatar.speak_ended") {
+          isAvatarSpeaking = false;
+          updateStatus("Listening...", "active");
+        } else if (eventType === "user.speak_started" && isAvatarSpeaking) {
+          console.log("[avatar.js] User interrupted avatar -> sending avatar.interrupt");
+          sendLiveAvatarCommand("avatar.interrupt");
+          isAvatarSpeaking = false;
+        }
       } catch {
         console.log(`[LiveKit DataReceived] topic=${topic} (raw)`);
       }
@@ -157,10 +171,21 @@
         
         if (data.type === "avatar_speak" && data.text) {
           console.log(`[avatar.js] >>> Publishing avatar.speak_text: "${data.text}"`);
+          isAvatarSpeaking = true;
           sendLiveAvatarCommand("avatar.speak_text", { text: data.text });
 
           updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
-          setTimeout(() => updateStatus("Listening...", "active"), 4000);
+          setTimeout(() => {
+            if (isAvatarSpeaking) {
+              isAvatarSpeaking = false;
+              updateStatus("Listening...", "active");
+            }
+          }, 6000);
+        } else if (data.type === "avatar_interrupt") {
+          console.log("[avatar.js] >>> Received avatar_interrupt command from backend");
+          sendLiveAvatarCommand("avatar.interrupt");
+          isAvatarSpeaking = false;
+          updateStatus("Listening...", "active");
         }
       } catch (err) {
         console.error("Error processing WS message:", err);
