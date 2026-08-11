@@ -352,11 +352,12 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             json=token_payload
         )
         
-        if token_res.status_code != 200:
+        if token_res.status_code not in (200, 201):
             logger.error(f"LiveAvatar token creation failed: {token_res.text}")
             raise HTTPException(status_code=token_res.status_code, detail=token_res.text)
         
-        token_data = token_res.json().get("data", {})
+        token_json = token_res.json()
+        token_data = token_json.get("data", {}) if isinstance(token_json.get("data"), dict) else token_json
         session_token = token_data.get("session_token")
         
         start_res = await client.post(
@@ -368,11 +369,12 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             json={}
         )
         
-        if start_res.status_code != 200:
+        if start_res.status_code not in (200, 201):
             logger.error(f"LiveAvatar start session failed: {start_res.text}")
             raise HTTPException(status_code=start_res.status_code, detail=start_res.text)
             
-        start_data = start_res.json().get("data", {})
+        start_json = start_res.json()
+        start_data = start_json.get("data", {}) if isinstance(start_json.get("data"), dict) else start_json
         
         return {
             "mode": payload.mode,
