@@ -41,18 +41,32 @@
     });
 
     room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+      console.log(`[LiveKit] Track subscribed: ${track.kind}`);
       if (track.kind === "video") {
         track.attach(videoEl);
         videoEl.play().catch(console.warn);
+        updateStatus("Avatar Video Rendering", "active");
       }
       if (track.kind === "audio") {
         const audioEl = track.attach();
         audioEl.autoplay = true;
         document.body.appendChild(audioEl);
+        console.log("[LiveKit] Avatar audio track attached to DOM");
+      }
+    });
+
+    const decoder = new TextDecoder();
+    room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+      try {
+        const decoded = JSON.parse(decoder.decode(payload));
+        console.log(`[LiveKit DataReceived] topic=${topic}:`, decoded);
+      } catch {
+        console.log(`[LiveKit DataReceived] topic=${topic} (raw)`);
       }
     });
 
     await room.connect(livekitUrl, livekitToken);
+    console.log("[LiveKit] Connected to room successfully");
     updateStatus("Live Avatar Connected", "active");
 
     // 3. Capture In-Meeting Audio (Recall auto-grants getUserMedia)
@@ -70,9 +84,12 @@
     // 4. Open Real-Time WebSocket to LiveAvatar-Spiked Backend
     const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${wsProtocol}//${location.host}/ws/audio/${sessionId}?token=${encodeURIComponent(token)}&client_id=${encodeURIComponent(clientId)}&bot_id=${encodeURIComponent(runId)}`;
+    console.log(`[WS] Connecting to backend: ${wsUrl}`);
     const ws = new WebSocket(wsUrl);
 
+    let sentChunks = 0;
     ws.onopen = () => {
+      console.log("[WS] WebSocket connection established");
       updateStatus("Audio Stream Live", "active");
       
       // Start recording raw audio frames and sending to WebSocket
@@ -82,11 +99,16 @@
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+          sentChunks++;
+          if (sentChunks % 30 === 0) {
+            console.log(`[MediaRecorder] Sent ${sentChunks} audio chunks (${event.data.size} bytes/chunk)`);
+          }
           ws.send(event.data);
         }
       };
 
       mediaRecorder.start(100); // 100ms chunks for minimum latency
+      console.log("[MediaRecorder] Started recording at 100ms interval");
     };
 
     // 5. Receive "avatar_speak" commands from Gemini/RAG and speak in meeting
@@ -94,12 +116,15 @@
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        console.log("[WS] Received message from backend:", data);
         
         if (data.type === "avatar_speak" && data.text) {
+          console.log(`[avatar.js] >>> Publishing avatar.speak_text: "${data.text}"`);
           const command = {
             event_id: crypto.randomUUID(),
             event_type: "avatar.speak_text",
             session_id: sessionId,
+            source_event_id: null,
             text: data.text,
             payload: {
               text: data.text,
@@ -112,8 +137,8 @@
             topic: "agent-control",
           });
 
-          updateStatus("Avatar Speaking...", "active");
-          setTimeout(() => updateStatus("Listening...", "active"), 3000);
+          updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
+          setTimeout(() => updateStatus("Listening...", "active"), 4000);
         }
       } catch (err) {
         console.error("Error processing WS message:", err);
@@ -121,8 +146,13 @@
     };
 
     ws.onerror = (err) => {
-      console.error("WebSocket error:", err);
+      console.error("[WS] WebSocket error:", err);
       updateStatus("Audio WS Error", "error");
+    };
+
+    ws.onclose = () => {
+      console.log("[WS] WebSocket connection closed");
+      updateStatus("Audio Stream Closed", "pending");
     };
 
   } catch (err) {

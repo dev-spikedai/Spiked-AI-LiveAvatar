@@ -256,6 +256,8 @@ RULES OF ENGAGEMENT:
         formatted_context += f"Speaker {turn.get('speaker', 'Participant')}: {turn.get('text', '')}\n"
     formatted_context += f"Speaker {speaker}: {transcript}\n"
 
+    logger.info(f"[Gemini Agent] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
+
     try:
         chat = model.start_chat(enable_automatic_function_calling=False)
         response = await asyncio.to_thread(chat.send_message, formatted_context)
@@ -265,10 +267,11 @@ RULES OF ENGAGEMENT:
                 fn_call = getattr(part, "function_call", None)
                 if fn_call and fn_call.name == "generate_system_answer":
                     query_arg = fn_call.args.get("query", transcript)
-                    logger.info(f"[Gemini Agent] Tool call triggered: generate_system_answer(query='{query_arg}')")
+                    logger.info(f"[Gemini Agent] >>> TOOL CALL: generate_system_answer(query='{query_arg}')")
                     
                     # Execute RAG query against SpikedAI-Backend-One
                     rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
+                    logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
                     
                     tool_response_part = genai.protos.Part(
                         function_response=genai.protos.FunctionResponse(
@@ -278,14 +281,20 @@ RULES OF ENGAGEMENT:
                     )
                     final_res = await asyncio.to_thread(chat.send_message, tool_response_part)
                     reply_text = final_res.text.strip()
+                    logger.info(f"[Gemini Agent] Post-tool reply: '{reply_text}'")
                     
                     if reply_text == "[SILENT]" or not reply_text:
+                        logger.info("[Gemini Agent] Model chose [SILENT] after tool lookup")
                         return None
+                    logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
                     return reply_text
 
         reply_text = response.text.strip()
+        logger.info(f"[Gemini Agent] Direct reply: '{reply_text}'")
         if reply_text == "[SILENT]" or not reply_text:
+            logger.info("[Gemini Agent] Model chose to remain silent ([SILENT])")
             return None
+        logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
         return reply_text
 
     except Exception as e:
@@ -654,20 +663,22 @@ async def websocket_audio_endpoint(
         return
 
     # Deepgram WebSocket Live Transcription URL
+    # MediaRecorder in avatar.js sends WebM containerized Opus audio.
+    # Omit encoding & sample_rate so Deepgram automatically detects the container!
     deepgram_params = {
         "model": "nova-2",
         "diarize": "true",
         "smart_format": "true",
         "interim_results": "false",
         "endpointing": "300",
-        "punctuate": "true",
-        "encoding": "linear16",
-        "sample_rate": "16000"
+        "punctuate": "true"
     }
     deepgram_ws_url = f"wss://api.deepgram.com/v1/listen?{urlencode(deepgram_params)}"
     deepgram_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
     conversation_history: List[Dict[str, str]] = []
+    chunk_count = 0
+    total_bytes = 0
 
     try:
         # websockets >= 13.0 uses 'additional_headers', older versions use 'extra_headers'
@@ -677,10 +688,11 @@ async def websocket_audio_endpoint(
             ws_client_cm = websockets.connect(deepgram_ws_url, extra_headers=deepgram_headers)
 
         async with ws_client_cm as dg_ws:
-            logger.info("[WS] Successfully connected to Deepgram Live Streaming STT")
+            logger.info(f"[WS] Successfully connected to Deepgram Live Streaming STT for session {session_id}")
 
             async def forward_audio():
                 """Forwards incoming binary audio frames from Recall browser to Deepgram."""
+                nonlocal chunk_count, total_bytes
                 try:
                     while True:
                         try:
@@ -692,6 +704,10 @@ async def websocket_audio_endpoint(
                             break
 
                         if "bytes" in message and message["bytes"]:
+                            chunk_count += 1
+                            total_bytes += len(message["bytes"])
+                            if chunk_count % 30 == 0:
+                                logger.info(f"[WS Ingress] Forwarded {chunk_count} chunks ({total_bytes} bytes) to Deepgram")
                             await dg_ws.send(message["bytes"])
                         elif "text" in message:
                             try:
@@ -704,7 +720,7 @@ async def websocket_audio_endpoint(
                 except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError):
                     pass
                 finally:
-                    logger.info("[WS] Audio forwarding stream ended")
+                    logger.info(f"[WS Ingress] Audio stream closed after {chunk_count} chunks ({total_bytes} bytes)")
 
             async def receive_transcripts():
                 """Receives transcribed turns from Deepgram, routes to Gemini + RAG, and triggers avatar speak."""
@@ -712,8 +728,9 @@ async def websocket_audio_endpoint(
                     while True:
                         raw_msg = await dg_ws.recv()
                         data = json.loads(raw_msg)
+                        msg_type = data.get("type")
                         
-                        if data.get("type") == "Results":
+                        if msg_type == "Results":
                             channel = data.get("channel", {})
                             alternatives = channel.get("alternatives", [])
                             if alternatives:
@@ -722,7 +739,7 @@ async def websocket_audio_endpoint(
                                     words = alternatives[0].get("words", [])
                                     speaker_id = str(words[0].get("speaker", "0")) if words else "0"
                                     
-                                    logger.info(f"[Deepgram] Speaker {speaker_id}: '{transcript_text}'")
+                                    logger.info(f"[Deepgram STT] Speaker {speaker_id} Turn: '{transcript_text}'")
                                     
                                     answer_to_speak = await process_transcript_with_gemini(
                                         transcript=transcript_text,
@@ -738,7 +755,7 @@ async def websocket_audio_endpoint(
                                     })
                                     
                                     if answer_to_speak:
-                                        logger.info(f"[Agent] Speaking response: '{answer_to_speak}'")
+                                        logger.info(f"[Agent] >>> Sending avatar_speak instruction: '{answer_to_speak}'")
                                         conversation_history.append({
                                             "speaker": "SpikedAI Avatar",
                                             "text": answer_to_speak
@@ -749,6 +766,10 @@ async def websocket_audio_endpoint(
                                             "text": answer_to_speak,
                                             "session_id": session_id
                                         })
+                        elif msg_type == "Metadata":
+                            logger.info(f"[Deepgram] Session metadata received: request_id={data.get('request_id')}")
+                        elif msg_type == "Error":
+                            logger.error(f"[Deepgram Error] {data}")
 
                 except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
                     logger.info("[WS] Deepgram receiver stream closed")
