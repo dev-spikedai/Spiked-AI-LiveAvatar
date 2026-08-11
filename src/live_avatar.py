@@ -91,7 +91,7 @@ class CreateLiveAvatarRequest(BaseModel):
     avatar_id: Optional[str] = Field(default=None, description="HeyGen/LiveAvatar avatar identifier")
     quality: str = Field(default="medium", description="Video quality: low, medium (720p), high (1080p)")
     is_sandbox: bool = Field(default=LIVEAVATAR_SANDBOX, description="Sandbox mode for testing")
-    mode: str = Field(default="LITE", description="LITE ($0.10/min) or FULL ($0.20/min)")
+    mode: str = Field(default="FULL", description="FULL ($0.20/min, includes TTS) or LITE ($0.10/min, BYOTTS)")
 
 class CreateBotWithLiveAvatarRequest(BaseModel):
     meeting_url: str = Field(..., description="Zoom, Google Meet, or MS Teams URL")
@@ -357,14 +357,41 @@ async def get_run_credentials(run_id: str, token: Optional[str] = Query(None)):
 @app.post("/create-live-avatar")
 async def create_avatar(payload: CreateLiveAvatarRequest):
     """
-    Creates a LiveAvatar / HeyGen session (LITE Mode = $0.10/min).
+    Creates a LiveAvatar / HeyGen session.
+    FULL Mode ($0.20/min) = includes built-in STT/LLM/TTS; supports avatar.speak_text.
+    LITE Mode ($0.10/min) = visual-only, requires BYOTTS (agent.speak with PCM audio).
     """
     if not LIVEAVATAR_API_KEY:
         raise HTTPException(status_code=500, detail="LIVEAVATAR_API_KEY is not configured")
 
     avatar_id = payload.avatar_id or LIVEAVATAR_AVATAR_ID or None
+    la_headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": LIVEAVATAR_API_KEY
+    }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
+        # For FULL mode, create a Context (persona) first — required per docs
+        context_id = None
+        if payload.mode == "FULL":
+            ctx_payload = {
+                "name": f"spiked-bot-{uuid.uuid4().hex[:8]}",
+                "prompt": "You are SpikedAI, a helpful, concise meeting assistant. Keep answers to 2-4 sentences spoken naturally.",
+                "opening_text": "Hi everyone, I'm SpikedAI. I'm here and ready to help."
+            }
+            ctx_res = await client.post(
+                f"{LIVEAVATAR_BASE_URL}/v1/contexts",
+                headers=la_headers,
+                json=ctx_payload
+            )
+            if ctx_res.status_code in (200, 201):
+                ctx_data = ctx_res.json()
+                context_id = ctx_data.get("data", {}).get("id") if isinstance(ctx_data.get("data"), dict) else None
+                logger.info(f"[LiveAvatar] Created context: {context_id}")
+            else:
+                logger.warning(f"[LiveAvatar] Context creation failed: {ctx_res.text}, proceeding without")
+
+        # Build session token payload
         token_payload = {
             "mode": payload.mode,
             "avatar_id": avatar_id,
@@ -374,13 +401,19 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             },
             "is_sandbox": payload.is_sandbox
         }
-        
+
+        # FULL mode requires interactivity_type + avatar_persona
+        if payload.mode == "FULL":
+            token_payload["interactivity_type"] = "CONVERSATIONAL"
+            if context_id:
+                token_payload["avatar_persona"] = {"context_id": context_id}
+            else:
+                # Fallback: empty persona so FULL mode still works
+                token_payload["avatar_persona"] = {}
+
         token_res = await client.post(
             f"{LIVEAVATAR_BASE_URL}/v1/sessions/token",
-            headers={
-                "Content-Type": "application/json",
-                "X-API-KEY": LIVEAVATAR_API_KEY
-            },
+            headers=la_headers,
             json=token_payload
         )
         
@@ -408,9 +441,11 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
         start_json = start_res.json()
         start_data = start_json.get("data", {}) if isinstance(start_json.get("data"), dict) else start_json
         
+        logger.info(f"[LiveAvatar] Session started in {payload.mode} mode: session_id={start_data.get('session_id')}")
+        
         return {
             "mode": payload.mode,
-            "rate": "$0.10/minute" if payload.mode == "LITE" else "$0.20/minute",
+            "rate": "$0.20/minute" if payload.mode == "FULL" else "$0.10/minute",
             "session_id": start_data.get("session_id"),
             "livekit_url": start_data.get("livekit_url"),
             "livekit_token": start_data.get("livekit_client_token"),
@@ -436,10 +471,10 @@ async def _deploy_live_avatar_bot(
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
 
-        # 1. Create LiveAvatar LITE Session ($0.10/min)
+        # 1. Create LiveAvatar FULL Session ($0.20/min, includes TTS)
         avatar_session = await create_avatar(CreateLiveAvatarRequest(
             avatar_id=avatar_id,
-            mode="LITE"
+            mode="FULL"
         ))
 
         # 2. Store session credentials for Recall's avatar.html
