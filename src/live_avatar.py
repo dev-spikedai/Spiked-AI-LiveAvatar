@@ -395,123 +395,130 @@ async def _deploy_live_avatar_bot(
     request: Optional[Request] = None
 ) -> Dict[str, Any]:
     """Internal core method to deploy the LiveAvatar Bot into a meeting."""
-    if not RECALL_API_KEY:
-        raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
+    try:
+        if not RECALL_API_KEY:
+            raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
 
-    if not user_id:
-        user_id = extract_user_id_from_jwt(token)
+        if not user_id:
+            user_id = extract_user_id_from_jwt(token)
 
-    run_id = f"run_{uuid.uuid4().hex[:12]}"
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
 
-    # 1. Create LiveAvatar LITE Session ($0.10/min)
-    avatar_session = await create_avatar(CreateLiveAvatarRequest(
-        avatar_id=avatar_id,
-        mode="LITE"
-    ))
+        # 1. Create LiveAvatar LITE Session ($0.10/min)
+        avatar_session = await create_avatar(CreateLiveAvatarRequest(
+            avatar_id=avatar_id,
+            mode="LITE"
+        ))
 
-    # 2. Store session credentials for Recall's avatar.html
-    _ACTIVE_RUNS[run_id] = {
-        "run_id": run_id,
-        "user_id": user_id,
-        "client_id": client_id,
-        "token": token,
-        "session_id": avatar_session.get("session_id"),
-        "livekit_url": avatar_session.get("livekit_url"),
-        "livekit_token": avatar_session.get("livekit_token"),
-    }
-
-    # 3. Build Output Media URL
-    base_url = PUBLIC_BASE_URL.rstrip('/')
-    if request and "localhost" in base_url and not "localhost" in str(request.base_url):
-        base_url = str(request.base_url).rstrip('/')
-
-    avatar_page_url = (
-        f"{base_url}/avatar.html"
-        f"?run={run_id}"
-        f"&token={token}"
-        f"&client_id={client_id or ''}"
-    )
-
-    # 4. Recall Bot Payload with Output Media + Dual-Track Webhook
-    recall_payload = {
-        "meeting_url": meeting_url,
-        "bot_name": bot_name,
-        "variant": {
-            "zoom": "web_4_core",
-            "google_meet": "web_4_core",
-            "microsoft_teams": "web_4_core"
-        },
-        "output_media": {
-            "camera": {
-                "kind": "webpage",
-                "config": {
-                    "url": avatar_page_url
-                }
-            }
-        },
-        "metadata": {
+        # 2. Store session credentials for Recall's avatar.html
+        _ACTIVE_RUNS[run_id] = {
+            "run_id": run_id,
             "user_id": user_id,
-            "client_id": client_id or ""
-        },
-        "recording_config": {
-            "retention": {
-                "type": "timed",
-                "hours": 168
+            "client_id": client_id,
+            "token": token,
+            "session_id": avatar_session.get("session_id"),
+            "livekit_url": avatar_session.get("livekit_url"),
+            "livekit_token": avatar_session.get("livekit_token"),
+        }
+
+        # 3. Build Output Media URL
+        base_url = PUBLIC_BASE_URL.rstrip('/')
+        if request and "localhost" in base_url and not "localhost" in str(request.base_url):
+            base_url = str(request.base_url).rstrip('/')
+
+        avatar_page_url = (
+            f"{base_url}/avatar.html"
+            f"?run={run_id}"
+            f"&token={token}"
+            f"&client_id={client_id or ''}"
+        )
+
+        # 4. Recall Bot Payload with Output Media + Dual-Track Webhook
+        recall_payload = {
+            "meeting_url": meeting_url,
+            "bot_name": bot_name,
+            "variant": {
+                "zoom": "web_4_core",
+                "google_meet": "web_4_core",
+                "microsoft_teams": "web_4_core"
             },
-            "include_bot_in_recording": {
-                "audio": True
-            },
-            "transcript": {
-                "provider": {
-                    "deepgram_streaming": {
-                        "model": "nova-3"
+            "output_media": {
+                "camera": {
+                    "kind": "webpage",
+                    "config": {
+                        "url": avatar_page_url
                     }
                 }
             },
-            "realtime_endpoints": [
-                {
-                    "type": "webhook",
-                    "url": RECALL_WEBHOOK_URL,
-                    "events": ["transcript.data", "transcript.partial_data"]
-                }
-            ]
+            "metadata": {
+                "user_id": user_id,
+                "client_id": client_id or ""
+            },
+            "recording_config": {
+                "retention": {
+                    "type": "timed",
+                    "hours": 168
+                },
+                "include_bot_in_recording": {
+                    "audio": True
+                },
+                "transcript": {
+                    "provider": {
+                        "deepgram_streaming": {
+                            "model": "nova-3"
+                        }
+                    }
+                },
+                "realtime_endpoints": [
+                    {
+                        "type": "webhook",
+                        "url": RECALL_WEBHOOK_URL,
+                        "events": ["transcript.data", "transcript.partial_data"]
+                    }
+                ]
+            }
         }
-    }
 
-    headers = {
-        "Authorization": f"Token {RECALL_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/",
-            headers=headers,
-            json=recall_payload
-        )
-        
-        if resp.status_code not in (200, 201):
-            logger.error(f"Recall Bot creation failed: {resp.text}")
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        
-        bot_data = resp.json()
-        bot_id = bot_data.get("id")
-        _ACTIVE_RUNS[run_id]["bot_id"] = bot_id
-
-        status_changes = bot_data.get("status_changes")
-        latest_status = "created"
-        if isinstance(status_changes, list) and len(status_changes) > 0 and isinstance(status_changes[-1], dict):
-            latest_status = status_changes[-1].get("code", "created")
-
-        return {
-            "id": bot_id,
-            "bot_id": bot_id,
-            "run_id": run_id,
-            "liveavatar_session_id": avatar_session.get("session_id"),
-            "avatar_page_url": avatar_page_url,
-            "status": latest_status
+        headers = {
+            "Authorization": f"Token {RECALL_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/",
+                headers=headers,
+                json=recall_payload
+            )
+            
+            if resp.status_code not in (200, 201):
+                logger.error(f"Recall Bot creation failed: {resp.text}")
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            
+            bot_data = resp.json()
+            bot_id = bot_data.get("id")
+            _ACTIVE_RUNS[run_id]["bot_id"] = bot_id
+
+            status_changes = bot_data.get("status_changes")
+            latest_status = "created"
+            if isinstance(status_changes, list) and len(status_changes) > 0 and isinstance(status_changes[-1], dict):
+                latest_status = status_changes[-1].get("code", "created")
+
+            return {
+                "id": bot_id,
+                "bot_id": bot_id,
+                "run_id": run_id,
+                "liveavatar_session_id": avatar_session.get("session_id"),
+                "avatar_page_url": avatar_page_url,
+                "status": latest_status
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deploying live avatar bot: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/start")
 async def start_bot_endpoint(
@@ -522,44 +529,51 @@ async def start_bot_endpoint(
     Unified Start Endpoint compatible with Frontend recallBotService.ts:
     Accepts both JSON and Multipart/FormData payloads.
     """
-    token = ""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "").strip()
+    try:
+        token = ""
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.replace("Bearer ", "").strip()
 
-    meeting_url = ""
-    client_id = None
-    bot_name = "SpikedAI"
-    avatar_id = None
+        meeting_url = ""
+        client_id = None
+        bot_name = "SpikedAI"
+        avatar_id = None
 
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        body = await request.json()
-        meeting_url = body.get("meeting_url", "")
-        client_id = body.get("client_id")
-        bot_name = body.get("bot_name", "SpikedAI")
-        avatar_id = body.get("avatar_id")
-        if not token:
-            token = body.get("token", "")
-    else:
-        form = await request.form()
-        meeting_url = form.get("meeting_url", "")
-        client_id = form.get("client_id")
-        bot_name = form.get("bot_name", "SpikedAI")
-        avatar_id = form.get("avatar_id")
-        if not token:
-            token = form.get("token", "")
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            meeting_url = body.get("meeting_url", "")
+            client_id = body.get("client_id")
+            bot_name = body.get("bot_name", "SpikedAI")
+            avatar_id = body.get("avatar_id")
+            if not token:
+                token = body.get("token", "")
+        else:
+            form = await request.form()
+            meeting_url = form.get("meeting_url", "")
+            client_id = form.get("client_id")
+            bot_name = form.get("bot_name", "SpikedAI")
+            avatar_id = form.get("avatar_id")
+            if not token:
+                token = form.get("token", "")
 
-    if not meeting_url:
-        raise HTTPException(status_code=400, detail="meeting_url is required")
+        if not meeting_url:
+            raise HTTPException(status_code=400, detail="meeting_url is required")
 
-    return await _deploy_live_avatar_bot(
-        meeting_url=meeting_url,
-        token=token,
-        client_id=client_id,
-        bot_name=bot_name,
-        avatar_id=avatar_id,
-        request=request
-    )
+        result = await _deploy_live_avatar_bot(
+            meeting_url=meeting_url,
+            token=token,
+            client_id=client_id,
+            bot_name=bot_name,
+            avatar_id=avatar_id,
+            request=request
+        )
+        return JSONResponse(status_code=200, content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"start_bot_endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create-live-avatar-bot")
 async def create_live_avatar_bot(
