@@ -205,18 +205,23 @@ async def process_transcript_with_gemini(
 
     system_instruction = """
 You are SpikedAI, a live interactive AI meeting assistant and sales representative avatar.
-You are listening to an ongoing meeting with real-time speaker diarization.
+You are a participant in this meeting. You can hear what everyone says via real-time speaker diarization.
 
 RULES OF ENGAGEMENT:
-1. DECIDE WHETHER TO SPEAK:
-   - If a participant directly asks you a question, greets you, or asks a product/business question requiring your input -> RESPOND.
-   - If participants are talking amongst themselves and do not need your input -> Respond with the exact string: "[SILENT]".
+1. WHEN TO SPEAK:
+   - ALWAYS respond to greetings, hellos, questions directed at you, or any product/business question.
+   - If someone says "hello", "hey", "hi", "can you hear me", or addresses you in any way -> RESPOND warmly.
+   - ONLY output "[SILENT]" if the speakers are clearly having a private side-conversation not involving you at all.
+   - When in doubt, RESPOND rather than staying silent. You are a helpful meeting participant.
 2. USING THE RAG TOOL:
-   - For ANY questions regarding company offerings, pricing, architecture, SLAs, product features, or onboarding -> You MUST call the `generate_system_answer` tool to retrieve verified facts.
-   - For casual greetings or quick social pleasantries (e.g. "Hello Spiked", "Can you hear me?"), respond conversationally without calling tools.
+   - For questions about company offerings, pricing, architecture, SLAs, product features, or onboarding -> call `generate_system_answer`.
+   - If the tool returns "No relevant information found" or similar, respond honestly: "I don't have specific information on that topic in my knowledge base, but I'd be happy to help with anything else."
+   - Do NOT call the tool again if it already returned no results for the same query.
+   - For casual greetings or social pleasantries, respond conversationally without calling tools.
 3. OUTPUT STYLE:
    - Keep answers natural, confident, concise, and direct (max 2 to 4 sentences).
    - Never output markdown formatting or bullet points (your response will be spoken aloud by a video avatar).
+   - Always produce a plain text response. Never produce a function call without accompanying text.
 """
 
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
@@ -262,39 +267,57 @@ RULES OF ENGAGEMENT:
         chat = model.start_chat(enable_automatic_function_calling=False)
         response = await asyncio.to_thread(chat.send_message, formatted_context)
         
-        if response.candidates and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                fn_call = getattr(part, "function_call", None)
-                if fn_call and fn_call.name == "generate_system_answer":
-                    query_arg = fn_call.args.get("query", transcript)
-                    logger.info(f"[Gemini Agent] >>> TOOL CALL: generate_system_answer(query='{query_arg}')")
-                    
-                    # Execute RAG query against SpikedAI-Backend-One
-                    rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
-                    logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
-                    
-                    tool_response_part = genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name="generate_system_answer",
-                            response={"result": rag_result}
+        # Handle up to 3 rounds of tool calls (Gemini may chain tool calls)
+        max_tool_rounds = 3
+        for tool_round in range(max_tool_rounds):
+            # Extract text from response, handling function_call parts safely
+            has_function_call = False
+            text_parts = []
+            
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    fn_call = getattr(part, "function_call", None)
+                    if fn_call and fn_call.name == "generate_system_answer":
+                        has_function_call = True
+                        query_arg = fn_call.args.get("query", transcript)
+                        logger.info(f"[Gemini Agent] >>> TOOL CALL (round {tool_round+1}): generate_system_answer(query='{query_arg}')")
+                        
+                        # Execute RAG query
+                        rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
+                        logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
+                        
+                        tool_response_part = genai.protos.Part(
+                            function_response=genai.protos.FunctionResponse(
+                                name="generate_system_answer",
+                                response={"result": rag_result}
+                            )
                         )
-                    )
-                    final_res = await asyncio.to_thread(chat.send_message, tool_response_part)
-                    reply_text = final_res.text.strip()
-                    logger.info(f"[Gemini Agent] Post-tool reply: '{reply_text}'")
-                    
-                    if reply_text == "[SILENT]" or not reply_text:
-                        logger.info("[Gemini Agent] Model chose [SILENT] after tool lookup")
-                        return None
-                    logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
-                    return reply_text
-
-        reply_text = response.text.strip()
-        logger.info(f"[Gemini Agent] Direct reply: '{reply_text}'")
+                        response = await asyncio.to_thread(chat.send_message, tool_response_part)
+                        break  # Re-evaluate the new response in next loop iteration
+                    elif hasattr(part, "text") and part.text:
+                        text_parts.append(part.text)
+            
+            if not has_function_call:
+                # No more tool calls - extract final text
+                reply_text = " ".join(text_parts).strip()
+                logger.info(f"[Gemini Agent] Final reply (round {tool_round+1}): '{reply_text}'")
+                if reply_text == "[SILENT]" or not reply_text:
+                    logger.info("[Gemini Agent] Model chose to remain silent")
+                    return None
+                logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
+                return reply_text
+        
+        # Exhausted tool rounds - try to extract any text from the last response
+        logger.warning(f"[Gemini Agent] Exhausted {max_tool_rounds} tool rounds, extracting fallback text")
+        try:
+            reply_text = response.text.strip()
+        except ValueError:
+            # Last response was still a function_call with no text
+            reply_text = "I wasn't able to find specific information on that, but I'm happy to help with anything else."
+        
         if reply_text == "[SILENT]" or not reply_text:
-            logger.info("[Gemini Agent] Model chose to remain silent ([SILENT])")
             return None
-        logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
+        logger.info(f"[Gemini Agent] >>> FALLBACK RESPONSE: '{reply_text}' <<<")
         return reply_text
 
     except Exception as e:

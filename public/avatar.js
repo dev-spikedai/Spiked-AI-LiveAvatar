@@ -69,6 +69,44 @@
     console.log("[LiveKit] Connected to room successfully");
     updateStatus("Live Avatar Connected", "active");
 
+    // Allow autoplay for audio
+    room.startAudio().catch(() => {
+      document.addEventListener("click", () => room.startAudio(), { once: true });
+    });
+
+    // Publish page microphone into LiveKit room (Recall pipes meeting audio into it)
+    try {
+      await room.localParticipant.setMicrophoneEnabled(true, {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      });
+      console.log("[LiveKit] Microphone published to LiveKit room");
+    } catch (micErr) {
+      console.warn("[LiveKit] Could not publish microphone:", micErr);
+    }
+
+    // Tell LiveAvatar agent to start listening (REQUIRED per LiveAvatar SDK)
+    const encoder = new TextEncoder();
+    function sendLiveAvatarCommand(eventType, payload = {}) {
+      const event = {
+        event_id: crypto.randomUUID(),
+        event_type: eventType,
+        session_id: sessionId,
+        source_event_id: null,
+        ...payload,
+        payload,
+      };
+      console.log(`[LiveKit] Publishing command: ${eventType}`, event);
+      room.localParticipant.publishData(encoder.encode(JSON.stringify(event)), {
+        reliable: true,
+        topic: "agent-control",
+      });
+    }
+
+    sendLiveAvatarCommand("avatar.start_listening");
+    console.log("[avatar.js] Sent avatar.start_listening command");
+
     // 3. Capture In-Meeting Audio (Recall auto-grants getUserMedia)
     updateStatus("Initializing In-Room Audio Capture...");
     const audioStream = await navigator.mediaDevices.getUserMedia({
@@ -112,7 +150,6 @@
     };
 
     // 5. Receive "avatar_speak" commands from Gemini/RAG and speak in meeting
-    const encoder = new TextEncoder();
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -120,22 +157,7 @@
         
         if (data.type === "avatar_speak" && data.text) {
           console.log(`[avatar.js] >>> Publishing avatar.speak_text: "${data.text}"`);
-          const command = {
-            event_id: crypto.randomUUID(),
-            event_type: "avatar.speak_text",
-            session_id: sessionId,
-            source_event_id: null,
-            text: data.text,
-            payload: {
-              text: data.text,
-            },
-          };
-
-          // Publish command to LiveKit agent-control topic
-          room.localParticipant.publishData(encoder.encode(JSON.stringify(command)), {
-            reliable: true,
-            topic: "agent-control",
-          });
+          sendLiveAvatarCommand("avatar.speak_text", { text: data.text });
 
           updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
           setTimeout(() => updateStatus("Listening...", "active"), 4000);
