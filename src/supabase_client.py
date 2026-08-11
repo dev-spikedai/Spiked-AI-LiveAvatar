@@ -52,6 +52,15 @@ PHONETIC_REPLACEMENTS = [
     (re.compile(r"\bspike the eye\b", re.IGNORECASE), "SpikedAI"),
     (re.compile(r"\bspike ai\b", re.IGNORECASE), "SpikedAI"),
     (re.compile(r"\bspiked ai\b", re.IGNORECASE), "SpikedAI"),
+    (re.compile(r"\bsecure a ai\b", re.IGNORECASE), "s3cura AI"),
+    (re.compile(r"\bsecure ai\b", re.IGNORECASE), "s3cura AI"),
+    (re.compile(r"\bsecura ai\b", re.IGNORECASE), "s3cura AI"),
+    (re.compile(r"\bsecura\b", re.IGNORECASE), "s3cura AI"),
+    (re.compile(r"\bthree c ai\b", re.IGNORECASE), "3CAI"),
+    (re.compile(r"\bthree cai\b", re.IGNORECASE), "3CAI"),
+    (re.compile(r"\b3c ai\b", re.IGNORECASE), "3CAI"),
+    (re.compile(r"\bcomic gp\b", re.IGNORECASE), "Karmic GP"),
+    (re.compile(r"\bkarma gp\b", re.IGNORECASE), "Karmic GP"),
     (re.compile(r"\blive avatar\b", re.IGNORECASE), "LiveAvatar"),
     (re.compile(r"\brecall ai\b", re.IGNORECASE), "Recall.ai"),
     (re.compile(r"\bdeep gram\b", re.IGNORECASE), "Deepgram"),
@@ -64,7 +73,7 @@ PHONETIC_REPLACEMENTS = [
 def correct_stt_text(raw_text: str, custom_keywords: Optional[List[str]] = None) -> str:
     """
     Applies phonetic and domain corrections to raw speech-to-text transcripts.
-    Corrects common mishearings like 'spider' -> 'Spiked'.
+    Corrects common mishearings like 'spider' -> 'Spiked', 'secure ai' -> 's3cura AI', 'three c ai' -> '3CAI'.
     """
     if not raw_text:
         return ""
@@ -76,8 +85,8 @@ def correct_stt_text(raw_text: str, custom_keywords: Optional[List[str]] = None)
     # Custom keyword boundary corrections if provided
     if custom_keywords:
         for kw in custom_keywords:
-            if len(kw) > 3 and " " not in kw:
-                # e.g., case-insensitive match for the keyword
+            if len(kw) > 2 and " " not in kw:
+                # Case-insensitive match for the exact keyword
                 pattern = re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)
                 text = pattern.sub(kw, text)
                 
