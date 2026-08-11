@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import time
 import asyncio
 import logging
 import uuid
@@ -94,6 +95,9 @@ class CreateLiveAvatarRequest(BaseModel):
     quality: str = Field(default="medium", description="Video quality: low, medium (720p), high (1080p)")
     is_sandbox: bool = Field(default=LIVEAVATAR_SANDBOX, description="Sandbox mode for testing")
     mode: str = Field(default="FULL", description="FULL ($0.20/min, includes TTS) or LITE ($0.10/min, BYOTTS)")
+    user_id: Optional[str] = Field(default=None, description="User ID for fetching context")
+    client_id: Optional[str] = Field(default=None, description="Client ID for fetching context")
+    token: Optional[str] = Field(default=None, description="Auth token")
 
 class CreateBotWithLiveAvatarRequest(BaseModel):
     meeting_url: str = Field(..., description="Zoom, Google Meet, or MS Teams URL")
@@ -245,7 +249,8 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY:
    - Tone: Confident, helpful, concise, and professional.
 """
 
-    preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services}', Domain='{product_domain}', Bot='{bot_name}'")
+    logger.info(f"[Prompt Debug] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
     candidate_models = [
         preferred_model,
         "gemini-3.5-flash-lite",
@@ -392,13 +397,24 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        # For FULL mode, create a Context (persona) first — required per docs
+        # For FULL mode, load user company context and create a Context (persona)
         context_id = None
         if payload.mode == "FULL":
+            user_ctx = await get_user_keywords_and_products(
+                user_id=payload.user_id,
+                client_id=payload.client_id,
+                auth_token=payload.token
+            )
+            c_name = user_ctx.get("company_name") or "SpikedAI"
+            p_desc = user_ctx.get("products_services") or user_ctx.get("product_domain") or "Enterprise AI Solutions"
+            b_name = user_ctx.get("bot_name") or "SpikedAI"
+            
+            logger.info(f"[LiveAvatar Context] Initializing with Company='{c_name}', Products='{p_desc[:80]}...', Bot='{b_name}'")
+            
             ctx_payload = {
                 "name": f"spiked-bot-{uuid.uuid4().hex[:8]}",
-                "prompt": "You are SpikedAI, a helpful, concise meeting assistant. Keep answers to 2-4 sentences spoken naturally.",
-                "opening_text": "Hi everyone, I'm SpikedAI. I'm here and ready to help."
+                "prompt": f"You are {b_name}, a helpful and concise sales engineer and meeting participant representing {c_name}. Products & offerings: {p_desc}. Keep answers to 2-4 sentences spoken naturally.",
+                "opening_text": f"Hi everyone, I'm {b_name} from {c_name}. I'm here and ready to help."
             }
             ctx_res = await client.post(
                 f"{LIVEAVATAR_BASE_URL}/v1/contexts",
@@ -492,10 +508,13 @@ async def _deploy_live_avatar_bot(
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
 
-        # 1. Create LiveAvatar FULL Session ($0.20/min, includes TTS)
+        # 1. Create LiveAvatar FULL Session ($0.20/min, includes TTS) with user context
         avatar_session = await create_avatar(CreateLiveAvatarRequest(
             avatar_id=avatar_id,
-            mode="FULL"
+            mode="FULL",
+            user_id=user_id,
+            client_id=client_id,
+            token=token
         ))
 
         # 2. Store session credentials for Recall's avatar.html

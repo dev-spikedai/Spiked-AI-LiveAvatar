@@ -119,6 +119,7 @@ async def get_user_keywords_and_products(
 
     if client_to_use and user_id and user_id != "unknown_user":
         try:
+            logger.info(f"[Supabase] Querying user_configs for user_id={user_id}")
             # 1. Fetch user_configs row
             res = await asyncio.to_thread(
                 lambda: client_to_use.table("user_configs")
@@ -134,6 +135,7 @@ async def get_user_keywords_and_products(
                 company_name = cfg.get("seller_company") or company_name
                 products_services = cfg.get("products_services") or ""
                 product_domain = cfg.get("product_domain") or product_domain
+                logger.info(f"[Supabase] Loaded user_configs: seller_company='{company_name}', products='{products_services[:60]}...'")
                 
                 # Add strategic keywords
                 strat_kw = cfg.get("strategic_keywords")
@@ -148,6 +150,8 @@ async def get_user_keywords_and_products(
                         clean_item = line.strip()
                         if clean_item and len(clean_item) < 40:
                             keywords_set.add(clean_item)
+            else:
+                logger.warning(f"[Supabase] No user_configs row found for user_id={user_id}")
 
             # 2. Fetch source documents titles
             sources_query = client_to_use.table("sources").select("filename, description").eq("user_id", user_id)
