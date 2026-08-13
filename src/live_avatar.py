@@ -19,7 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -33,7 +34,7 @@ logger = logging.getLogger("LiveAvatar-Spiked")
 # Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API") or os.getenv("DEEPGRAM_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://us-west-2.recall.ai")
@@ -50,10 +51,14 @@ PUBLIC_BASE_URL = os.getenv(
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
 
-# Configure Gemini Client
+# Configure Modern Google GenAI Client
+gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    logger.info("Google Gemini API configured successfully")
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("[Google GenAI] Official modern SDK client initialized successfully")
+    except Exception as e:
+        logger.warning(f"[Google GenAI] Could not initialize client: {e}")
 else:
     logger.warning("GEMINI_API is not set in environment")
 
@@ -191,8 +196,8 @@ async def process_transcript_with_gemini(
     Uses SOTA conversational meeting bot dialogue policy with intelligent intent classification.
     Returns the final answer text to speak, or None if the bot should stay silent.
     """
-    if not GEMINI_API_KEY:
-        logger.error("GEMINI_API key is missing")
+    if not gemini_client:
+        logger.error("[Google GenAI] Client is not initialized")
         return None
 
     # Extract dynamic company context
@@ -204,17 +209,17 @@ async def process_transcript_with_gemini(
     keywords_list = ctx.get("keywords") or []
     formatted_keywords = ", ".join(keywords_list[:40]) if keywords_list else "SpikedAI, s3cura AI, 3CAI, CRM, RAG"
 
-    # Define official Tool protobuf for Gemini
-    rag_tool = genai.protos.Tool(
+    # Define Tool using modern Google GenAI SDK
+    rag_tool = types.Tool(
         function_declarations=[
-            genai.protos.FunctionDeclaration(
+            types.FunctionDeclaration(
                 name="generate_system_answer",
                 description=f"REQUIRED tool to retrieve verified facts, documentation, products, pricing, and architecture for {company_name} from the company document RAG database.",
-                parameters=genai.protos.Schema(
-                    type=genai.protos.Type.OBJECT,
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
                     properties={
-                        "query": genai.protos.Schema(
-                            type=genai.protos.Type.STRING,
+                        "query": types.Schema(
+                            type=types.Type.STRING,
                             description=f"The specific, high-density question or topic to search in {company_name}'s knowledge base."
                         )
                     },
@@ -296,35 +301,13 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services[:100]}...', Domain='{product_domain}', Bot='{bot_name}'")
     logger.info(f"[Prompt Debug] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
-    
-    candidate_models = [
-        preferred_model,
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro"
-    ]
-    seen = set()
-    candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
 
-    model = None
-    for m_name in candidate_models:
-        try:
-            model = genai.GenerativeModel(
-                model_name=m_name,
-                generation_config={
-                    "temperature": 0.2,
-                    "max_output_tokens": 200
-                },
-                system_instruction=system_instruction,
-                tools=[rag_tool]
-            )
-            break
-        except Exception as e:
-            logger.warning(f"Could not initialize model {m_name}: {e}")
-
-    if not model:
-        logger.error("Failed to initialize any Gemini model candidate")
-        return None
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=250,
+        system_instruction=system_instruction,
+        tools=[rag_tool]
+    )
 
     # Build conversation context with previous meeting turns
     formatted_context = ""
@@ -332,74 +315,54 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
         formatted_context += f"Speaker {turn.get('speaker', 'Participant')}: {turn.get('text', '')}\n"
     formatted_context += f"Speaker {speaker}: {transcript}\n"
 
-    logger.info(f"[Gemini Agent] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
-
     try:
-        chat = model.start_chat(enable_automatic_function_calling=False)
-        response = await asyncio.to_thread(chat.send_message, formatted_context)
+        chat = gemini_client.aio.chats.create(model=preferred_model, config=config)
+        response = await chat.send_message(formatted_context)
         
-        # Handle up to 3 rounds of tool calls (Gemini may chain tool calls)
+        # Multi-round tool execution (up to 3 rounds)
         max_tool_rounds = 3
         for tool_round in range(max_tool_rounds):
-            # Extract text from response, handling function_call parts safely
-            has_function_call = False
-            text_parts = []
+            if response.function_calls:
+                fn_call = response.function_calls[0]
+                if fn_call.name == "generate_system_answer":
+                    query_arg = fn_call.args.get("query", transcript) if isinstance(fn_call.args, dict) else transcript
+                    logger.info(f"[Gemini Agent] >>> TOOL CALL (round {tool_round+1}): generate_system_answer(query='{query_arg}')")
+                    
+                    # Execute RAG query against SpikedAI-Backend-One
+                    rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
+                    
+                    # If RAG returned no matching docs, fallback to injected company product catalog
+                    if not rag_result or "No relevant information found" in rag_result or "could not retrieve" in rag_result:
+                        fallback_facts = f"Verified company knowledge: {company_name} offers {products_services}. Domain: {product_domain}."
+                        logger.info(f"[Gemini Agent] RAG empty -> Enhancing with user_configs: '{fallback_facts[:120]}...'")
+                        rag_result = f"{rag_result}\n\n{fallback_facts}"
+                    else:
+                        logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
+                    
+                    tool_resp_part = types.Part.from_function_response(
+                        name="generate_system_answer",
+                        response={"result": rag_result}
+                    )
+                    response = await chat.send_message(tool_resp_part)
+                    continue
             
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    fn_call = getattr(part, "function_call", None)
-                    if fn_call and fn_call.name == "generate_system_answer":
-                        has_function_call = True
-                        query_arg = fn_call.args.get("query", transcript)
-                        logger.info(f"[Gemini Agent] >>> TOOL CALL (round {tool_round+1}): generate_system_answer(query='{query_arg}')")
-                        
-                        # Execute RAG query against SpikedAI-Backend-One
-                        rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
-                        
-                        # If RAG returned no matching docs, fallback to injected company product catalog
-                        if not rag_result or "No relevant information found" in rag_result or "could not retrieve" in rag_result:
-                            fallback_facts = f"Verified company knowledge: {company_name} offers {products_services}. Domain: {product_domain}."
-                            logger.info(f"[Gemini Agent] RAG empty -> Enhancing with user_configs: '{fallback_facts[:120]}...'")
-                            rag_result = f"{rag_result}\n\n{fallback_facts}"
-                        else:
-                            logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
-                        
-                        tool_response_part = genai.protos.Part(
-                            function_response=genai.protos.FunctionResponse(
-                                name="generate_system_answer",
-                                response={"result": rag_result}
-                            )
-                        )
-                        response = await asyncio.to_thread(chat.send_message, tool_response_part)
-                        break  # Re-evaluate the new response in next loop iteration
-                    elif hasattr(part, "text") and part.text:
-                        text_parts.append(part.text)
+            # No function call - extract final spoken text
+            reply_text = response.text.strip() if response.text else ""
+            logger.info(f"[Gemini Agent] Final reply (round {tool_round+1}): '{reply_text}'")
+            if reply_text == "[SILENT]" or not reply_text:
+                logger.info("[Gemini Agent] Model chose to remain silent")
+                return None
+            logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
+            return reply_text
             
-            if not has_function_call:
-                # No more tool calls - extract final text
-                reply_text = " ".join(text_parts).strip()
-                logger.info(f"[Gemini Agent] Final reply (round {tool_round+1}): '{reply_text}'")
-                if reply_text == "[SILENT]" or not reply_text:
-                    logger.info("[Gemini Agent] Model chose to remain silent")
-                    return None
-                logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
-                return reply_text
-        
-        # Exhausted tool rounds - try to extract any text from the last response
-        logger.warning(f"[Gemini Agent] Exhausted {max_tool_rounds} tool rounds, extracting fallback text")
-        try:
-            reply_text = response.text.strip()
-        except ValueError:
-            # Last response was still a function_call with no text
-            reply_text = "I wasn't able to find specific information on that, but I'm happy to help with anything else."
-        
+        reply_text = response.text.strip() if response.text else ""
         if reply_text == "[SILENT]" or not reply_text:
             return None
         logger.info(f"[Gemini Agent] >>> FALLBACK RESPONSE: '{reply_text}' <<<")
         return reply_text
 
     except Exception as e:
-        logger.error(f"[Gemini Agent] Inference error: {e}", exc_info=True)
+        logger.error(f"[Gemini Agent] Inference error with google-genai SDK: {e}", exc_info=True)
         return None
 
 # ---------------------------------------------------------------------------
