@@ -56,11 +56,11 @@ gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info("[Google GenAI] Official modern SDK client initialized successfully")
+        logger.info(f"[Google GenAI] Official modern SDK client initialized with key: {GEMINI_API_KEY[:8]}...{GEMINI_API_KEY[-6:]}")
     except Exception as e:
         logger.warning(f"[Google GenAI] Could not initialize client: {e}")
 else:
-    logger.warning("GEMINI_API is not set in environment")
+    logger.warning("GEMINI_API_KEY is not set in environment")
 
 app = FastAPI(title="LiveAvatar Spiked AI Orchestrator", version="1.0.0")
 

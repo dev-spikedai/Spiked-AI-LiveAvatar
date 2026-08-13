@@ -1,6 +1,6 @@
 # Spiked-AI-LiveAvatar.
 
-Real-time Live Avatar Orchestrator for SpikedAI.
+Real-time Live Avatar Orchestrator for SpikedAI..
 
 This service coordinates:
 - **Recall.ai Output Media**: Injects live video and audio directly into Zoom, Google Meet, and Microsoft Teams meetings via a self-hosted `avatar.html` webpage (`web_4_core` variant).
