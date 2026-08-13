@@ -815,27 +815,41 @@ async def websocket_audio_endpoint(
     )
     user_keywords = user_context.get("keywords", [])
 
-    # Deepgram WebSocket Live Transcription URL
-    # MediaRecorder in avatar.js sends WebM containerized Opus audio.
-    # Omit encoding & sample_rate so Deepgram automatically detects the container!
-    deepgram_params = {
-        "model": "nova-3",
-        "diarize": "true",
-        "smart_format": "true",
-        "interim_results": "false",
-        "endpointing": "300",
-        "punctuate": "true"
-    }
-    deepgram_ws_url = f"wss://api.deepgram.com/v1/listen?{urlencode(deepgram_params)}"
-    
-    # Inject Boosted Keywords into Deepgram query string
-    if user_keywords:
-        boosted_kw_params = [f"keywords={quote(kw)}:5" for kw in user_keywords[:50] if kw]
-        if boosted_kw_params:
-            deepgram_ws_url = f"{deepgram_ws_url}&{'&'.join(boosted_kw_params)}"
-            logger.info(f"[Deepgram] Injected {len(boosted_kw_params)} boosted keywords into STT URL")
-
     deepgram_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+
+    async def connect_to_deepgram():
+        models_to_try = ["nova-3", "nova-2"]
+        last_err = None
+        for m in models_to_try:
+            params = {
+                "model": m,
+                "diarize": "true",
+                "smart_format": "true",
+                "interim_results": "false",
+                "endpointing": "300",
+                "punctuate": "true"
+            }
+            url = f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
+            if user_keywords:
+                if m.startswith("nova-3"):
+                    # Nova-3 uses keyterm parameter without weights
+                    kw_params = [f"keyterm={quote(kw.strip())}" for kw in user_keywords[:40] if kw and kw.strip()]
+                else:
+                    # Nova-2 uses legacy keywords with weights
+                    kw_params = [f"keywords={quote(kw.strip())}:5" for kw in user_keywords[:40] if kw and kw.strip()]
+                if kw_params:
+                    url = f"{url}&{'&'.join(kw_params)}"
+            try:
+                try:
+                    conn = await websockets.connect(url, additional_headers=deepgram_headers)
+                except TypeError:
+                    conn = await websockets.connect(url, extra_headers=deepgram_headers)
+                logger.info(f"[WS] Successfully connected to Deepgram Live STT using model '{m}' (session: {session_id})")
+                return conn
+            except Exception as e:
+                logger.warning(f"[WS] Deepgram connection with model '{m}' failed: {e}")
+                last_err = e
+        raise last_err
 
     conversation_history: List[Dict[str, str]] = []
     chunk_count = 0
@@ -843,14 +857,8 @@ async def websocket_audio_endpoint(
     last_speak_timestamp = 0.0
 
     try:
-        # websockets >= 13.0 uses 'additional_headers', older versions use 'extra_headers'
-        try:
-            ws_client_cm = websockets.connect(deepgram_ws_url, additional_headers=deepgram_headers)
-        except TypeError:
-            ws_client_cm = websockets.connect(deepgram_ws_url, extra_headers=deepgram_headers)
-
-        async with ws_client_cm as dg_ws:
-            logger.info(f"[WS] Successfully connected to Deepgram Live Streaming STT for session {session_id}")
+        dg_ws = await connect_to_deepgram()
+        async with dg_ws:
 
             async def forward_audio():
                 """Forwards incoming binary audio frames from Recall browser to Deepgram."""
