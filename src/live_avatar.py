@@ -52,6 +52,7 @@ PUBLIC_BASE_URL = os.getenv(
 )
 
 # Configure Modern Google GenAI Client
+# Using gemini-3.5-flash-lite for cost-effective, low-latency function calling
 gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
     try:
