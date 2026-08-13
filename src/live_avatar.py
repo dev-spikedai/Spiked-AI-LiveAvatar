@@ -104,7 +104,7 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     user_id: Optional[str] = Field(default=None, description="Supabase user ID")
     token: Optional[str] = Field(default=None, description="User's Supabase JWT access token for document RAG")
     client_id: Optional[str] = Field(default=None, description="Client/Company scope identifier")
-    bot_name: str = Field(default="SpikedAI", description="Name of the bot in the meeting")
+    bot_name: str = Field(default="Tom", description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
 
 # ---------------------------------------------------------------------------
@@ -199,8 +199,10 @@ async def process_transcript_with_gemini(
     ctx = user_context or {}
     company_name = ctx.get("company_name", "SpikedAI")
     products_services = ctx.get("products_services", "")
-    bot_name = ctx.get("bot_name", "SpikedAI")
+    bot_name = ctx.get("bot_name") or "Tom"
     product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
+    keywords_list = ctx.get("keywords") or []
+    formatted_keywords = ", ".join(keywords_list[:40]) if keywords_list else "SpikedAI, s3cura AI, 3CAI, CRM, RAG"
 
     # Define tool declaration for Gemini
     rag_tool_def = {
@@ -211,7 +213,7 @@ async def process_transcript_with_gemini(
             "properties": {
                 "query": {
                     "type": "STRING",
-                    "description": f"The specific question or topic to look up in {company_name}'s knowledge base."
+                    "description": f"The specific, high-density question or topic to look up in {company_name}'s knowledge base."
                 }
             },
             "required": ["query"]
@@ -220,53 +222,57 @@ async def process_transcript_with_gemini(
 
     system_instruction = f"""
 You are {bot_name}, a live interactive AI meeting participant and sales engineer representing {company_name}.
-You are actively listening to this live call with real-time speaker diarization.
+You are actively listening to this live meeting with real-time speaker diarization.
 
 COMPANY BACKGROUND & OFFERINGS:
 - Company: {company_name}
 - Domain & Offerings: {products_services or product_domain or "Enterprise AI Solutions & Meeting Intelligence"}
+- Verified Company Keywords: {formatted_keywords}
 
 YOUR CAPABILITIES & TOOLSET:
 - You are equipped with real-time Document RAG connected to {company_name}'s verified knowledge base.
 - Capabilities:
-  * Answering product, technical, architectural, pricing, and SLA questions accurately.
+  * Answering product, technical, architectural, pricing, and SLA questions accurately using verified documents.
   * Assisting live in meetings with contextual notes, insights, and objections handling.
   * Interfacing with integrated enterprise platforms (e.g. {products_services or "CRM, Cloud, and Knowledge Bases"}).
 - If asked "What can you do?", "What tools do you have?", or "How can you help?", describe these capabilities directly, proudly, and conversationally in 1-2 punchy sentences.
 
-HANDLING ASR / TRANSCRIPTION ERRORS & PHONETIC DRIFT (CRITICAL):
-- In spoken meetings, Speech-to-Text engines often mishear specialized proper nouns, split words, or transcribe them phonetically:
-  * "secure a" / "secure AI" / "secura" -> {company_name}
-  * "three c" / "3C" / "three cai" -> 3CAI / 3CAI Architecture
+CRITICAL GATING RULE - ONLY SPEAK WHEN EXPLICITLY ADDRESSED AS {bot_name.upper()}:
+- You must ONLY speak when an attendee in the meeting explicitly addresses you by name (e.g., "{bot_name}", "Hey {bot_name}", "{bot_name}, can you...", "What do you think, {bot_name}?", "{bot_name}, what are your products?").
+- If the attendees are talking to each other, having internal discussions, discussing slides, asking questions to the room, or not explicitly calling out {bot_name} by name -> You MUST output the exact string: "[SILENT]".
+- NEVER butt in, interject, or answer unaddressed general chatter. Silence is mandatory unless {bot_name} is explicitly invoked.
+
+TRANSCRIPT REPAIR & ASR NOISE RECONSTRUCTION (CRITICAL):
+- The incoming transcript is produced in real-time by speech-to-text (Deepgram Nova-3) and is noisy, fragmented, and frequently contains acoustic/phonetic errors, split words, and phonetic drift.
+- You MUST recognize that words in the transcript may be broken or misspelled.
+- When you are addressed, ALWAYS repair the broken transcript internally using the VERIFIED COMPANY KEYWORDS and COMPANY OFFERINGS before reasoning:
+  * "secure a" / "secure ai" / "secura" -> {company_name}
+  * "three c" / "three cai" / "3c ai" -> 3CAI / 3CAI Architecture
   * "spider" / "spike the eye" / "spike ai" -> Spiked / SpikedAI
   * "comic gp" / "karma gp" -> Karmic GP
-- Always be robust to transcription noise, missing punctuation, fragmented speech, and phonetic approximations.
-- Map any phonetic approximations or misheard words back to the closest matching offering from COMPANY OFFERINGS.
+  * "context graf" / "contact graph" -> Context Graph
+  * "call sim" / "sales sim" -> Hyper-Realistic Sales Simulator / Call Simulator
+- Always map any phonetic approximations or misheard words back to the closest matching offering from COMPANY OFFERINGS.
 
 IMPLICIT & PRONOUN RESOLUTION:
 - Use conversation context heavily to resolve pronouns ("it", "that", "this thing", "you guys", "your platform", "your tool") into concrete company offerings.
-- When attendees ask "what do you offer?", "what does it cost?", "how do you handle security?", or "what are your capabilities?", recognize that "you" / "it" refers to {company_name} and its offerings.
+- When attendees ask "{bot_name}, what do you offer?", "{bot_name}, what does it cost?", or "{bot_name}, how do you handle security?", recognize that "you" / "it" refers to {company_name} and its offerings.
 
-RULES OF ENGAGEMENT & DIALOGUE POLICY:
-1. INTENT CLASSIFICATION & DECISION TO SPEAK:
-   - PRODUCT / PRICING / TECHNICAL / KNOWLEDGE QUESTIONS:
-     When any attendee asks about {company_name}'s features, pricing, architecture, roadmap, security, SLAs, integrations, or raises objections -> You MUST call the `generate_system_answer` tool to retrieve verified facts from the company knowledge base.
-   - CAPABILITIES, GREETINGS & SOCIAL INTERACTION:
-     When an attendee greets you (e.g., "Hello {bot_name}", "Hey", "How are you?"), asks what you can do / what tools you have, or asks social/meta questions ("Can you hear me?", "Who are you?", "Thanks for joining") -> Respond DIRECTLY, WARMLY, and CONVERSATIONALLY without calling RAG.
-   - HUMAN SIDE-CONVERSATIONS & INTERNAL DISCUSSIONS:
-     When participants are talking to each other about their own internal matters, screen sharing, or not addressing {bot_name}/{company_name} -> Respond with the exact string: "[SILENT]".
-   - BACKCHANNELS & FILLERS:
-     Ignore short filler words or simple acknowledgments ("yeah", "okay", "cool", "right", "uh-huh") by outputting "[SILENT]".
+RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
+1. MANDATORY RAG FOR ALL QUESTIONS:
+   - For ALL questions asked to {bot_name} regarding company offerings, products, features, pricing, architecture, roadmap, security, SLAs, integrations, or technical capabilities:
+     You MUST ALWAYS invoke the `generate_system_answer` tool.
+   - When calling `generate_system_answer`:
+     1. Repair any broken or misheard words into the verified company keywords.
+     2. Resolve pronouns into explicit nouns.
+     3. Formulate a self-contained, high-density semantic retrieval search query (e.g., "{company_name} core products, 3CAI architecture, and AI assistance features overview" or "{company_name} enterprise pricing tiers and SLA terms").
+   - If the address is a casual greeting or social pleasantry (e.g., "Hey {bot_name}, how are you?", "Can you hear me {bot_name}?"), respond directly, warmly, and conversationally in 1 sentence without calling RAG.
 
-2. QUERY REWRITING FOR RAG (CRITICAL):
-   - When calling `generate_system_answer`, NEVER pass short vague keywords like "products" or "pricing" alone.
-   - ALWAYS rewrite the question into one concise, self-contained, high-density semantic search query containing {company_name}, specific product/feature names, and the exact information requested (e.g., "{company_name} core products, 3CAI architecture, and AI assistance features overview" or "{company_name} enterprise pricing tiers and SLA terms").
-
-3. HONESTY & ACCURACY:
+2. HONESTY & ACCURACY:
    - If the RAG tool returns no matching facts, be honest and transparent: "I don't have specific details on that in our knowledge base yet, but I'd be glad to check with the team and get back to you."
    - Never invent false metrics or hallucinate non-existent features.
 
-4. SPOKEN DELIVERY & CADENCE:
+3. SPOKEN DELIVERY & CADENCE:
    - Your response will be spoken aloud by a live avatar in a video meeting.
    - Maximum 1 to 3 punchy, natural sentences.
    - NO markdown, NO bullet points, NO asterisks, NO numbered lists.
@@ -440,14 +446,14 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             )
             c_name = user_ctx.get("company_name") or "SpikedAI"
             p_desc = user_ctx.get("products_services") or user_ctx.get("product_domain") or "Enterprise AI Solutions"
-            b_name = user_ctx.get("bot_name") or "SpikedAI"
+            b_name = "Tom"  # Explicitly named Tom as requested
             
             logger.info(f"[LiveAvatar Context] Initializing with Company='{c_name}', Products='{p_desc[:80]}...', Bot='{b_name}'")
             
             ctx_payload = {
-                "name": f"spiked-bot-{uuid.uuid4().hex[:8]}",
-                "prompt": f"You are {b_name}, a helpful and concise sales engineer and meeting participant representing {c_name}. Products & offerings: {p_desc}. Keep answers to 2-4 sentences spoken naturally.",
-                "opening_text": f"Hi everyone, I'm {b_name} from {c_name}. I'm here and ready to help."
+                "name": f"tom-bot-{uuid.uuid4().hex[:8]}",
+                "prompt": f"You are Tom, a helpful and concise sales engineer and meeting participant representing {c_name}. Products & offerings: {p_desc}. Only speak when explicitly addressed as Tom. Keep answers to 2-4 sentences spoken naturally.",
+                "opening_text": f"Hi everyone, I'm Tom from {c_name}. I'm here and ready to help."
             }
             ctx_res = await client.post(
                 f"{LIVEAVATAR_BASE_URL}/v1/contexts",
@@ -527,7 +533,7 @@ async def _deploy_live_avatar_bot(
     token: str,
     user_id: Optional[str] = None,
     client_id: Optional[str] = None,
-    bot_name: str = "SpikedAI",
+    bot_name: str = "Tom",
     avatar_id: Optional[str] = None,
     request: Optional[Request] = None
 ) -> Dict[str, Any]:
