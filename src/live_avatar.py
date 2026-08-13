@@ -204,21 +204,25 @@ async def process_transcript_with_gemini(
     keywords_list = ctx.get("keywords") or []
     formatted_keywords = ", ".join(keywords_list[:40]) if keywords_list else "SpikedAI, s3cura AI, 3CAI, CRM, RAG"
 
-    # Define tool declaration for Gemini
-    rag_tool_def = {
-        "name": "generate_system_answer",
-        "description": f"Retrieves verified knowledge, pricing, architecture, SLAs, product features, and seller persona guidelines for {company_name} from the company document RAG database.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "query": {
-                    "type": "STRING",
-                    "description": f"The specific, high-density question or topic to look up in {company_name}'s knowledge base."
-                }
-            },
-            "required": ["query"]
-        }
-    }
+    # Define official Tool protobuf for Gemini
+    rag_tool = genai.protos.Tool(
+        function_declarations=[
+            genai.protos.FunctionDeclaration(
+                name="generate_system_answer",
+                description=f"REQUIRED tool to retrieve verified facts, documentation, products, pricing, and architecture for {company_name} from the company document RAG database.",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "query": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description=f"The specific, high-density question or topic to search in {company_name}'s knowledge base."
+                        )
+                    },
+                    required=["query"]
+                )
+            )
+        ]
+    )
 
     system_instruction = f"""
 You are {bot_name}, a live interactive AI meeting participant and sales engineer representing {company_name}.
@@ -230,7 +234,7 @@ COMPANY BACKGROUND & OFFERINGS:
 - Verified Company Keywords: {formatted_keywords}
 
 YOUR CAPABILITIES & TOOLSET:
-- You are equipped with real-time Document RAG connected to {company_name}'s verified knowledge base.
+- You are equipped with real-time Document RAG connected to {company_name}'s verified knowledge base via the `generate_system_answer` tool.
 - Capabilities:
   * Answering product, technical, architectural, pricing, and SLA questions accurately using verified documents.
   * Assisting live in meetings with contextual notes, insights, and objections handling.
@@ -259,14 +263,16 @@ IMPLICIT & PRONOUN RESOLUTION:
 - When attendees ask "{bot_name}, what do you offer?", "{bot_name}, what does it cost?", or "{bot_name}, how do you handle security?", recognize that "you" / "it" refers to {company_name} and its offerings.
 
 RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
-1. MANDATORY RAG FOR ALL QUESTIONS:
-   - For ALL questions asked to {bot_name} regarding company offerings, products, features, pricing, architecture, roadmap, security, SLAs, integrations, or technical capabilities:
-     You MUST ALWAYS invoke the `generate_system_answer` tool.
+1. MANDATORY RAG TOOL CALL FOR ALL QUESTIONS (CRITICAL):
+   - You do NOT have raw internal knowledge stored in memory.
+   - For ANY question asked to {bot_name} regarding company offerings, products, features, pricing, architecture, roadmap, security, SLAs, integrations, or technical capabilities:
+     YOU MUST ALWAYS EXECUTE THE TOOL `generate_system_answer(query=...)`.
+   - Do NOT generate direct text answers for knowledge questions without calling `generate_system_answer`.
    - When calling `generate_system_answer`:
      1. Repair any broken or misheard words into the verified company keywords.
-     2. Resolve pronouns into explicit nouns.
+     2. Resolve pronouns into explicit product/company names.
      3. Formulate a self-contained, high-density semantic retrieval search query (e.g., "{company_name} core products, 3CAI architecture, and AI assistance features overview" or "{company_name} enterprise pricing tiers and SLA terms").
-   - If the address is a casual greeting or social pleasantry (e.g., "Hey {bot_name}, how are you?", "Can you hear me {bot_name}?"), respond directly, warmly, and conversationally in 1 sentence without calling RAG.
+   - If the address is purely a casual greeting or social pleasantry (e.g., "Hey {bot_name}, how are you?", "Can you hear me {bot_name}?"), respond directly, warmly, and conversationally in 1 sentence without calling RAG.
 
 2. HONESTY & ACCURACY:
    - If the RAG tool returns no matching facts, be honest and transparent: "I don't have specific details on that in our knowledge base yet, but I'd be glad to check with the team and get back to you."
@@ -287,16 +293,15 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
    - Tone: Confident, helpful, concise, and professional.
 """
 
-    preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    preferred_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services[:100]}...', Domain='{product_domain}', Bot='{bot_name}'")
     logger.info(f"[Prompt Debug] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
     
     candidate_models = [
         preferred_model,
-        "gemini-3.5-flash-lite",
-        "gemini-2.0-flash-lite",
         "gemini-2.0-flash",
-        "gemini-1.5-flash"
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
     ]
     seen = set()
     candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
@@ -311,7 +316,7 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
                     "max_output_tokens": 200
                 },
                 system_instruction=system_instruction,
-                tools=[{"function_declarations": [rag_tool_def]}]
+                tools=[rag_tool]
             )
             break
         except Exception as e:
