@@ -321,9 +321,9 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
         logger.error("Failed to initialize any Gemini model candidate")
         return None
 
-    # Build conversation context
+    # Build conversation context with previous meeting turns
     formatted_context = ""
-    for turn in conversation_history[-6:]:
+    for turn in conversation_history[-12:]:
         formatted_context += f"Speaker {turn.get('speaker', 'Participant')}: {turn.get('text', '')}\n"
     formatted_context += f"Speaker {speaker}: {transcript}\n"
 
