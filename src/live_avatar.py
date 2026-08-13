@@ -34,7 +34,7 @@ logger = logging.getLogger("LiveAvatar-Spiked")
 # Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API") or os.getenv("DEEPGRAM_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://us-west-2.recall.ai")
@@ -298,7 +298,7 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
    - Tone: Confident, helpful, concise, and professional.
 """
 
-    preferred_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services[:100]}...', Domain='{product_domain}', Bot='{bot_name}'")
     logger.info(f"[Prompt Debug] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
 
