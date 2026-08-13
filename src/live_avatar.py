@@ -173,7 +173,7 @@ async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[s
                     full_text += line + " "
             
             result = full_text.strip()
-            logger.info(f"[RAG] Received grounded answer ({len(result)} chars)")
+            logger.info(f"[RAG] Received grounded answer ({len(result)} chars):\n{result}")
             return result or "No specific documentation found for this query."
             
     except Exception as e:
@@ -363,10 +363,10 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
                     # If RAG returned no matching docs, fallback to injected company product catalog
                     if not rag_result or "No relevant information found" in rag_result or "could not retrieve" in rag_result:
                         fallback_facts = f"Verified company knowledge: {company_name} offers {products_services}. Domain: {product_domain}."
-                        logger.info(f"[Gemini Agent] RAG empty -> Enhancing with user_configs: '{fallback_facts[:120]}...'")
+                        logger.info(f"[Gemini Agent] RAG empty -> Enhancing with user_configs:\n{fallback_facts}")
                         rag_result = f"{rag_result}\n\n{fallback_facts}"
                     else:
-                        logger.info(f"[Gemini Agent] RAG Result preview: '{rag_result[:120]}...'")
+                        logger.info(f"[Gemini Agent] >>> FULL RAG RESULT FOR GEMINI:\n{rag_result}\n<<<")
                     
                     tool_resp_part = types.Part.from_function_response(
                         name="generate_system_answer",
