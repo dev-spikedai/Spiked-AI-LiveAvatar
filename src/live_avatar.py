@@ -456,8 +456,9 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
         }
 
         # FULL mode requires interactivity_type + avatar_persona
+        # Set interactivity_type to PUSH_TO_TALK to prevent HeyGen's built-in LLM from responding automatically
         if payload.mode == "FULL":
-            token_payload["interactivity_type"] = "CONVERSATIONAL"
+            token_payload["interactivity_type"] = "PUSH_TO_TALK"
             if context_id:
                 token_payload["avatar_persona"] = {"context_id": context_id}
             else:
