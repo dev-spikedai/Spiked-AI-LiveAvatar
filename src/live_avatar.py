@@ -316,6 +316,34 @@ RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
         formatted_context += f"Speaker {turn.get('speaker', 'Participant')}: {turn.get('text', '')}\n"
     formatted_context += f"Speaker {speaker}: {transcript}\n"
 
+    # Deterministic invocation gating:
+    # Check if Tom is explicitly mentioned by name or phonetic aliases, OR if this is a direct conversational continuation.
+    is_explicitly_addressed = bot_name.lower() in transcript.lower()
+    
+    # Expand with common phonetic drifts of "Tom" (e.g. Tom, Thom, Tone, Tong, Dom, Toom, Time)
+    phonetic_aliases = ["tom", "thom", "dom", "tone", "tong", "time", "toom"]
+    if not is_explicitly_addressed:
+        words_in_transcript = [w.strip("?,.!") for w in transcript.lower().split()]
+        for alias in phonetic_aliases:
+            if alias in words_in_transcript:
+                is_explicitly_addressed = True
+                break
+                
+    is_continuation = False
+    if conversation_history:
+        last_turn = conversation_history[-1]
+        # If the last speaking participant was the bot, the user is directly continuing dialog with Tom
+        if last_turn.get("speaker") == bot_name:
+            is_continuation = True
+            
+    is_addressed = is_explicitly_addressed or is_continuation
+    
+    # Instruct Gemini on the gating decision to prevent prompt hallucination
+    if is_addressed:
+        formatted_context += f"\n(Gating Instruction: You are currently ADDRESSED. Answer the question '{transcript}' naturally.)"
+    else:
+        formatted_context += f"\n(Gating Instruction: You are NOT addressed. Do NOT reply. Output exactly '[SILENT]'.)"
+
     try:
         chat = gemini_client.aio.chats.create(model=preferred_model, config=config)
         response = await chat.send_message(formatted_context)
@@ -884,9 +912,11 @@ async def websocket_audio_endpoint(
                                     transcript_text = correct_stt_text(raw_transcript, user_keywords)
                                     logger.info(f"[Deepgram STT] Speaker {speaker_id} Turn: '{raw_transcript}' -> Corrected: '{transcript_text}'")
                                     
-                                    # Barge-in: If user speaks within 6s of avatar speaking, notify avatar to interrupt
-                                    if time.time() - last_speak_timestamp < 6.0:
-                                        logger.info("[Barge-In] User spoke while avatar was active — sending interrupt")
+                                    # Barge-in: If user speaks after avatar has been speaking for at least 1.5s, notify to interrupt.
+                                    # This avoids instant back-to-back STT queue race conditions.
+                                    time_since_speak = time.time() - last_speak_timestamp
+                                    if 1.5 <= time_since_speak < 6.0:
+                                        logger.info(f"[Barge-In] User spoke while avatar was active (time_since_speak={time_since_speak:.2f}s) — sending interrupt")
                                         await websocket.send_json({
                                             "type": "avatar_interrupt",
                                             "session_id": session_id
