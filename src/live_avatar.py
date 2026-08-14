@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import logging
+import re
 import uuid
 import hashlib
 import hmac
@@ -68,7 +69,7 @@ AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
 AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "500"))
 AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
-DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
+DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Lara").strip() or "Lara"
 
 # Configure Modern Google GenAI Client
 # Using gemini-3.5-flash-lite for cost-effective, low-latency function calling
@@ -232,7 +233,7 @@ async def process_transcript_with_gemini(
     ctx = user_context or {}
     company_name = ctx.get("company_name", "SpikedAI")
     products_services = ctx.get("products_services", "")
-    bot_name = ctx.get("bot_name") or "Tom"
+    bot_name = ctx.get("bot_name") or "Lara"
     product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     catalog = build_entity_catalog(ctx)
@@ -769,20 +770,21 @@ def _schedule_completed_turn(
     transcript = (utterance.get("text") or "").strip()
     if not transcript:
         return
-    bot_name = run.get("bot_name") or "Tom"
+    bot_name = run.get("bot_name") or "Lara"
     invocation = detect_invocation(transcript, bot_name)
     history = run.setdefault("history", [])
     history_snapshot = list(history[-20:])
     history.append({"speaker": participant_name, "participant_id": participant_id, "text": transcript})
     del history[:-40]
     logger.info(
-        "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s addressed=%s matched_name=%s reason=%s",
+        "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s addressed=%s matched_name=%s reason=%s transcript=%r",
         participant_id,
         participant_name,
         bot_name,
         invocation.addressed,
         invocation.matched_name,
         invocation.reason,
+        re.sub(r"\s+", " ", transcript)[:160],
     )
     if not invocation.addressed:
         return
@@ -970,7 +972,7 @@ async def recall_separate_audio_endpoint(
         client_id=run.get("client_id"),
         auth_token=run.get("token"),
     )
-    user_context["bot_name"] = run.get("bot_name") or "Tom"
+    user_context["bot_name"] = run.get("bot_name") or "Lara"
     run["user_context"] = user_context
     keywords = build_entity_catalog(user_context)
     transcribers: Dict[str, ParticipantTranscriber] = {}
@@ -1007,7 +1009,7 @@ async def recall_separate_audio_endpoint(
             if not pcm:
                 continue
 
-            if participant_name.casefold() == (run.get("bot_name") or "Tom").casefold():
+            if participant_name.casefold() == (run.get("bot_name") or "Lara").casefold():
                 continue
 
             detector = detectors.setdefault(

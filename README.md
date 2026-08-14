@@ -39,11 +39,11 @@ AGENT_MAX_REPLY_WORDS=45
 
 ## Meeting behavior
 
-- The agent speaks only when a finalized participant utterance explicitly contains its configured name. Conservative STT formatting variants are supported (for example, `SpikedAI`, `Spiked AI`, `Spiked A.I.`, and `Spike AI`). Every turn requires the name.
+- Lara speaks only when a finalized participant utterance explicitly contains `Lara`. Every turn requires the name.
 - Participant names come from Recall and are preserved in conversation history.
 - Company, product, pricing, security, SLA, and integration questions always call document RAG before an answer is generated.
 - Normal answers are capped at two sentences and 45 spoken words; no automatic follow-up question is added.
-- While Tom is speaking, 700 ms of sustained speech interrupts playback but does not trigger a reply unless the new turn also invokes Tom.
+- While Lara is speaking, 700 ms of sustained speech interrupts playback but does not trigger a reply unless the new turn also invokes Lara.
 
 3. Run the development server:
 ```bash

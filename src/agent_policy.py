@@ -83,8 +83,8 @@ def detect_invocation(text: str, bot_name: str) -> InvocationDecision:
                 index += 1
         return collapsed
 
-    configured = (bot_name or "Tom").strip()
-    configured_words = normalized_words(configured) or ["tom"]
+    configured = (bot_name or "Lara").strip()
+    configured_words = normalized_words(configured) or ["lara"]
     aliases = {tuple(configured_words)}
     compact_name = "".join(configured_words)
     if compact_name == "tom":
