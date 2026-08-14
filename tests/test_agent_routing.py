@@ -102,6 +102,55 @@ def test_rag_failure_returns_short_honest_fallback(monkeypatch):
     assert answer == "I don’t have verified information on that available right now."
 
 
+def test_llm_response_gate_can_keep_the_agent_silent(monkeypatch):
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysis(
+                response_action="silent",
+                intent="social",
+                resolved_query="",
+                corrections=[],
+            )
+        ),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+
+    async def fail_if_rag_called(*args):
+        raise AssertionError("silent turns must not query RAG")
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", fail_if_rag_called)
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="I told Tom about this yesterday.",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Tom"},
+    ))
+    assert answer is None
+
+
+def test_llm_response_gate_can_acknowledge_without_generation(monkeypatch):
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysis(
+                response_action="acknowledge",
+                intent="command",
+                resolved_query="wait",
+                corrections=[],
+            )
+        ),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="Tom, please wait a moment.",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Tom"},
+    ))
+    assert answer == "Understood."
+
+
 def make_run(**overrides):
     run = {
         "bot_name": "Tom",
@@ -116,6 +165,55 @@ def make_run(**overrides):
     }
     run.update(overrides)
     return run
+
+
+def test_third_person_mention_cannot_take_the_fast_path(monkeypatch):
+    """The fast path must not skip the LLM addressee gate on an ambiguous turn.
+
+    "pricing" satisfies requires_company_knowledge and there is no pronoun, so
+    the only thing standing between this turn and an unwanted answer is the
+    is_directly_addressed check.
+    """
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysis(
+                response_action="silent",
+                intent="meeting_context",
+                resolved_query="",
+                corrections=[],
+            )
+        ),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+
+    async def fail_if_rag_called(*args):
+        raise AssertionError("a third-person mention must not reach RAG")
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", fail_if_rag_called)
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="I asked Tom about pricing yesterday.",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Tom", "keywords": ["SpikedAI"]},
+    ))
+    assert answer is None
+
+
+def test_acknowledgement_is_rate_limited_like_any_other_reply():
+    """`acknowledge` returns text through the normal dispatch, so the governor
+    sees it. Otherwise repeated "Tom, wait" would machine-gun "Understood."."""
+    governor = live_avatar.SpeechGovernor()
+    now = live_avatar.time.monotonic()
+
+    allowed, _ = governor.allows_reply(now)
+    assert allowed
+    governor.note_reply("Understood.", now)
+
+    # Same acknowledgement moments later is both inside the cooldown and a duplicate.
+    allowed, reason = governor.allows_reply(now + 0.5)
+    assert not allowed and reason == "cooldown"
+    assert governor.is_duplicate("Understood.", now + 5)
 
 
 def test_unaddressed_turn_is_recorded_but_never_scheduled():

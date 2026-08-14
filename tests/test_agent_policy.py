@@ -32,6 +32,13 @@ def test_invocation_is_required_again_after_an_answer():
     assert not detect_invocation("And what about security?", "Tom").addressed
 
 
+def test_tom_is_a_precise_wake_name():
+    assert detect_invocation("Tom, can you answer that?", "Tom").addressed
+    assert detect_invocation("What do you think, Tom?", "Tom").addressed
+    assert not detect_invocation("Ctom, can you answer that?", "Tom").addressed
+    assert not detect_invocation("The larynx is unrelated.", "Tom").addressed
+
+
 def test_spiked_ai_invocation_accepts_stt_formatting_variants():
     for transcript in (
         "SpikedAI, what do you offer?",

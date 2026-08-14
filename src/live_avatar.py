@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import logging
+import re
 import time
 import uuid
 import hashlib
@@ -22,6 +23,7 @@ from src.agent_policy import (
     build_entity_catalog,
     closest_entities,
     estimate_speech_seconds,
+    is_directly_addressed,
     evaluate_turn,
     is_probably_incomplete,
     needs_context_resolution,
@@ -169,6 +171,7 @@ class TranscriptCorrection(BaseModel):
 
 
 class TurnAnalysis(BaseModel):
+    response_action: Literal["respond", "acknowledge", "silent"] = "respond"
     intent: Literal["company_knowledge", "meeting_context", "social", "command"]
     resolved_query: str
     corrections: List[TranscriptCorrection] = Field(default_factory=list)
@@ -270,12 +273,19 @@ async def process_transcript_with_gemini(
         for turn in conversation_history[-12:]
     )
     try:
-        # Fast path: a self-contained company question is already fully routed by
-        # the deterministic gate, and its raw text is a fine retrieval query. The
-        # classification round trip would only re-derive what we know, so skip it.
-        if requires_company_knowledge(transcript, catalog) and not needs_context_resolution(transcript):
+        # Fast path: skip the classification round trip only when the turn is
+        # unambiguously addressed to the agent — the wake name opens the sentence
+        # and a self-contained company question follows. Anything less certain
+        # ("I asked Tom about pricing", "was Tom's answer right, Sam?") still needs
+        # the LLM addressee gate below, which is the whole point of that call.
+        if (
+            is_directly_addressed(transcript, bot_name)
+            and requires_company_knowledge(transcript, catalog)
+            and not needs_context_resolution(transcript)
+        ):
             logger.info("[Agent Route] Fast path: skipped classification round trip")
             analysis = TurnAnalysis(
+                response_action="respond",
                 intent="company_knowledge",
                 resolved_query=transcript,
                 corrections=[],
@@ -293,7 +303,7 @@ async def process_transcript_with_gemini(
                 preferred_model=preferred_model,
             )
 
-        analysis_prompt = f"""Classify and normalize this addressed meeting turn.
+        analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn.
 Company: {company_name}
 Offerings: {products_services or product_domain}
 Verified entity candidates: {candidate_entities}
@@ -302,6 +312,11 @@ Recent finalized conversation:
 Current speaker: {speaker}
 Raw ASR: {transcript}
 
+Set response_action to:
+- respond: the speaker directly asks {bot_name} a question, requests an action/opinion, or gives {bot_name} a command.
+- acknowledge: the speaker directly gives {bot_name} information or a simple instruction that only needs a brief confirmation.
+- silent: {bot_name} is merely mentioned, quoted, discussed in third person, explicitly told not to answer, or the request is directed to somebody else.
+The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
 Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
 Use meeting_context only for questions about what meeting participants said or discussed.
 Use social for greetings and audio checks. Use command for stop/wait/repeat commands.
@@ -326,10 +341,22 @@ Resolve pronouns and omitted context only in resolved_query. Propose corrections
         except Exception:
             logger.warning("[Agent Route] Structured routing failed; defaulting substantive turn to RAG", exc_info=True)
             analysis = TurnAnalysis(
+                response_action="respond",
                 intent="company_knowledge",
                 resolved_query=transcript,
                 corrections=[],
             )
+
+        logger.info(
+            "[LLM Response Gate] speaker=%s action=%s intent=%s",
+            speaker,
+            analysis.response_action,
+            analysis.intent,
+        )
+        if analysis.response_action == "silent":
+            return None
+        if analysis.response_action == "acknowledge":
+            return "Understood."
 
         if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
             analysis.intent = "company_knowledge"
@@ -1095,75 +1122,6 @@ def _finalize_turn(
     run["active_response_task"] = asyncio.create_task(respond())
 
 
-def _schedule_completed_turn(
-    run: Dict[str, Any],
-    participant_id: str,
-    participant_name: str,
-    utterance: Dict[str, Any],
-) -> None:
-    transcript = (utterance.get("text") or "").strip()
-    if not transcript:
-        return
-    bot_name = run.get("bot_name") or "Tom"
-    invocation = detect_invocation(transcript, bot_name)
-    history = run.setdefault("history", [])
-    history_snapshot = list(history[-20:])
-    history.append({"speaker": participant_name, "participant_id": participant_id, "text": transcript})
-    del history[:-40]
-    logger.info(
-        "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s addressed=%s matched_name=%s reason=%s",
-        participant_id,
-        participant_name,
-        bot_name,
-        invocation.addressed,
-        invocation.matched_name,
-        invocation.reason,
-    )
-    if not invocation.addressed:
-        return
-
-    previous_task = run.get("active_response_task")
-    if previous_task and not previous_task.done():
-        previous_task.cancel()
-
-    run["turn_counter"] = int(run.get("turn_counter", 0)) + 1
-    turn_id = run["turn_counter"]
-    run["active_turn_id"] = turn_id
-    run["state"] = AgentState.THINKING
-
-    async def respond() -> None:
-        try:
-            answer = await process_transcript_with_gemini(
-                transcript=transcript,
-                speaker=participant_name,
-                conversation_history=history_snapshot,
-                auth_token=run.get("token") or "",
-                client_id=run.get("client_id"),
-                user_context=run.get("user_context") or {},
-            )
-            if turn_id != run.get("active_turn_id"):
-                logger.info("[Agent] Discarded stale response turn_id=%s", turn_id)
-                return
-            if not answer:
-                run["state"] = AgentState.LISTENING
-                return
-            control_ws = run.get("control_ws")
-            if not control_ws:
-                logger.warning("[Agent] Avatar control socket unavailable for turn_id=%s", turn_id)
-                run["state"] = AgentState.LISTENING
-                return
-            history.append({"speaker": bot_name, "participant_id": "bot", "text": answer})
-            del history[:-40]
-            await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
-        except asyncio.CancelledError:
-            logger.info("[Agent] Cancelled superseded turn_id=%s", turn_id)
-        except Exception:
-            run["state"] = AgentState.LISTENING
-            logger.error("[Agent] Failed addressed turn_id=%s", turn_id, exc_info=True)
-
-    run["active_response_task"] = asyncio.create_task(respond())
-
-
 class ParticipantTranscriber:
     def __init__(
         self,
@@ -1355,7 +1313,7 @@ async def recall_separate_audio_endpoint(
             # names, and the avatar returning through a participant's speakers.
             if participant.get("is_bot") or participant_id == str(run.get("bot_participant_id") or ""):
                 continue
-            if participant_name.casefold() == (run.get("bot_name") or "Tom").casefold():
+            if participant_name.casefold() == (run.get("bot_name") or DEFAULT_BOT_NAME).casefold():
                 continue
 
             detector = detectors.setdefault(

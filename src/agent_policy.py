@@ -191,10 +191,46 @@ def requires_company_knowledge(text: str, catalog: Iterable[str]) -> bool:
     )
 
 
+# Verbs that make a nameless remainder an instruction to the agent rather than a
+# remark about it.
+_IMPERATIVE_STARTERS = frozenset({
+    "tell", "explain", "elaborate", "describe", "summarize", "summarise",
+    "list", "give", "show", "walk", "define", "compare",
+})
+
+
 _ANAPHORA = frozenset({
     "it", "its", "it's", "that", "this", "they", "them", "their", "those",
     "these", "he", "she", "him", "her", "his", "one", "ones",
 })
+
+
+def is_directly_addressed(text: str, bot_name: str) -> bool:
+    """True when the turn opens by naming the agent, then asks something.
+
+    "Tom, what is your pricing?" is unambiguous. "I asked Tom about pricing" puts
+    the name mid-sentence and is a third-person mention, so it must not qualify —
+    resolving that correctly needs the LLM addressee gate, not a regex.
+    """
+
+    invocation = detect_invocation(text, bot_name)
+    if not invocation.addressed or not invocation.matched_name:
+        return False
+
+    normalized = _normalize_for_match(text)
+    name = invocation.matched_name
+    if not normalized.startswith(name):
+        return False
+
+    remainder = normalized[len(name):].split()
+    if not remainder:
+        return False
+    # A trailing "?" is the strongest signal. Otherwise only a direct imperative
+    # counts: "Tom is great at pricing" opens with the name and reads as
+    # question-shaped to a looser check, but it is a statement about him.
+    # Anything else falls through to the LLM gate, which costs latency, not
+    # correctness.
+    return text.strip().endswith("?") or remainder[0] in _IMPERATIVE_STARTERS
 
 
 def needs_context_resolution(text: str) -> bool:

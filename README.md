@@ -39,7 +39,8 @@ AGENT_MAX_REPLY_WORDS=45
 
 ## Meeting behavior
 
-- The agent speaks only when a finalized participant utterance explicitly contains its configured name. Conservative STT formatting variants are supported (for example, `SpikedAI`, `Spiked AI`, `Spiked A.I.`, and `Spike AI`). Every turn requires the name.
+- Tom speaks only when a finalized participant utterance explicitly contains `Tom`. Every turn requires the name.
+- After wake-name detection, a constrained LLM gate chooses `respond`, `acknowledge`, or `silent`, so third-person mentions and explicit requests not to answer do not make Tom speak.
 - Participant names come from Recall and are preserved in conversation history.
 - Company, product, pricing, security, SLA, and integration questions always call document RAG before an answer is generated.
 - Normal answers are capped at two sentences and 45 spoken words; no automatic follow-up question is added.
