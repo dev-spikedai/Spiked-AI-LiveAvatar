@@ -25,28 +25,27 @@ sequenceDiagram
     Bot->>Backend: GET credentials
     Backend-->>Bot: Return WebRTC Token
     Bot->>LASDK: Initialize WebRTC
-    Bot->>Backend: Open Audio WebSocket
+    Bot->>Backend: Open output-control WebSocket
 
     %% Audio Streaming & STT
     Note over Participant, Backend: 2. Real-Time Audio & Transcription
     Participant->>Bot: Speak in Meeting
-    Bot->>Backend: Stream raw audio chunks
-    Backend->>DG: Forward audio stream
-    DG-->>Backend: Return transcripts
+    Bot->>Backend: Recall realtime endpoint sends participant-separated PCM + participant identity
+    Backend->>DG: Forward each participant to a dedicated Nova-3 stream
+    DG-->>Backend: Return interim/final segments and end-of-turn events
 
     %% Orchestrator Evaluation
     Note over Backend, Gemini: 3. Addressing & Gating Check
-    Backend->>Backend: Repair STT noise
-    alt Addressed to Tom OR Conversational Continuation
-        Backend->>Gemini: POST generateContent
-        Note right of Gemini: System Prompt instructs RAG tool calling
-        Gemini-->>Backend: Tool Call generate_system_answer
+    Backend->>Backend: Assemble complete turn and apply deterministic name gate
+    alt Explicitly addressed to Tom on this turn
+        Backend->>Gemini: Structured intent + contextual query repair
+        Gemini-->>Backend: Intent, resolved query, validated correction candidates
         
         %% RAG Execution
-        Backend->>SpikedRAG: POST ask handsfree
+        Backend->>SpikedRAG: Deterministic POST ask handsfree for company knowledge
         SpikedRAG-->>Backend: Return grounded documents
         
-        Backend->>Gemini: Send RAG results
+        Backend->>Gemini: Generate short answer from RAG results
         Gemini-->>Backend: Final response with spoken text
         
         %% Speaking Command
@@ -90,7 +89,7 @@ The integration is divided across the following key services:
 * **Responsibilities**:
   * Renders the photorealistic 3D/2D avatar (Tom) with sub-second lipsync.
   * Streams raw audio and H264 video back to the headless browser via a LiveKit-hosted WebRTC room.
-  * **Interactivity Configuration**: Configured with `interactivity_type: "PUSH_TO_TALK"`. This completely deactivates HeyGen's built-in, server-side LLM conversational engine, preventing race conditions or generic responses while Gemini processes custom RAG answers. The avatar is controlled strictly by our orchestrator via the `avatar.speak_text` command.
+* **Interactivity Configuration**: Configured with `interactivity_type: "PUSH_TO_TALK"`, kept in `avatar.stop_listening`, and used only through `avatar.speak_text`. No meeting microphone is published into LiveAvatar, so its internal ASR/LLM cannot race the orchestrator.
 
 ### D. `SpikedAI-Backend-One`
 * **Endpoint**: `/ask/handsfree`
@@ -110,24 +109,17 @@ The integration is divided across the following key services:
 ## 3. Key Orchestration Logic
 
 ### 1. Conversational Dialogue & Gating Policy
-Tom stays silent (`[SILENT]`) unless explicitly addressed. Gating is calculated deterministically by checking:
-1. **Explicit Name Invocation**: If the transcript contains the name `"Tom"` or any of its misheard phonetic approximations (e.g. `Thom`, `Dom`, `Tong`, `Tone`, `Toom`, `Time`).
-2. **Dialog Continuation**: If Tom spoke on the *immediate previous turn* in the history, any fast user response is treated as a conversational continuation, allowing back-and-forth dialogue without needing the user to repeat "Tom" every sentence.
+Tom stays silent unless each finalized utterance explicitly contains `Tom` or the safe spelling variant `Thom`. Common words such as `time` and `tone`, other names such as `Dom`, and automatic post-answer continuation are deliberately rejected.
 
 ### 2. ASR Noise Repair
-Since real-time meeting audio transcribes with errors, transcripts are normalized before hitting Gemini using strategic keywords:
-* `"secure a" / "secura" / "secure ai" -> "s3cura AI"`
-* `"three c" / "three cai" / "3c ai" -> "3CAI"`
-* `"spider" / "spike the eye" / "spike ai" -> "SpikedAI"`
-* `"comic gp" / "karma gp" -> "Karmic GP"`
-* `"context graf" / "contact graph" -> "Context Graph"`
+Nova-3 receives up to 100 verified company/product keyterms. Gemini may propose entity corrections after an addressed, complete turn, but the backend accepts only high-confidence replacements found in the verified entity catalog. Pronouns and omitted context are expanded in a separate retrieval query without rewriting the stored transcript.
 
 ### 3. Graceful Barge-In & Interruption
-* If a participant interrupts and speaks while the avatar is talking, the orchestrator sends an `avatar_interrupt` command to halt the avatar's video speech instantly.
-* **STT Grace Window**: A `1.5s` guard window is enforced. Barge-ins cannot trigger within the first 1.5 seconds of starting speech to prevent back-to-back transcripts in the STT queue from canceling the output before the user has actually heard it.
+* Participant-separated PCM is evaluated in 20 ms VAD frames. At least 700 ms of sustained non-bot speech sends one `avatar_interrupt` command.
+* An interruption stops playback only. The completed participant turn still needs to invoke Tom before it can receive an answer.
 
 ### 4. Sliding Context Window
-* A sliding history window of the last **12 turns** is injected into each Gemini request to preserve conversational context, pronoun resolution ("it", "that platform", "your service"), and dialogue coherence.
+* A bounded named-speaker history is retained per run. The last 12 turns are supplied for routing, contextual repair, pronoun resolution, and answer generation.
 
 ---
 

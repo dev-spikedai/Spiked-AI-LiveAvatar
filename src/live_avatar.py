@@ -1,18 +1,31 @@
 import os
 import json
 import base64
-import time
 import asyncio
 import logging
 import uuid
-from typing import Optional, List, Dict, Any
+import hashlib
+import hmac
+from typing import Optional, List, Dict, Any, Literal
 from urllib.parse import urlencode, quote
 
-from src.supabase_client import get_user_keywords_and_products, correct_stt_text
+from src.supabase_client import get_user_keywords_and_products
+from src.agent_policy import (
+    AgentState,
+    FinalUtteranceBuffer,
+    SustainedSpeechDetector,
+    apply_validated_corrections,
+    build_entity_catalog,
+    closest_entities,
+    detect_invocation,
+    normalize_reply,
+    requires_company_knowledge,
+)
 
 import httpx
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request, Header, Form
+from websockets.exceptions import ConnectionClosed
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -37,6 +50,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
+RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
 RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://us-west-2.recall.ai")
 RECALL_WEBHOOK_URL = os.getenv(
     "RECALL_WEBHOOK_URL", 
@@ -44,12 +58,17 @@ RECALL_WEBHOOK_URL = os.getenv(
 )
 LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
-LIVEAVATAR_AVATAR_ID = os.getenv("LIVEAVATAR_AVATAR_ID", "dd73ea75-1218-4ef3-92ce-606d5f7fbc0a")
+LIVEAVATAR_AVATAR_ID = os.getenv("LIVEAVATAR_AVATAR_ID", "69cf601f-b35b-4d1b-a701-c854d223b5a5")
 LIVEAVATAR_SANDBOX = os.getenv("LIVEAVATAR_SANDBOX", "false").lower() == "true"
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", 
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
+AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
+AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "500"))
+AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
+AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
+DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
 
 # Configure Modern Google GenAI Client
 # Using gemini-3.5-flash-lite for cost-effective, low-latency function calling
@@ -57,7 +76,7 @@ gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info(f"[Google GenAI] Official modern SDK client initialized with key: {GEMINI_API_KEY[:8]}...{GEMINI_API_KEY[-6:]}")
+        logger.info("[Google GenAI] Official modern SDK client initialized")
     except Exception as e:
         logger.warning(f"[Google GenAI] Could not initialize client: {e}")
 else:
@@ -104,14 +123,27 @@ class CreateLiveAvatarRequest(BaseModel):
     user_id: Optional[str] = Field(default=None, description="User ID for fetching context")
     client_id: Optional[str] = Field(default=None, description="Client ID for fetching context")
     token: Optional[str] = Field(default=None, description="Auth token")
+    bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Meeting display and invocation name")
 
 class CreateBotWithLiveAvatarRequest(BaseModel):
     meeting_url: str = Field(..., description="Zoom, Google Meet, or MS Teams URL")
     user_id: Optional[str] = Field(default=None, description="Supabase user ID")
     token: Optional[str] = Field(default=None, description="User's Supabase JWT access token for document RAG")
     client_id: Optional[str] = Field(default=None, description="Client/Company scope identifier")
-    bot_name: str = Field(default="Tom", description="Name of the bot in the meeting")
+    bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
+
+
+class TranscriptCorrection(BaseModel):
+    raw: str = ""
+    replacement: str = ""
+    confidence: float = 0.0
+
+
+class TurnAnalysis(BaseModel):
+    intent: Literal["company_knowledge", "meeting_context", "social", "command"]
+    resolved_query: str
+    corrections: List[TranscriptCorrection] = Field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 # Static Webpage Hosting (Self-Hosted avatar.html for Recall Output Media)
@@ -155,13 +187,13 @@ async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[s
         "client_id": client_id
     }
     
-    logger.info(f"[RAG] Querying SpikedAI-Backend-One for: '{question}' (client_id: {client_id})")
+    logger.info("[RAG] Querying SpikedAI-Backend-One client_id=%s query_chars=%d", client_id, len(question))
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code != 200:
-                logger.error(f"[RAG] Failed with status {response.status_code}: {response.text}")
+                logger.error("[RAG] Failed with status %s", response.status_code)
                 return "I could not retrieve the relevant company documents for this question."
             
             full_text = ""
@@ -173,7 +205,7 @@ async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[s
                     full_text += line + " "
             
             result = full_text.strip()
-            logger.info(f"[RAG] Received grounded answer ({len(result)} chars):\n{result}")
+            logger.info("[RAG] Received grounded answer (%d chars)", len(result))
             return result or "No specific documentation found for this query."
             
     except Exception as e:
@@ -181,7 +213,7 @@ async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[s
         return "An error occurred while accessing the company knowledge base."
 
 # ---------------------------------------------------------------------------
-# Gemini Agent with Dynamic RAG Tool Calling
+# Gemini turn routing with deterministic RAG execution
 # ---------------------------------------------------------------------------
 
 async def process_transcript_with_gemini(
@@ -192,204 +224,112 @@ async def process_transcript_with_gemini(
     client_id: Optional[str] = None,
     user_context: Optional[Dict[str, Any]] = None
 ) -> Optional[str]:
-    """
-    Evaluates transcript turn with Gemini 3.5 Flash Lite equipped with the RAG tool.
-    Uses SOTA conversational meeting bot dialogue policy with intelligent intent classification.
-    Returns the final answer text to speak, or None if the bot should stay silent.
-    """
+    """Route an already-addressed, complete turn and produce a short spoken reply."""
     if not gemini_client:
         logger.error("[Google GenAI] Client is not initialized")
         return None
 
-    # Extract dynamic company context
     ctx = user_context or {}
     company_name = ctx.get("company_name", "SpikedAI")
     products_services = ctx.get("products_services", "")
     bot_name = ctx.get("bot_name") or "Tom"
     product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
-    keywords_list = ctx.get("keywords") or []
-    formatted_keywords = ", ".join(keywords_list[:40]) if keywords_list else "SpikedAI, s3cura AI, 3CAI, CRM, RAG"
-
-    # Define Tool using modern Google GenAI SDK
-    rag_tool = types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="generate_system_answer",
-                description=f"REQUIRED tool to retrieve verified facts, documentation, products, pricing, and architecture for {company_name} from the company document RAG database.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "query": types.Schema(
-                            type=types.Type.STRING,
-                            description=f"The specific, high-density question or topic to search in {company_name}'s knowledge base."
-                        )
-                    },
-                    required=["query"]
-                )
-            )
-        ]
-    )
-
-    system_instruction = f"""
-You are {bot_name}, a live interactive AI meeting participant and sales engineer representing {company_name}.
-You are actively listening to this live meeting with real-time speaker diarization.
-
-COMPANY BACKGROUND & OFFERINGS:
-- Company: {company_name}
-- Domain & Offerings: {products_services or product_domain or "Enterprise AI Solutions & Meeting Intelligence"}
-- Verified Company Keywords: {formatted_keywords}
-
-YOUR CAPABILITIES & TOOLSET:
-- You are equipped with real-time Document RAG connected to {company_name}'s verified knowledge base via the `generate_system_answer` tool.
-- Capabilities:
-  * Answering product, technical, architectural, pricing, and SLA questions accurately using verified documents.
-  * Assisting live in meetings with contextual notes, insights, and objections handling.
-  * Interfacing with integrated enterprise platforms (e.g. {products_services or "CRM, Cloud, and Knowledge Bases"}).
-- If asked "What can you do?", "What tools do you have?", or "How can you help?", describe these capabilities directly, proudly, and conversationally in 1-2 punchy sentences.
-
-CRITICAL GATING RULE - ONLY SPEAK WHEN EXPLICITLY ADDRESSED AS {bot_name.upper()}:
-- You must ONLY speak when an attendee in the meeting explicitly addresses you by name (e.g., "{bot_name}", "Hey {bot_name}", "{bot_name}, can you...", "What do you think, {bot_name}?", "{bot_name}, what are your products?").
-- If the attendees are talking to each other, having internal discussions, discussing slides, asking questions to the room, or not explicitly calling out {bot_name} by name -> You MUST output the exact string: "[SILENT]".
-- NEVER butt in, interject, or answer unaddressed general chatter. Silence is mandatory unless {bot_name} is explicitly invoked.
-
-TRANSCRIPT REPAIR & ASR NOISE RECONSTRUCTION (CRITICAL):
-- The incoming transcript is produced in real-time by speech-to-text (Deepgram Nova-3) and is noisy, fragmented, and frequently contains acoustic/phonetic errors, split words, and phonetic drift.
-- You MUST recognize that words in the transcript may be broken or misspelled.
-- When you are addressed, ALWAYS repair the broken transcript internally using the VERIFIED COMPANY KEYWORDS and COMPANY OFFERINGS before reasoning:
-  * "secure a" / "secure ai" / "secura" -> {company_name}
-  * "three c" / "three cai" / "3c ai" -> 3CAI / 3CAI Architecture
-  * "spider" / "spike the eye" / "spike ai" -> Spiked / SpikedAI
-  * "comic gp" / "karma gp" -> Karmic GP
-  * "context graf" / "contact graph" -> Context Graph
-  * "call sim" / "sales sim" -> Hyper-Realistic Sales Simulator / Call Simulator
-- Always map any phonetic approximations or misheard words back to the closest matching offering from COMPANY OFFERINGS.
-
-IMPLICIT & PRONOUN RESOLUTION:
-- Use conversation context heavily to resolve pronouns ("it", "that", "this thing", "you guys", "your platform", "your tool") into concrete company offerings.
-- When attendees ask "{bot_name}, what do you offer?", "{bot_name}, what does it cost?", or "{bot_name}, how do you handle security?", recognize that "you" / "it" refers to {company_name} and its offerings.
-
-RULES OF ENGAGEMENT & DIALOGUE POLICY (WHEN ADDRESSED AS {bot_name.upper()}):
-1. MANDATORY RAG TOOL CALL FOR ALL QUESTIONS (CRITICAL):
-   - You do NOT have raw internal knowledge stored in memory.
-   - For ANY question asked to {bot_name} regarding company offerings, products, features, pricing, architecture, roadmap, security, SLAs, integrations, or technical capabilities:
-     YOU MUST ALWAYS EXECUTE THE TOOL `generate_system_answer(query=...)`.
-   - Do NOT generate direct text answers for knowledge questions without calling `generate_system_answer`.
-   - When calling `generate_system_answer`:
-     1. Repair any broken or misheard words into the verified company keywords.
-     2. Resolve pronouns into explicit product/company names.
-     3. Formulate a self-contained, high-density semantic retrieval search query (e.g., "{company_name} core products, 3CAI architecture, and AI assistance features overview" or "{company_name} enterprise pricing tiers and SLA terms").
-   - If the address is purely a casual greeting or social pleasantry (e.g., "Hey {bot_name}, how are you?", "Can you hear me {bot_name}?"), respond directly, warmly, and conversationally in 1 sentence without calling RAG.
-
-2. HONESTY & ACCURACY:
-   - If the RAG tool returns no matching facts, be honest and transparent: "I don't have specific details on that in our knowledge base yet, but I'd be glad to check with the team and get back to you."
-   - Never invent false metrics or hallucinate non-existent features.
-
-3. ALWAYS END WITH A FOLLOW-UP QUESTION (MANDATORY):
-   - Every answer you provide MUST conclude with a relevant, natural conversational follow-up question to keep the conversation engaging and proactive.
-   - Examples of ending questions:
-     * "Would you like me to dive deeper into how that works?"
-     * "Does that align with what your team is looking for?"
-     * "Should I pull up more technical details on that for you?"
-     * "Would you like to explore our pricing or integrations for that?"
-
-4. SPOKEN DELIVERY & CADENCE:
-   - Your response will be spoken aloud by a live avatar in a video meeting.
-   - Maximum 2 to 4 punchy, natural sentences (ending with your follow-up question).
-   - NO markdown, NO bullet points, NO asterisks, NO numbered lists.
-   - Tone: Confident, helpful, concise, and professional.
-"""
-
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-    logger.info(f"[Prompt Debug] Dynamic Context: Company='{company_name}', Products='{products_services[:100]}...', Domain='{product_domain}', Bot='{bot_name}'")
-    logger.info(f"[Prompt Debug] Evaluating transcript turn: Speaker {speaker} -> '{transcript}'")
-
-    config = types.GenerateContentConfig(
-        temperature=0.2,
-        max_output_tokens=250,
-        system_instruction=system_instruction,
-        tools=[rag_tool]
+    catalog = build_entity_catalog(ctx)
+    candidate_entities = closest_entities(transcript, catalog)
+    history_text = "\n".join(
+        f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
+        for turn in conversation_history[-12:]
     )
-
-    # Build conversation context with previous meeting turns
-    formatted_context = ""
-    for turn in conversation_history[-12:]:
-        formatted_context += f"Speaker {turn.get('speaker', 'Participant')}: {turn.get('text', '')}\n"
-    formatted_context += f"Speaker {speaker}: {transcript}\n"
-
-    # Deterministic invocation gating:
-    # Check if Tom is explicitly mentioned by name or phonetic aliases, OR if this is a direct conversational continuation.
-    is_explicitly_addressed = bot_name.lower() in transcript.lower()
-    
-    # Expand with common phonetic drifts of "Tom" (e.g. Tom, Thom, Tone, Tong, Dom, Toom, Time)
-    phonetic_aliases = ["tom", "thom", "dom", "tone", "tong", "time", "toom"]
-    if not is_explicitly_addressed:
-        words_in_transcript = [w.strip("?,.!") for w in transcript.lower().split()]
-        for alias in phonetic_aliases:
-            if alias in words_in_transcript:
-                is_explicitly_addressed = True
-                break
-                
-    is_continuation = False
-    if conversation_history:
-        last_turn = conversation_history[-1]
-        # If the last speaking participant was the bot, the user is directly continuing dialog with Tom
-        if last_turn.get("speaker") == bot_name:
-            is_continuation = True
-            
-    is_addressed = is_explicitly_addressed or is_continuation
-    
-    # Instruct Gemini on the gating decision to prevent prompt hallucination
-    if is_addressed:
-        formatted_context += f"\n(Gating Instruction: You are currently ADDRESSED. Answer the question '{transcript}' naturally.)"
-    else:
-        formatted_context += f"\n(Gating Instruction: You are NOT addressed. Do NOT reply. Output exactly '[SILENT]'.)"
-
     try:
-        chat = gemini_client.aio.chats.create(model=preferred_model, config=config)
-        response = await chat.send_message(formatted_context)
-        
-        # Multi-round tool execution (up to 3 rounds)
-        max_tool_rounds = 3
-        for tool_round in range(max_tool_rounds):
-            if response.function_calls:
-                fn_call = response.function_calls[0]
-                if fn_call.name == "generate_system_answer":
-                    query_arg = fn_call.args.get("query", transcript) if isinstance(fn_call.args, dict) else transcript
-                    logger.info(f"[Gemini Agent] >>> TOOL CALL (round {tool_round+1}): generate_system_answer(query='{query_arg}')")
-                    
-                    # Execute RAG query against SpikedAI-Backend-One
-                    rag_result = await query_spiked_rag(query_arg, auth_token, client_id)
-                    
-                    # If RAG returned no matching docs, fallback to injected company product catalog
-                    if not rag_result or "No relevant information found" in rag_result or "could not retrieve" in rag_result:
-                        fallback_facts = f"Verified company knowledge: {company_name} offers {products_services}. Domain: {product_domain}."
-                        logger.info(f"[Gemini Agent] RAG empty -> Enhancing with user_configs:\n{fallback_facts}")
-                        rag_result = f"{rag_result}\n\n{fallback_facts}"
-                    else:
-                        logger.info(f"[Gemini Agent] >>> FULL RAG RESULT FOR GEMINI:\n{rag_result}\n<<<")
-                    
-                    tool_resp_part = types.Part.from_function_response(
-                        name="generate_system_answer",
-                        response={"result": rag_result}
-                    )
-                    response = await chat.send_message(tool_resp_part)
-                    continue
-            
-            # No function call - extract final spoken text
-            reply_text = response.text.strip() if response.text else ""
-            logger.info(f"[Gemini Agent] Final reply (round {tool_round+1}): '{reply_text}'")
-            if reply_text == "[SILENT]" or not reply_text:
-                logger.info("[Gemini Agent] Model chose to remain silent")
-                return None
-            logger.info(f"[Gemini Agent] >>> SPEAKING RESPONSE: '{reply_text}' <<<")
-            return reply_text
-            
-        reply_text = response.text.strip() if response.text else ""
-        if reply_text == "[SILENT]" or not reply_text:
-            return None
-        logger.info(f"[Gemini Agent] >>> FALLBACK RESPONSE: '{reply_text}' <<<")
-        return reply_text
+        analysis_prompt = f"""Classify and normalize this addressed meeting turn.
+Company: {company_name}
+Offerings: {products_services or product_domain}
+Verified entity candidates: {candidate_entities}
+Recent finalized conversation:
+{history_text}
+Current speaker: {speaker}
+Raw ASR: {transcript}
 
+Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
+Use meeting_context only for questions about what meeting participants said or discussed.
+Use social for greetings and audio checks. Use command for stop/wait/repeat commands.
+Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates."""
+        try:
+            analysis_response = await gemini_client.aio.models.generate_content(
+                model=preferred_model,
+                contents=analysis_prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=220,
+                    response_mime_type="application/json",
+                    response_schema=TurnAnalysis,
+                ),
+            )
+            parsed = getattr(analysis_response, "parsed", None)
+            if isinstance(parsed, TurnAnalysis):
+                analysis = parsed
+            elif parsed is not None:
+                analysis = TurnAnalysis.model_validate(parsed)
+            else:
+                analysis = TurnAnalysis.model_validate_json(analysis_response.text)
+        except Exception:
+            logger.warning("[Agent Route] Structured routing failed; defaulting substantive turn to RAG", exc_info=True)
+            analysis = TurnAnalysis(
+                intent="company_knowledge",
+                resolved_query=transcript,
+                corrections=[],
+            )
+
+        if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
+            analysis.intent = "company_knowledge"
+
+        corrections = [item.model_dump() for item in analysis.corrections]
+        corrected_transcript = apply_validated_corrections(transcript, corrections, catalog)
+        resolved_query = analysis.resolved_query.strip() or corrected_transcript
+        detailed_request = any(
+            phrase in transcript.casefold()
+            for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive")
+        )
+        reply_word_limit = 90 if detailed_request else AGENT_MAX_REPLY_WORDS
+        reply_sentence_limit = 4 if detailed_request else 2
+        rag_result = ""
+        rag_used = analysis.intent == "company_knowledge"
+        if rag_used:
+            rag_result = await query_spiked_rag(resolved_query, auth_token, client_id)
+            if not rag_result or any(marker in rag_result.lower() for marker in (
+                "could not retrieve", "no specific documentation", "an error occurred"
+            )):
+                logger.warning("[Agent Route] RAG unavailable for addressed knowledge turn")
+                return "I don’t have verified information on that available right now."
+
+        answer_prompt = f"""You are {bot_name}, a concise meeting participant representing {company_name}.
+Answer {speaker}'s addressed turn naturally for spoken delivery.
+Use at most {reply_sentence_limit} sentences and {reply_word_limit} words. No markdown, lists, filler, sales pitch, or automatic follow-up question.
+Use the speaker's first name only if it improves a greeting or clarification.
+Never invent facts.
+
+Intent: {analysis.intent}
+Corrected turn: {corrected_transcript}
+Resolved meaning: {resolved_query}
+Recent finalized conversation:
+{history_text}
+Verified RAG facts (the only source for company facts):
+{rag_result if rag_used else '(not required for this intent)'}"""
+        response = await gemini_client.aio.models.generate_content(
+            model=preferred_model,
+            contents=answer_prompt,
+            config=types.GenerateContentConfig(max_output_tokens=120),
+        )
+        reply = normalize_reply(response.text or "", reply_word_limit, reply_sentence_limit)
+        logger.info(
+            "[Agent Route] speaker=%s intent=%s rag_used=%s corrections=%d reply_words=%d",
+            speaker,
+            analysis.intent,
+            rag_used,
+            len(corrections),
+            len(reply.split()),
+        )
+        return reply or None
     except Exception as e:
         logger.error(f"[Gemini Agent] Inference error with google-genai SDK: {e}", exc_info=True)
         return None
@@ -451,14 +391,13 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             )
             c_name = user_ctx.get("company_name") or "SpikedAI"
             p_desc = user_ctx.get("products_services") or user_ctx.get("product_domain") or "Enterprise AI Solutions"
-            b_name = "Tom"  # Explicitly named Tom as requested
+            b_name = payload.bot_name or user_ctx.get("bot_name") or "Tom"
             
             logger.info(f"[LiveAvatar Context] Initializing with Company='{c_name}', Products='{p_desc[:80]}...', Bot='{b_name}'")
             
             ctx_payload = {
                 "name": f"tom-bot-{uuid.uuid4().hex[:8]}",
-                "prompt": f"You are Tom, a helpful and concise sales engineer and meeting participant representing {c_name}. Products & offerings: {p_desc}. Only speak when explicitly addressed as Tom. Keep answers to 2-4 sentences spoken naturally.",
-                "opening_text": f"Hi everyone, I'm Tom from {c_name}. I'm here and ready to help."
+                "prompt": f"You are {b_name}, a concise meeting participant representing {c_name}. Products & offerings: {p_desc}. Only speak when explicitly addressed as {b_name}. Keep answers brief."
             }
             ctx_res = await client.post(
                 f"{LIVEAVATAR_BASE_URL}/v1/contexts",
@@ -539,7 +478,7 @@ async def _deploy_live_avatar_bot(
     token: str,
     user_id: Optional[str] = None,
     client_id: Optional[str] = None,
-    bot_name: str = "Tom",
+    bot_name: str = DEFAULT_BOT_NAME,
     avatar_id: Optional[str] = None,
     request: Optional[Request] = None
 ) -> Dict[str, Any]:
@@ -551,7 +490,8 @@ async def _deploy_live_avatar_bot(
         if not user_id:
             user_id = extract_user_id_from_jwt(token)
 
-        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        run_id = f"run_{uuid.uuid4().hex}"
+        recall_ws_token = uuid.uuid4().hex
 
         # 1. Create LiveAvatar FULL Session ($0.20/min, includes TTS) with user context
         avatar_session = await create_avatar(CreateLiveAvatarRequest(
@@ -559,7 +499,8 @@ async def _deploy_live_avatar_bot(
             mode="FULL",
             user_id=user_id,
             client_id=client_id,
-            token=token
+            token=token,
+            bot_name=bot_name
         ))
 
         # 2. Store session credentials for Recall's avatar.html
@@ -571,6 +512,13 @@ async def _deploy_live_avatar_bot(
             "session_id": avatar_session.get("session_id"),
             "livekit_url": avatar_session.get("livekit_url"),
             "livekit_token": avatar_session.get("livekit_token"),
+            "bot_name": bot_name,
+            "recall_ws_token": recall_ws_token,
+            "state": AgentState.LISTENING,
+            "history": [],
+            "turn_counter": 0,
+            "control_ws": None,
+            "active_response_task": None,
         }
 
         # 3. Build Output Media URL
@@ -581,9 +529,9 @@ async def _deploy_live_avatar_bot(
         avatar_page_url = (
             f"{base_url}/avatar.html"
             f"?run={run_id}"
-            f"&token={token}"
-            f"&client_id={client_id or ''}"
         )
+        recall_ws_base = base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        recall_audio_url = f"{recall_ws_base}/ws/recall/audio/{run_id}?token={recall_ws_token}"
 
         # 4. Recall Bot Payload with Output Media + Dual-Track Webhook
         recall_payload = {
@@ -607,6 +555,7 @@ async def _deploy_live_avatar_bot(
                 "client_id": client_id or ""
             },
             "recording_config": {
+                "audio_separate_raw": {},
                 "retention": {
                     "type": "timed",
                     "hours": 168
@@ -619,9 +568,23 @@ async def _deploy_live_avatar_bot(
                         "deepgram_streaming": {
                             "model": "nova-3"
                         }
+                    },
+                    "diarization": {
+                        "use_separate_streams_when_available": True
                     }
                 },
                 "realtime_endpoints": [
+                    {
+                        "type": "websocket",
+                        "url": recall_audio_url,
+                        "events": [
+                            "audio_separate_raw.data",
+                            "participant_events.join",
+                            "participant_events.leave",
+                            "participant_events.speech_on",
+                            "participant_events.speech_off"
+                        ]
+                    },
                     {
                         "type": "webhook",
                         "url": RECALL_WEBHOOK_URL,
@@ -688,7 +651,7 @@ async def start_bot_endpoint(
 
         meeting_url = ""
         client_id = None
-        bot_name = "SpikedAI"
+        bot_name = DEFAULT_BOT_NAME
         avatar_id = None
 
         content_type = request.headers.get("content-type", "")
@@ -696,7 +659,7 @@ async def start_bot_endpoint(
             body = await request.json()
             meeting_url = body.get("meeting_url", "")
             client_id = body.get("client_id")
-            bot_name = body.get("bot_name", "SpikedAI")
+            bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = body.get("avatar_id")
             if not token:
                 token = body.get("token", "")
@@ -704,7 +667,7 @@ async def start_bot_endpoint(
             form = await request.form()
             meeting_url = form.get("meeting_url", "")
             client_id = form.get("client_id")
-            bot_name = form.get("bot_name", "SpikedAI")
+            bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = form.get("avatar_id")
             if not token:
                 token = form.get("token", "")
@@ -780,195 +743,320 @@ async def get_bot_endpoint(bot_id: str):
         return resp.json()
 
 # ---------------------------------------------------------------------------
-# WebSocket Audio Ingress & Real-Time Orchestration Pipeline
+# Participant-separated Audio & Control WebSockets
 # ---------------------------------------------------------------------------
 
-@app.websocket("/ws/audio/{session_id}")
-async def websocket_audio_endpoint(
-    websocket: WebSocket,
-    session_id: str,
-    token: Optional[str] = Query(None),
-    client_id: Optional[str] = Query(None),
-    bot_id: Optional[str] = Query(None)
-):
-    """
-    Receives raw meeting audio stream from avatar.html (inside Recall headless browser).
-    Pipes audio to Deepgram Streaming STT -> Detects Speech Turns -> Evaluates with Gemini 3.5 Flash Lite
-    -> Executes SpikedAI Document RAG -> Sends Avatar Speak instructions back to avatar.html.
-    """
-    await websocket.accept()
-    logger.info(f"[WS] Client connected for session {session_id} (bot_id: {bot_id}, client_id: {client_id})")
 
-    if not DEEPGRAM_API_KEY:
-        logger.error("[WS] DEEPGRAM_API_KEY is not configured")
-        await websocket.send_json({"type": "error", "message": "Deepgram API key missing on server"})
-        await websocket.close()
+def verify_recall_websocket(headers: Any, fallback_token: str, supplied_token: str) -> bool:
+    """Verify Recall's upgrade signature, with a per-run token for legacy workspaces."""
+    if not RECALL_WEBHOOK_SECRET:
+        return bool(fallback_token) and hmac.compare_digest(fallback_token, supplied_token or "")
+    try:
+        secret = RECALL_WEBHOOK_SECRET
+        if not secret.startswith("whsec_"):
+            return False
+        message_id = headers.get("webhook-id") or headers.get("svix-id")
+        timestamp = headers.get("webhook-timestamp") or headers.get("svix-timestamp")
+        signatures = headers.get("webhook-signature") or headers.get("svix-signature")
+        if not message_id or not timestamp or not signatures:
+            return False
+        key = base64.b64decode(secret.removeprefix("whsec_"))
+        expected = hmac.new(key, f"{message_id}.{timestamp}.".encode(), hashlib.sha256).digest()
+        for versioned in signatures.split(" "):
+            version, _, signature = versioned.partition(",")
+            if version == "v1" and hmac.compare_digest(expected, base64.b64decode(signature)):
+                return True
+    except Exception:
+        logger.warning("[Recall WS] Signature verification failed", exc_info=True)
+    return False
+
+
+async def _interrupt_avatar(run: Dict[str, Any], participant_id: str) -> None:
+    if run.get("state") != AgentState.SPEAKING:
+        return
+    control_ws = run.get("control_ws")
+    if not control_ws:
+        return
+    run["state"] = AgentState.INTERRUPTING
+    logger.info("[Barge-In] participant_id=%s sustained_ms=%d", participant_id, AGENT_BARGE_IN_MS)
+    await control_ws.send_json({
+        "type": "avatar_interrupt",
+        "turn_id": run.get("active_turn_id"),
+    })
+
+
+def _schedule_completed_turn(
+    run: Dict[str, Any],
+    participant_id: str,
+    participant_name: str,
+    utterance: Dict[str, Any],
+) -> None:
+    transcript = (utterance.get("text") or "").strip()
+    if not transcript:
+        return
+    bot_name = run.get("bot_name") or "Tom"
+    invocation = detect_invocation(transcript, bot_name)
+    history = run.setdefault("history", [])
+    history_snapshot = list(history[-20:])
+    history.append({"speaker": participant_name, "participant_id": participant_id, "text": transcript})
+    del history[:-40]
+    logger.info(
+        "[Turn Gate] participant_id=%s participant_name=%s addressed=%s reason=%s",
+        participant_id,
+        participant_name,
+        invocation.addressed,
+        invocation.reason,
+    )
+    if not invocation.addressed:
         return
 
-    user_id = extract_user_id_from_jwt(token)
-    user_context = await get_user_keywords_and_products(
-        user_id=user_id,
-        client_id=client_id,
-        auth_token=token
-    )
-    user_keywords = user_context.get("keywords", [])
+    previous_task = run.get("active_response_task")
+    if previous_task and not previous_task.done():
+        previous_task.cancel()
 
-    deepgram_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+    run["turn_counter"] = int(run.get("turn_counter", 0)) + 1
+    turn_id = run["turn_counter"]
+    run["active_turn_id"] = turn_id
+    run["state"] = AgentState.THINKING
 
-    async def connect_to_deepgram():
-        models_to_try = ["nova-3", "nova-2"]
-        last_err = None
-        for m in models_to_try:
+    async def respond() -> None:
+        try:
+            answer = await process_transcript_with_gemini(
+                transcript=transcript,
+                speaker=participant_name,
+                conversation_history=history_snapshot,
+                auth_token=run.get("token") or "",
+                client_id=run.get("client_id"),
+                user_context=run.get("user_context") or {},
+            )
+            if turn_id != run.get("active_turn_id"):
+                logger.info("[Agent] Discarded stale response turn_id=%s", turn_id)
+                return
+            if not answer:
+                run["state"] = AgentState.LISTENING
+                return
+            control_ws = run.get("control_ws")
+            if not control_ws:
+                logger.warning("[Agent] Avatar control socket unavailable for turn_id=%s", turn_id)
+                run["state"] = AgentState.LISTENING
+                return
+            history.append({"speaker": bot_name, "participant_id": "bot", "text": answer})
+            del history[:-40]
+            await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
+        except asyncio.CancelledError:
+            logger.info("[Agent] Cancelled superseded turn_id=%s", turn_id)
+        except Exception:
+            run["state"] = AgentState.LISTENING
+            logger.error("[Agent] Failed addressed turn_id=%s", turn_id, exc_info=True)
+
+    run["active_response_task"] = asyncio.create_task(respond())
+
+
+class ParticipantTranscriber:
+    def __init__(
+        self,
+        participant_id: str,
+        participant_name: str,
+        keywords: List[str],
+        on_utterance: Any,
+    ):
+        self.participant_id = participant_id
+        self.participant_name = participant_name
+        self.keywords = keywords
+        self.on_utterance = on_utterance
+        self.ws: Any = None
+        self.receiver_task: Optional[asyncio.Task] = None
+        self.buffer = FinalUtteranceBuffer()
+        self.start_lock = asyncio.Lock()
+
+    async def ensure_started(self) -> None:
+        if self.ws:
+            return
+        async with self.start_lock:
+            if self.ws:
+                return
             params = {
-                "model": m,
-                "diarize": "true",
+                "model": "nova-3",
+                "encoding": "linear16",
+                "sample_rate": "16000",
+                "channels": "1",
                 "smart_format": "true",
-                "interim_results": "false",
-                "endpointing": "300",
-                "punctuate": "true"
+                "interim_results": "true",
+                "endpointing": str(AGENT_ENDPOINTING_MS),
+                "utterance_end_ms": str(AGENT_UTTERANCE_END_MS),
+                "vad_events": "true",
+                "punctuate": "true",
             }
             url = f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
-            if user_keywords:
-                if m.startswith("nova-3"):
-                    # Nova-3 uses keyterm parameter without weights
-                    kw_params = [f"keyterm={quote(kw.strip())}" for kw in user_keywords[:40] if kw and kw.strip()]
-                else:
-                    # Nova-2 uses legacy keywords with weights
-                    kw_params = [f"keywords={quote(kw.strip())}:5" for kw in user_keywords[:40] if kw and kw.strip()]
-                if kw_params:
-                    url = f"{url}&{'&'.join(kw_params)}"
+            keyterms: List[str] = []
+            keyterm_tokens = 0
+            for item in self.keywords[:100]:
+                if not item or not item.strip():
+                    continue
+                estimated_tokens = max(1, len(item.split()))
+                if keyterm_tokens + estimated_tokens > 450:
+                    break
+                keyterms.append(item.strip())
+                keyterm_tokens += estimated_tokens
+            if keyterms:
+                url += "&" + "&".join(f"keyterm={quote(item.strip())}" for item in keyterms)
+            headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
             try:
-                try:
-                    conn = await websockets.connect(url, additional_headers=deepgram_headers)
-                except TypeError:
-                    conn = await websockets.connect(url, extra_headers=deepgram_headers)
-                logger.info(f"[WS] Successfully connected to Deepgram Live STT using model '{m}' (session: {session_id})")
-                return conn
-            except Exception as e:
-                logger.warning(f"[WS] Deepgram connection with model '{m}' failed: {e}")
-                last_err = e
-        raise last_err
+                self.ws = await websockets.connect(url, additional_headers=headers)
+            except TypeError:
+                self.ws = await websockets.connect(url, extra_headers=headers)
+            self.receiver_task = asyncio.create_task(self._receive())
+            logger.info(
+                "[Deepgram] Connected participant_id=%s participant_name=%s",
+                self.participant_id,
+                self.participant_name,
+            )
 
-    conversation_history: List[Dict[str, str]] = []
-    chunk_count = 0
-    total_bytes = 0
-    last_speak_timestamp = 0.0
+    async def send(self, pcm: bytes) -> None:
+        await self.ensure_started()
+        await self.ws.send(pcm)
+
+    async def _receive(self) -> None:
+        try:
+            while True:
+                data = json.loads(await self.ws.recv())
+                utterance = self.buffer.add_result(data)
+                if utterance:
+                    self.on_utterance(self.participant_id, self.participant_name, utterance)
+                if data.get("type") == "Error":
+                    logger.error("[Deepgram] participant_id=%s error=%s", self.participant_id, data)
+        except (ConnectionClosed, asyncio.CancelledError):
+            pass
+        except Exception:
+            logger.error("[Deepgram] Receiver failed participant_id=%s", self.participant_id, exc_info=True)
+
+    async def close(self) -> None:
+        if self.ws:
+            try:
+                await self.ws.send(json.dumps({"type": "CloseStream"}))
+                await self.ws.close()
+            except Exception:
+                pass
+        if self.receiver_task:
+            self.receiver_task.cancel()
+
+
+@app.websocket("/ws/control/{run_id}")
+async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run:
+        await websocket.close(code=4404)
+        return
+    await websocket.accept()
+    run["control_ws"] = websocket
+    logger.info("[Control WS] Avatar connected run_id=%s", run_id)
+    try:
+        while True:
+            event = await websocket.receive_json()
+            event_type = event.get("type")
+            turn_id = event.get("turn_id")
+            if turn_id is not None and turn_id != run.get("active_turn_id"):
+                continue
+            if event_type == "avatar_speak_started":
+                run["state"] = AgentState.SPEAKING
+            elif event_type in ("avatar_speak_ended", "avatar_speak_interrupted"):
+                run["state"] = AgentState.LISTENING
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        if run.get("control_ws") is websocket:
+            run["control_ws"] = None
+        logger.info("[Control WS] Avatar disconnected run_id=%s", run_id)
+
+
+@app.websocket("/ws/recall/audio/{run_id}")
+async def recall_separate_audio_endpoint(
+    websocket: WebSocket,
+    run_id: str,
+    token: Optional[str] = Query(None),
+):
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run or not verify_recall_websocket(
+        websocket.headers,
+        run.get("recall_ws_token") or "",
+        token or "",
+    ):
+        await websocket.close(code=4401)
+        return
+    if not DEEPGRAM_API_KEY:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+    user_context = await get_user_keywords_and_products(
+        user_id=run.get("user_id"),
+        client_id=run.get("client_id"),
+        auth_token=run.get("token"),
+    )
+    user_context["bot_name"] = run.get("bot_name") or "Tom"
+    run["user_context"] = user_context
+    keywords = build_entity_catalog(user_context)
+    transcribers: Dict[str, ParticipantTranscriber] = {}
+    detectors: Dict[str, SustainedSpeechDetector] = {}
+    logger.info("[Recall WS] Separate audio connected run_id=%s", run_id)
 
     try:
-        dg_ws = await connect_to_deepgram()
-        async with dg_ws:
+        while True:
+            message = await websocket.receive_json()
+            event_type = message.get("event")
+            envelope = message.get("data") or {}
+            payload = envelope.get("data") or envelope
+            participant = payload.get("participant") or {}
+            participant_id = str(participant.get("id") or "unknown")
+            participant_name = (participant.get("name") or f"Participant {participant_id}").strip()
 
-            async def forward_audio():
-                """Forwards incoming binary audio frames from Recall browser to Deepgram."""
-                nonlocal chunk_count, total_bytes
-                try:
-                    while True:
-                        try:
-                            message = await websocket.receive()
-                        except (WebSocketDisconnect, RuntimeError):
-                            break
+            if event_type == "participant_events.leave":
+                transcriber = transcribers.pop(participant_id, None)
+                detectors.pop(participant_id, None)
+                if transcriber:
+                    await transcriber.close()
+                continue
+            if event_type != "audio_separate_raw.data":
+                continue
 
-                        if message.get("type") == "websocket.disconnect":
-                            break
+            encoded = payload.get("buffer") or ""
+            if not encoded:
+                continue
+            try:
+                pcm = base64.b64decode(encoded)
+            except Exception:
+                logger.warning("[Recall WS] Invalid audio buffer participant_id=%s", participant_id)
+                continue
+            if not pcm:
+                continue
 
-                        if "bytes" in message and message["bytes"]:
-                            chunk_count += 1
-                            total_bytes += len(message["bytes"])
-                            if chunk_count % 30 == 0:
-                                logger.info(f"[WS Ingress] Forwarded {chunk_count} chunks ({total_bytes} bytes) to Deepgram")
-                            await dg_ws.send(message["bytes"])
-                        elif "text" in message:
-                            try:
-                                cmd = json.loads(message["text"])
-                                if cmd.get("type") == "auth_update":
-                                    nonlocal token
-                                    token = cmd.get("token", token)
-                            except Exception:
-                                pass
-                except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError):
-                    pass
-                finally:
-                    logger.info(f"[WS Ingress] Audio stream closed after {chunk_count} chunks ({total_bytes} bytes)")
+            if participant_name.casefold() == (run.get("bot_name") or "Tom").casefold():
+                continue
 
-            async def receive_transcripts():
-                """Receives transcribed turns from Deepgram, routes to Gemini + RAG, and triggers avatar speak."""
-                nonlocal last_speak_timestamp
-                try:
-                    while True:
-                        raw_msg = await dg_ws.recv()
-                        data = json.loads(raw_msg)
-                        msg_type = data.get("type")
-                        
-                        if msg_type == "Results":
-                            channel = data.get("channel", {})
-                            alternatives = channel.get("alternatives", [])
-                            if alternatives:
-                                raw_transcript = alternatives[0].get("transcript", "").strip()
-                                if raw_transcript:
-                                    words = alternatives[0].get("words", [])
-                                    speaker_id = str(words[0].get("speaker", "0")) if words else "0"
-                                    
-                                    # Apply phonetic & keyword correction
-                                    transcript_text = correct_stt_text(raw_transcript, user_keywords)
-                                    logger.info(f"[Deepgram STT] Speaker {speaker_id} Turn: '{raw_transcript}' -> Corrected: '{transcript_text}'")
-                                    
-                                    # Barge-in: If user speaks after avatar has been speaking for at least 1.5s, notify to interrupt.
-                                    # This avoids instant back-to-back STT queue race conditions.
-                                    time_since_speak = time.time() - last_speak_timestamp
-                                    if 1.5 <= time_since_speak < 6.0:
-                                        logger.info(f"[Barge-In] User spoke while avatar was active (time_since_speak={time_since_speak:.2f}s) — sending interrupt")
-                                        await websocket.send_json({
-                                            "type": "avatar_interrupt",
-                                            "session_id": session_id
-                                        })
-
-                                    answer_to_speak = await process_transcript_with_gemini(
-                                        transcript=transcript_text,
-                                        speaker=speaker_id,
-                                        conversation_history=conversation_history,
-                                        auth_token=token or "",
-                                        client_id=client_id,
-                                        user_context=user_context
-                                    )
-                                    
-                                    conversation_history.append({
-                                        "speaker": speaker_id,
-                                        "text": transcript_text
-                                    })
-                                    
-                                    if answer_to_speak:
-                                        logger.info(f"[Agent] >>> Sending avatar_speak instruction: '{answer_to_speak}'")
-                                        conversation_history.append({
-                                            "speaker": user_context.get("bot_name", "SpikedAI"),
-                                            "text": answer_to_speak
-                                        })
-                                        
-                                        last_speak_timestamp = time.time()
-                                        await websocket.send_json({
-                                            "type": "avatar_speak",
-                                            "text": answer_to_speak,
-                                            "session_id": session_id
-                                        })
-                        elif msg_type == "Metadata":
-                            logger.info(f"[Deepgram] Session metadata received: request_id={data.get('request_id')}")
-                        elif msg_type == "Error":
-                            logger.error(f"[Deepgram Error] {data}")
-
-                except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
-                    logger.info("[WS] Deepgram receiver stream closed")
-
-            forward_task = asyncio.create_task(forward_audio())
-            receive_task = asyncio.create_task(receive_transcripts())
-            done, pending = await asyncio.wait(
-                [forward_task, receive_task],
-                return_when=asyncio.FIRST_COMPLETED
+            detector = detectors.setdefault(
+                participant_id,
+                SustainedSpeechDetector(threshold_ms=AGENT_BARGE_IN_MS),
             )
-            for task in pending:
-                task.cancel()
+            if run.get("state") == AgentState.SPEAKING:
+                if detector.feed(pcm):
+                    await _interrupt_avatar(run, participant_id)
+            else:
+                detector.reset()
 
+            transcriber = transcribers.get(participant_id)
+            if not transcriber:
+                transcriber = ParticipantTranscriber(
+                    participant_id,
+                    participant_name,
+                    keywords,
+                    lambda pid, name, utterance: _schedule_completed_turn(run, pid, name, utterance),
+                )
+                transcribers[participant_id] = transcriber
+            await transcriber.send(pcm)
     except (WebSocketDisconnect, RuntimeError):
-        logger.info(f"[WS] Client disconnected cleanly for session {session_id}")
-    except Exception as e:
-        logger.error(f"[WS] WebSocket error: {e}", exc_info=True)
+        pass
+    except Exception:
+        logger.error("[Recall WS] Separate audio failed run_id=%s", run_id, exc_info=True)
     finally:
-        logger.info(f"[WS] Cleaned up connection for session {session_id}")
+        await asyncio.gather(*(item.close() for item in transcribers.values()), return_exceptions=True)
+        logger.info("[Recall WS] Separate audio disconnected run_id=%s", run_id)

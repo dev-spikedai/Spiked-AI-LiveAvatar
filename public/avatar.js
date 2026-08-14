@@ -1,5 +1,5 @@
 // LiveAvatar-Spiked: public/avatar.js
-// Handles WebRTC video playback, room audio capture, and low-latency WebSocket communication.
+// Handles LiveAvatar playback and backend control. Meeting audio goes directly from Recall to the backend.
 
 (async function () {
   const statusDot = document.getElementById("status-dot");
@@ -14,8 +14,6 @@
   try {
     const params = new URLSearchParams(window.location.search);
     const runId = params.get("run") || "default";
-    const token = params.get("token") || "";
-    const clientId = params.get("client_id") || "";
     let sessionId = params.get("session_id") || "";
     let livekitUrl = params.get("livekit_url") || "";
     let livekitToken = params.get("livekit_token") || "";
@@ -24,7 +22,7 @@
 
     // 1. If credentials are not in URL query params, fetch them from backend
     if (!livekitUrl || !livekitToken) {
-      const res = await fetch(`/api/runs/${runId}/credentials?token=${encodeURIComponent(token)}`);
+      const res = await fetch(`/api/runs/${runId}/credentials`);
       if (!res.ok) throw new Error(`Failed to load credentials: ${res.status}`);
       const data = await res.json();
       sessionId = data.session_id;
@@ -55,24 +53,31 @@
       }
     });
 
-    let isAvatarSpeaking = false;
+    let currentTurnId = null;
+    const speakEventTurns = new Map();
+    let controlWs = null;
+    function sendControlState(type, turnId = currentTurnId) {
+      if (turnId === null || turnId === undefined) return;
+      if (controlWs && controlWs.readyState === WebSocket.OPEN) {
+        controlWs.send(JSON.stringify({ type, turn_id: turnId }));
+      }
+    }
     const decoder = new TextDecoder();
     room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
       try {
+        if (topic && topic !== "agent-response") return;
         const decoded = JSON.parse(decoder.decode(payload));
         const eventType = decoded.event_type || decoded.type;
+        const eventTurnId = speakEventTurns.get(decoded.source_event_id) ?? currentTurnId;
         console.log(`[LiveKit DataReceived] topic=${topic}:`, decoded);
         
         if (eventType === "avatar.speak_started") {
-          isAvatarSpeaking = true;
+          sendControlState("avatar_speak_started", eventTurnId);
           updateStatus("Avatar Speaking", "active");
         } else if (eventType === "avatar.speak_ended") {
-          isAvatarSpeaking = false;
+          sendControlState("avatar_speak_ended", eventTurnId);
+          if (decoded.source_event_id) speakEventTurns.delete(decoded.source_event_id);
           updateStatus("Listening...", "active");
-        } else if (eventType === "user.speak_started" && isAvatarSpeaking) {
-          console.log("[avatar.js] User interrupted avatar -> sending avatar.interrupt");
-          sendLiveAvatarCommand("avatar.interrupt");
-          isAvatarSpeaking = false;
         }
       } catch {
         console.log(`[LiveKit DataReceived] topic=${topic} (raw)`);
@@ -88,19 +93,7 @@
       document.addEventListener("click", () => room.startAudio(), { once: true });
     });
 
-    // Publish page microphone into LiveKit room (Recall pipes meeting audio into it)
-    try {
-      await room.localParticipant.setMicrophoneEnabled(true, {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      });
-      console.log("[LiveKit] Microphone published to LiveKit room");
-    } catch (micErr) {
-      console.warn("[LiveKit] Could not publish microphone:", micErr);
-    }
-
-    // Tell LiveAvatar agent to start listening (REQUIRED per LiveAvatar SDK)
+    // LiveAvatar is output-only. Recall and the backend own listening and turn-taking.
     const encoder = new TextEncoder();
     function sendLiveAvatarCommand(eventType, payload = {}) {
       const event = {
@@ -116,75 +109,39 @@
         reliable: true,
         topic: "agent-control",
       });
+      return event.event_id;
     }
 
-    sendLiveAvatarCommand("avatar.start_listening");
-    console.log("[avatar.js] Sent avatar.start_listening command");
+    sendLiveAvatarCommand("avatar.stop_listening");
+    console.log("[avatar.js] Sent avatar.stop_listening command");
 
-    // 3. Capture In-Meeting Audio (Recall auto-grants getUserMedia)
-    updateStatus("Initializing In-Room Audio Capture...");
-    const audioStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        sampleRate: 16000,
-        channelCount: 1,
-      },
-    });
-
-    // 4. Open Real-Time WebSocket to LiveAvatar-Spiked Backend
+    // 3. Open control-only WebSocket to LiveAvatar-Spiked Backend.
     const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${wsProtocol}//${location.host}/ws/audio/${sessionId}?token=${encodeURIComponent(token)}&client_id=${encodeURIComponent(clientId)}&bot_id=${encodeURIComponent(runId)}`;
+    const wsUrl = `${wsProtocol}//${location.host}/ws/control/${encodeURIComponent(runId)}`;
     console.log(`[WS] Connecting to backend: ${wsUrl}`);
-    const ws = new WebSocket(wsUrl);
+    controlWs = new WebSocket(wsUrl);
 
-    let sentChunks = 0;
-    ws.onopen = () => {
-      console.log("[WS] WebSocket connection established");
-      updateStatus("Audio Stream Live", "active");
-      
-      // Start recording raw audio frames and sending to WebSocket
-      const mediaRecorder = new MediaRecorder(audioStream, {
-        mimeType: "audio/webm;codecs=opus",
-      });
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-          sentChunks++;
-          if (sentChunks % 30 === 0) {
-            console.log(`[MediaRecorder] Sent ${sentChunks} audio chunks (${event.data.size} bytes/chunk)`);
-          }
-          ws.send(event.data);
-        }
-      };
-
-      mediaRecorder.start(100); // 100ms chunks for minimum latency
-      console.log("[MediaRecorder] Started recording at 100ms interval");
+    controlWs.onopen = () => {
+      console.log("[WS] Control connection established");
+      updateStatus("Listening...", "active");
     };
 
-    // 5. Receive "avatar_speak" commands from Gemini/RAG and speak in meeting
-    ws.onmessage = (event) => {
+    // 4. Receive avatar commands from the backend.
+    controlWs.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         console.log("[WS] Received message from backend:", data);
         
         if (data.type === "avatar_speak" && data.text) {
           console.log(`[avatar.js] >>> Publishing avatar.speak_text: "${data.text}"`);
-          isAvatarSpeaking = true;
-          sendLiveAvatarCommand("avatar.speak_text", { text: data.text });
-
+          currentTurnId = data.turn_id;
+          const eventId = sendLiveAvatarCommand("avatar.speak_text", { text: data.text });
+          speakEventTurns.set(eventId, currentTurnId);
           updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
-          setTimeout(() => {
-            if (isAvatarSpeaking) {
-              isAvatarSpeaking = false;
-              updateStatus("Listening...", "active");
-            }
-          }, 6000);
         } else if (data.type === "avatar_interrupt") {
           console.log("[avatar.js] >>> Received avatar_interrupt command from backend");
           sendLiveAvatarCommand("avatar.interrupt");
-          isAvatarSpeaking = false;
+          sendControlState("avatar_speak_interrupted");
           updateStatus("Listening...", "active");
         }
       } catch (err) {
@@ -192,14 +149,14 @@
       }
     };
 
-    ws.onerror = (err) => {
+    controlWs.onerror = (err) => {
       console.error("[WS] WebSocket error:", err);
-      updateStatus("Audio WS Error", "error");
+      updateStatus("Control WS Error", "error");
     };
 
-    ws.onclose = () => {
-      console.log("[WS] WebSocket connection closed");
-      updateStatus("Audio Stream Closed", "pending");
+    controlWs.onclose = () => {
+      console.log("[WS] Control connection closed");
+      updateStatus("Control Stream Closed", "pending");
     };
 
   } catch (err) {
