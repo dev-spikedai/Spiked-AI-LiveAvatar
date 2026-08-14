@@ -15,15 +15,9 @@ class FakeModels:
         return self.responses.pop(0)
 
 
-def test_company_knowledge_route_always_calls_rag(monkeypatch):
+def test_self_contained_question_skips_the_classification_round_trip(monkeypatch):
+    """A self-contained company question goes straight to RAG: one model call."""
     models = FakeModels([
-        SimpleNamespace(
-            parsed=live_avatar.TurnAnalysis(
-                intent="company_knowledge",
-                resolved_query="SpikedAI enterprise security",
-                corrections=[],
-            )
-        ),
         SimpleNamespace(text="It uses the verified security controls described in the knowledge base."),
     ])
     monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
@@ -43,8 +37,43 @@ def test_company_knowledge_route_always_calls_rag(monkeypatch):
         user_context={"company_name": "SpikedAI", "bot_name": "Tom", "keywords": ["SpikedAI"]},
     ))
 
-    assert rag_queries == [("SpikedAI enterprise security", "token", "client")]
+    # Raw transcript is the retrieval query, and the analysis response was never consumed.
+    assert rag_queries == [("Tom, how do you handle security?", "token", "client")]
+    assert models.responses == []
     assert answer == "It uses the verified security controls described in the knowledge base."
+
+
+def test_turn_needing_context_still_runs_query_repair(monkeypatch):
+    """A pronoun means the raw text is a poor query, so classification still runs."""
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysis(
+                intent="company_knowledge",
+                resolved_query="SpikedAI enterprise pricing",
+                corrections=[],
+            )
+        ),
+        SimpleNamespace(text="Pricing starts at the published enterprise tier."),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+    rag_queries = []
+
+    async def fake_rag(query, auth_token, client_id):
+        rag_queries.append((query, auth_token, client_id))
+        return "Enterprise pricing is published."
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", fake_rag)
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="Tom, what is its pricing?",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        client_id="client",
+        user_context={"company_name": "SpikedAI", "bot_name": "Tom", "keywords": ["SpikedAI"]},
+    ))
+
+    assert rag_queries == [("SpikedAI enterprise pricing", "token", "client")]
+    assert answer == "Pricing starts at the published enterprise tier."
 
 
 def test_rag_failure_returns_short_honest_fallback(monkeypatch):
@@ -73,24 +102,59 @@ def test_rag_failure_returns_short_honest_fallback(monkeypatch):
     assert answer == "I don’t have verified information on that available right now."
 
 
-def test_unaddressed_turn_is_recorded_but_never_scheduled():
+def make_run(**overrides):
     run = {
         "bot_name": "Tom",
         "history": [],
         "active_response_task": None,
+        "watchdog_task": None,
+        "pending_turns": {},
+        "floor": live_avatar.FloorState(),
+        "echo": live_avatar.EchoSuppressor(),
+        "governor": live_avatar.SpeechGovernor(),
+        "state": live_avatar.AgentState.LISTENING,
     }
-    live_avatar._schedule_completed_turn(
-        run,
-        participant_id="42",
-        participant_name="Alice",
-        utterance={"text": "What time can you meet?", "words": []},
-    )
+    run.update(overrides)
+    return run
+
+
+def test_unaddressed_turn_is_recorded_but_never_scheduled():
+    run = make_run()
+    live_avatar._finalize_turn(run, "42", "Alice", "What time can you meet?")
     assert run["active_response_task"] is None
     assert run["history"] == [{
         "speaker": "Alice",
         "participant_id": "42",
         "text": "What time can you meet?",
     }]
+
+
+def test_self_audio_is_dropped_before_the_gate():
+    """The agent hearing its own reply must not reach history or the gate."""
+    run = make_run()
+    reply = "Tom here, our pricing starts at four hundred dollars per seat."
+    run["echo"].note_bot_speech(reply, live_avatar.time.monotonic())
+
+    async def drive():
+        # Arrives under a human participant id, as room echo actually does.
+        live_avatar._ingest_utterance(run, "42", "Alice", {"text": reply, "words": []})
+        await asyncio.sleep(0)
+
+    asyncio.run(drive())
+    assert run["history"] == []
+    assert run["pending_turns"] == {}
+
+
+def test_governor_blocks_a_second_reply_inside_the_cooldown():
+    run = make_run()
+    now = live_avatar.time.monotonic()
+    run["governor"].note_reply("Our pricing starts at four hundred dollars.", now)
+
+    live_avatar._finalize_turn(run, "42", "Alice", "Tom, what about support hours?")
+
+    # Turn is still recorded, but no inference task is spawned.
+    assert run["active_response_task"] is None
+    assert len(run["history"]) == 1
 
 
 def test_recall_websocket_signature_verification(monkeypatch):

@@ -4,7 +4,7 @@ import struct
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import webrtcvad
@@ -24,6 +24,24 @@ class InvocationDecision:
     addressed: bool
     matched_name: Optional[str] = None
     reason: str = "name_not_present"
+
+
+@dataclass(frozen=True)
+class TurnDecision:
+    """Outcome of the floor-control gate for one assembled participant turn."""
+
+    should_reply: bool
+    reason: str
+    matched_name: Optional[str] = None
+
+
+@dataclass
+class FloorState:
+    """Who currently holds the conversational floor with the agent."""
+
+    last_bot_finished_at: Optional[float] = None
+    last_addressed_participant: Optional[str] = None
+    consecutive_followups: int = 0
 
 
 @dataclass
@@ -173,6 +191,23 @@ def requires_company_knowledge(text: str, catalog: Iterable[str]) -> bool:
     )
 
 
+_ANAPHORA = frozenset({
+    "it", "its", "it's", "that", "this", "they", "them", "their", "those",
+    "these", "he", "she", "him", "her", "his", "one", "ones",
+})
+
+
+def needs_context_resolution(text: str) -> bool:
+    """True when a turn leans on earlier context and needs LLM query repair.
+
+    A self-contained question can go straight to retrieval, skipping a full
+    model round trip. Anything referring back to prior turns cannot.
+    """
+
+    words = re.sub(r"[^a-z0-9' ]+", " ", (text or "").casefold()).split()
+    return any(word in _ANAPHORA for word in words)
+
+
 def normalize_reply(text: str, max_words: int = 45, max_sentences: int = 2) -> str:
     clean = re.sub(r"\s+", " ", (text or "").strip())
     clean = clean.replace("**", "").replace("__", "").replace("`", "")
@@ -188,6 +223,201 @@ def normalize_reply(text: str, max_words: int = 45, max_sentences: int = 2) -> s
         if clean[-1:] not in ".!?":
             clean += "."
     return clean
+
+
+WORDS_PER_SECOND = 2.5
+
+# Openers that make a nameless turn read as a continuation of the agent's answer
+# rather than as room chatter. Deliberately narrow: anything not listed here needs
+# the wake name, matching the conservative default of the rest of this module.
+_FOLLOWUP_STARTERS = frozenset({
+    "what", "how", "why", "when", "where", "who", "which", "whose",
+    "can", "could", "would", "will", "should", "do", "does", "did",
+    "is", "are", "was", "were", "tell", "explain", "elaborate", "repeat",
+})
+
+# A finalized segment ending on one of these is a speaker pausing mid-thought,
+# not a completed turn.
+_DANGLING_TOKENS = frozenset({
+    "and", "but", "so", "or", "if", "when", "because", "that", "which",
+    "with", "for", "to", "of", "in", "on", "at", "the", "a", "an", "um", "uh",
+})
+
+
+def _normalize_for_match(text: str) -> str:
+    collapsed = re.sub(r"[^a-z0-9 ]+", " ", (text or "").casefold())
+    return re.sub(r"\s+", " ", collapsed).strip()
+
+
+def estimate_speech_seconds(text: str, words_per_second: float = WORDS_PER_SECOND) -> float:
+    """Approximate spoken duration, used for echo expiry and the speak watchdog."""
+
+    words = len((text or "").split())
+    return words / words_per_second if words else 0.0
+
+
+def is_probably_incomplete(text: str) -> bool:
+    """True when a finalized segment looks like a mid-thought pause."""
+
+    clean = (text or "").strip()
+    if not clean:
+        return True
+    if clean[-1] not in ".!?":
+        return True
+    words = _normalize_for_match(clean).split()
+    return bool(words) and words[-1] in _DANGLING_TOKENS
+
+
+def looks_like_followup(text: str) -> bool:
+    """Question-shaped continuation that may skip the wake name inside the window."""
+
+    clean = (text or "").strip()
+    words = _normalize_for_match(clean).split()
+    if len(words) < 2:
+        return False
+    if clean.endswith("?"):
+        return True
+    if words[0] in _FOLLOWUP_STARTERS:
+        return True
+    # "and what about pricing", "okay how does that work"
+    if words[0] in {"and", "but", "so", "okay", "ok"} and words[1] in _FOLLOWUP_STARTERS:
+        return True
+    return False
+
+
+class EchoSuppressor:
+    """Reject transcripts that are the avatar's own voice returning through the room.
+
+    Recall includes bot audio in the separate-audio stream, and a participant on
+    speakers re-injects the avatar through their own microphone under their own
+    participant id. Neither case can be caught by comparing participant names, so
+    match against what the agent actually said instead.
+    """
+
+    def __init__(self, similarity_threshold: float = 0.72, tail_seconds: float = 2.5):
+        self.similarity_threshold = similarity_threshold
+        self.tail_seconds = tail_seconds
+        self._entries: List[Tuple[float, str]] = []
+
+    def note_bot_speech(self, text: str, now: float) -> None:
+        normalized = _normalize_for_match(text)
+        if not normalized:
+            return
+        expires_at = now + estimate_speech_seconds(text) + self.tail_seconds
+        self._entries.append((expires_at, normalized))
+
+    def _prune(self, now: float) -> None:
+        self._entries = [entry for entry in self._entries if entry[0] > now]
+
+    def is_echo(self, text: str, now: float) -> bool:
+        self._prune(now)
+        candidate = _normalize_for_match(text)
+        if not candidate:
+            return False
+        candidate_words = candidate.split()
+        for _, spoken in self._entries:
+            # A microphone usually captures only a fragment of the avatar's reply.
+            if len(candidate_words) >= 3 and candidate in spoken:
+                return True
+            if SequenceMatcher(None, candidate, spoken).ratio() >= self.similarity_threshold:
+                return True
+        return False
+
+    def reset(self) -> None:
+        self._entries.clear()
+
+
+class SpeechGovernor:
+    """Hard, non-LLM ceiling on how often and how repetitively the agent may speak.
+
+    This is the structural guarantee against a talking spree: it holds even when
+    the model misbehaves, a control event is lost, or turns arrive fragmented.
+    """
+
+    def __init__(
+        self,
+        cooldown_seconds: float = 2.0,
+        max_replies_per_window: int = 4,
+        window_seconds: float = 30.0,
+        duplicate_threshold: float = 0.90,
+        duplicate_window_seconds: float = 20.0,
+    ):
+        self.cooldown_seconds = cooldown_seconds
+        self.max_replies_per_window = max_replies_per_window
+        self.window_seconds = window_seconds
+        self.duplicate_threshold = duplicate_threshold
+        self.duplicate_window_seconds = duplicate_window_seconds
+        self._reply_times: List[float] = []
+        self._recent_replies: List[Tuple[float, str]] = []
+
+    def _prune(self, now: float) -> None:
+        self._reply_times = [item for item in self._reply_times if now - item <= self.window_seconds]
+        self._recent_replies = [
+            item for item in self._recent_replies if now - item[0] <= self.duplicate_window_seconds
+        ]
+
+    def allows_reply(self, now: float) -> Tuple[bool, str]:
+        self._prune(now)
+        if self._reply_times and now - self._reply_times[-1] < self.cooldown_seconds:
+            return False, "cooldown"
+        if len(self._reply_times) >= self.max_replies_per_window:
+            return False, "rate_limited"
+        return True, "allowed"
+
+    def is_duplicate(self, text: str, now: float) -> bool:
+        self._prune(now)
+        candidate = _normalize_for_match(text)
+        if not candidate:
+            return False
+        return any(
+            SequenceMatcher(None, candidate, previous).ratio() >= self.duplicate_threshold
+            for _, previous in self._recent_replies
+        )
+
+    def note_reply(self, text: str, now: float) -> None:
+        self._reply_times.append(now)
+        self._recent_replies.append((now, _normalize_for_match(text)))
+        self._prune(now)
+
+
+def evaluate_turn(
+    text: str,
+    participant_id: str,
+    bot_name: str,
+    floor: FloorState,
+    now: float,
+    followup_window_seconds: float = 8.0,
+    max_consecutive_followups: int = 2,
+    agent_is_idle: bool = True,
+) -> TurnDecision:
+    """Decide whether an assembled turn has the floor.
+
+    The wake name always grants it. A bounded window after the agent finishes
+    speaking also lets the same speaker ask one or two question-shaped follow-ups
+    without repeating the name, so natural conversation does not require chanting.
+
+    Set `max_consecutive_followups=0` to disable nameless follow-ups entirely and
+    fall back to requiring the wake name on every single turn.
+    """
+
+    invocation = detect_invocation(text, bot_name)
+    if invocation.addressed:
+        return TurnDecision(True, "explicit_name", invocation.matched_name)
+    if not agent_is_idle:
+        # Room chatter overlapping the agent's own reply is never a follow-up.
+        # Without the name it has no claim on the floor.
+        return TurnDecision(False, "agent_not_idle")
+    if floor.last_bot_finished_at is None:
+        return TurnDecision(False, "name_not_present")
+    if participant_id != floor.last_addressed_participant:
+        return TurnDecision(False, "different_speaker")
+    if now - floor.last_bot_finished_at > followup_window_seconds:
+        return TurnDecision(False, "followup_window_expired")
+    if floor.consecutive_followups >= max_consecutive_followups:
+        return TurnDecision(False, "followup_limit")
+    if not looks_like_followup(text):
+        return TurnDecision(False, "not_followup_shaped")
+    return TurnDecision(True, "followup_window")
 
 
 class SustainedSpeechDetector:
