@@ -64,15 +64,39 @@ class FinalUtteranceBuffer:
 
 
 def detect_invocation(text: str, bot_name: str) -> InvocationDecision:
-    """High-precision wake-name gate. Common English phonetic aliases are unsafe."""
+    """Match the configured wake name, including conservative STT formatting variants."""
+
+    def normalized_words(value: str) -> List[str]:
+        # Deepgram may render a brand as either "SpikedAI", "Spiked AI", or
+        # "Spiked A.I.". Normalize formatting without enabling broad fuzzy matches.
+        value = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+        value = re.sub(r"[^a-zA-Z0-9]+", " ", value).casefold().strip()
+        words = value.split()
+        collapsed: List[str] = []
+        index = 0
+        while index < len(words):
+            if index + 1 < len(words) and len(words[index]) == len(words[index + 1]) == 1:
+                collapsed.append(words[index] + words[index + 1])
+                index += 2
+            else:
+                collapsed.append(words[index])
+                index += 1
+        return collapsed
 
     configured = (bot_name or "Tom").strip()
-    safe_names = {configured.casefold()}
-    if configured.casefold() == "tom":
-        safe_names.add("thom")
+    configured_words = normalized_words(configured) or ["tom"]
+    aliases = {tuple(configured_words)}
+    compact_name = "".join(configured_words)
+    if compact_name == "tom":
+        aliases.add(("thom",))
+    if compact_name == "spikedai":
+        # "spike AI" is a frequent, narrow STT repair for the SpikedAI brand.
+        aliases.update({("spiked", "ai"), ("spike", "ai")})
 
-    for name in sorted(safe_names, key=len, reverse=True):
-        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, flags=re.IGNORECASE):
+    normalized_text = " ".join(normalized_words(text))
+    for alias in sorted(aliases, key=lambda item: (len(item), len(" ".join(item))), reverse=True):
+        name = " ".join(alias)
+        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", normalized_text):
             return InvocationDecision(True, name, "explicit_name")
     return InvocationDecision(False)
 

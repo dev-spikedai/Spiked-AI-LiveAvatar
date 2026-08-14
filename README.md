@@ -39,7 +39,7 @@ AGENT_MAX_REPLY_WORDS=45
 
 ## Meeting behavior
 
-- Tom speaks only when a finalized participant utterance explicitly contains `Tom` or `Thom`. Every turn requires the name.
+- The agent speaks only when a finalized participant utterance explicitly contains its configured name. Conservative STT formatting variants are supported (for example, `SpikedAI`, `Spiked AI`, `Spiked A.I.`, and `Spike AI`). Every turn requires the name.
 - Participant names come from Recall and are preserved in conversation history.
 - Company, product, pricing, security, SLA, and integration questions always call document RAG before an answer is generated.
 - Normal answers are capped at two sentences and 45 spoken words; no automatic follow-up question is added.

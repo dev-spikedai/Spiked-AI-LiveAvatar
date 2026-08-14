@@ -32,6 +32,19 @@ def test_invocation_is_required_again_after_an_answer():
     assert not detect_invocation("And what about security?", "Tom").addressed
 
 
+def test_spiked_ai_invocation_accepts_stt_formatting_variants():
+    for transcript in (
+        "SpikedAI, what do you offer?",
+        "Spiked AI, what do you offer?",
+        "Hey Spiked A.I., what do you offer?",
+        "Spike AI, what do you offer?",
+    ):
+        assert detect_invocation(transcript, "SpikedAI").addressed
+
+    assert not detect_invocation("Spike, what do you offer?", "SpikedAI").addressed
+    assert not detect_invocation("What does the AI offer?", "SpikedAI").addressed
+
+
 def test_final_segments_are_buffered_until_end_of_turn():
     buffer = FinalUtteranceBuffer()
     assert buffer.add_result(result("Tom what", speech_final=False)) is None

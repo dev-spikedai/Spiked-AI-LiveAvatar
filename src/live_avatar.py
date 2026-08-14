@@ -381,35 +381,10 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        # For FULL mode, load user company context and create a Context (persona)
+        # The application owns knowledge retrieval and response generation. Keep
+        # LiveAvatar output-only rather than creating a second persona/context that
+        # can greet or answer independently of the meeting turn gate.
         context_id = None
-        if payload.mode == "FULL":
-            user_ctx = await get_user_keywords_and_products(
-                user_id=payload.user_id,
-                client_id=payload.client_id,
-                auth_token=payload.token
-            )
-            c_name = user_ctx.get("company_name") or "SpikedAI"
-            p_desc = user_ctx.get("products_services") or user_ctx.get("product_domain") or "Enterprise AI Solutions"
-            b_name = payload.bot_name or user_ctx.get("bot_name") or "Tom"
-            
-            logger.info(f"[LiveAvatar Context] Initializing with Company='{c_name}', Products='{p_desc[:80]}...', Bot='{b_name}'")
-            
-            ctx_payload = {
-                "name": f"tom-bot-{uuid.uuid4().hex[:8]}",
-                "prompt": f"You are {b_name}, a concise meeting participant representing {c_name}. Products & offerings: {p_desc}. Only speak when explicitly addressed as {b_name}. Keep answers brief."
-            }
-            ctx_res = await client.post(
-                f"{LIVEAVATAR_BASE_URL}/v1/contexts",
-                headers=la_headers,
-                json=ctx_payload
-            )
-            if ctx_res.status_code in (200, 201):
-                ctx_data = ctx_res.json()
-                context_id = ctx_data.get("data", {}).get("id") if isinstance(ctx_data.get("data"), dict) else None
-                logger.info(f"[LiveAvatar] Created context: {context_id}")
-            else:
-                logger.warning(f"[LiveAvatar] Context creation failed: {ctx_res.text}, proceeding without")
 
         # Build session token payload
         token_payload = {
@@ -801,10 +776,12 @@ def _schedule_completed_turn(
     history.append({"speaker": participant_name, "participant_id": participant_id, "text": transcript})
     del history[:-40]
     logger.info(
-        "[Turn Gate] participant_id=%s participant_name=%s addressed=%s reason=%s",
+        "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s addressed=%s matched_name=%s reason=%s",
         participant_id,
         participant_name,
+        bot_name,
         invocation.addressed,
+        invocation.matched_name,
         invocation.reason,
     )
     if not invocation.addressed:
