@@ -74,8 +74,8 @@ PUBLIC_BASE_URL = os.getenv(
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
 AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
-AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "500"))
-AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
+AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
+AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "800"))
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
 DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
 
@@ -96,7 +96,9 @@ AGENT_REPLY_WINDOW_S = float(os.getenv("AGENT_REPLY_WINDOW_S", "30"))
 AGENT_ECHO_SIMILARITY = float(os.getenv("AGENT_ECHO_SIMILARITY", "0.72"))
 AGENT_ECHO_TAIL_S = float(os.getenv("AGENT_ECHO_TAIL_S", "2.5"))
 # Watchdog: force LISTENING if the avatar never reports back.
-AGENT_DEBUG_OVERLAY = os.getenv("AGENT_DEBUG_OVERLAY", "true").lower() == "true"
+# Renders the "what the agent heard" panel into the meeting camera feed, which
+# every participant can see. Off unless explicitly opted into for local debugging.
+AGENT_DEBUG_OVERLAY = os.getenv("AGENT_DEBUG_OVERLAY", "false").lower() == "true"
 AGENT_SPEAK_START_TIMEOUT_S = float(os.getenv("AGENT_SPEAK_START_TIMEOUT_S", "4"))
 AGENT_SPEAK_MAX_OVERRUN_S = float(os.getenv("AGENT_SPEAK_MAX_OVERRUN_S", "6"))
 
