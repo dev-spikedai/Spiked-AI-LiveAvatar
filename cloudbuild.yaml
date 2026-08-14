@@ -47,7 +47,7 @@ steps:
       # and the avatar control socket cannot land on different workers.
       - '1'
       - '--set-env-vars'
-      - 'SPIKED_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app,RECALL_WEBHOOK_URL=https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript,LIVEAVATAR_API_URL=https://api.liveavatar.com,LIVEAVATAR_AVATAR_ID=69cf601f-b35b-4d1b-a701-c854d223b5a5,BOT_NAME=Tom,GEMINI_MODEL=gemini-3.5-flash-lite,PUBLIC_BASE_URL=https://spiked-ai-liveavatar-409019309412.us-central1.run.app,AGENT_BARGE_IN_MS=700,AGENT_MAX_REPLY_WORDS=45'
+      - 'SPIKED_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app,RECALL_WEBHOOK_URL=https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript,LIVEAVATAR_API_URL=https://api.liveavatar.com,LIVEAVATAR_AVATAR_ID=dd73ea75-1218-4ef3-92ce-606d5f7fbc0a,LIVEAVATAR_SANDBOX=true,BOT_NAME=Tom,GEMINI_MODEL=gemini-3.5-flash-lite,PUBLIC_BASE_URL=https://spiked-ai-liveavatar-409019309412.us-central1.run.app,AGENT_BARGE_IN_MS=700,AGENT_MAX_REPLY_WORDS=45'
       - '--set-secrets'
       - 'DEEPGRAM_API=projects/409019309412/secrets/DEEPGRAM_API:latest,LIVEAVATAR_API_KEY=projects/409019309412/secrets/LIVEAVATAR_API_KEY:latest,RECALL_API_KEY=projects/409019309412/secrets/RECALL_API_KEY:latest,GEMINI_API_KEY=projects/409019309412/secrets/GEMINI_API_KEY:latest,SUPABASE_KEY=projects/409019309412/secrets/SUPABASE_KEY_TRANSCRIPT:latest,SUPABASE_URL=projects/409019309412/secrets/SUPABASE_URL_TRANSCRIPT:latest'
 
