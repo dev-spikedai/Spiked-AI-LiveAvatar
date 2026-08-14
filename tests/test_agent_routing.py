@@ -73,6 +73,55 @@ def test_rag_failure_returns_short_honest_fallback(monkeypatch):
     assert answer == "I don’t have verified information on that available right now."
 
 
+def test_llm_response_gate_can_keep_lara_silent(monkeypatch):
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysis(
+                response_action="silent",
+                intent="social",
+                resolved_query="",
+                corrections=[],
+            )
+        ),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+
+    async def fail_if_rag_called(*args):
+        raise AssertionError("silent turns must not query RAG")
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", fail_if_rag_called)
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="I told Lara about this yesterday.",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Lara"},
+    ))
+    assert answer is None
+
+
+def test_llm_response_gate_can_acknowledge_without_generation(monkeypatch):
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysis(
+                response_action="acknowledge",
+                intent="command",
+                resolved_query="wait",
+                corrections=[],
+            )
+        ),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="Lara, please wait a moment.",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Lara"},
+    ))
+    assert answer == "Understood."
+
+
 def test_unaddressed_turn_is_recorded_but_never_scheduled():
     run = {
         "bot_name": "Tom",

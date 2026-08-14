@@ -40,6 +40,7 @@ AGENT_MAX_REPLY_WORDS=45
 ## Meeting behavior
 
 - Lara speaks only when a finalized participant utterance explicitly contains `Lara`. Every turn requires the name.
+- After wake-name detection, a constrained LLM gate chooses `respond`, `acknowledge`, or `silent`, so third-person mentions and explicit requests not to answer do not make Lara speak.
 - Participant names come from Recall and are preserved in conversation history.
 - Company, product, pricing, security, SLA, and integration questions always call document RAG before an answer is generated.
 - Normal answers are capped at two sentences and 45 spoken words; no automatic follow-up question is added.

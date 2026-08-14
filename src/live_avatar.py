@@ -142,6 +142,7 @@ class TranscriptCorrection(BaseModel):
 
 
 class TurnAnalysis(BaseModel):
+    response_action: Literal["respond", "acknowledge", "silent"] = "respond"
     intent: Literal["company_knowledge", "meeting_context", "social", "command"]
     resolved_query: str
     corrections: List[TranscriptCorrection] = Field(default_factory=list)
@@ -243,7 +244,7 @@ async def process_transcript_with_gemini(
         for turn in conversation_history[-12:]
     )
     try:
-        analysis_prompt = f"""Classify and normalize this addressed meeting turn.
+        analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn.
 Company: {company_name}
 Offerings: {products_services or product_domain}
 Verified entity candidates: {candidate_entities}
@@ -252,6 +253,11 @@ Recent finalized conversation:
 Current speaker: {speaker}
 Raw ASR: {transcript}
 
+Set response_action to:
+- respond: the speaker directly asks {bot_name} a question, requests an action/opinion, or gives {bot_name} a command.
+- acknowledge: the speaker directly gives {bot_name} information or a simple instruction that only needs a brief confirmation.
+- silent: {bot_name} is merely mentioned, quoted, discussed in third person, explicitly told not to answer, or the request is directed to somebody else.
+The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
 Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
 Use meeting_context only for questions about what meeting participants said or discussed.
 Use social for greetings and audio checks. Use command for stop/wait/repeat commands.
@@ -276,10 +282,22 @@ Resolve pronouns and omitted context only in resolved_query. Propose corrections
         except Exception:
             logger.warning("[Agent Route] Structured routing failed; defaulting substantive turn to RAG", exc_info=True)
             analysis = TurnAnalysis(
+                response_action="respond",
                 intent="company_knowledge",
                 resolved_query=transcript,
                 corrections=[],
             )
+
+        logger.info(
+            "[LLM Response Gate] speaker=%s action=%s intent=%s",
+            speaker,
+            analysis.response_action,
+            analysis.intent,
+        )
+        if analysis.response_action == "silent":
+            return None
+        if analysis.response_action == "acknowledge":
+            return "Understood."
 
         if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
             analysis.intent = "company_knowledge"
