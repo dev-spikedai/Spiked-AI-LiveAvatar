@@ -75,7 +75,7 @@ PUBLIC_BASE_URL = os.getenv(
 )
 AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
 AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
-AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "800"))
+AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
 DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
 
