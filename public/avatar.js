@@ -11,6 +11,42 @@
     statusDot.className = `status-dot ${state === "active" ? "active" : state === "error" ? "error" : ""}`;
   }
 
+  // Debug overlay: shows every finalized turn the backend evaluated, with the
+  // gate's verdict. Clears on each speaking -> listening transition so the panel
+  // always reflects the current turn rather than the whole meeting.
+  const heardOverlay = document.getElementById("heard-overlay");
+  const heardLines = document.getElementById("heard-lines");
+  const debugEnabled = new URLSearchParams(window.location.search).get("debug") === "1";
+
+  function renderHeard(entry) {
+    if (!debugEnabled) return;
+    const row = document.createElement("div");
+    row.className = "heard-line";
+
+    const speaker = document.createElement("span");
+    speaker.className = "heard-speaker";
+    speaker.textContent = `${entry.speaker || "?"}:`;
+
+    const text = document.createElement("span");
+    text.className = "heard-text";
+    text.textContent = entry.text || "";
+
+    const verdict = document.createElement("span");
+    verdict.className = `heard-verdict ${entry.reply ? "reply" : "blocked"}`;
+    verdict.textContent = entry.reason || (entry.reply ? "reply" : "ignored");
+
+    row.append(speaker, text, verdict);
+    heardLines.appendChild(row);
+    while (heardLines.childElementCount > 6) heardLines.removeChild(heardLines.firstChild);
+    heardOverlay.classList.add("visible");
+  }
+
+  function clearHeard() {
+    if (!debugEnabled) return;
+    heardLines.replaceChildren();
+    heardOverlay.classList.remove("visible");
+  }
+
   try {
     const params = new URLSearchParams(window.location.search);
     const runId = params.get("run") || "default";
@@ -78,6 +114,7 @@
           sendControlState("avatar_speak_ended", eventTurnId);
           if (decoded.source_event_id) speakEventTurns.delete(decoded.source_event_id);
           updateStatus("Listening...", "active");
+          clearHeard();
         }
       } catch {
         console.log(`[LiveKit DataReceived] topic=${topic} (raw)`);
@@ -132,6 +169,11 @@
         const data = JSON.parse(event.data);
         console.log("[WS] Received message from backend:", data);
         
+        if (data.type === "heard") {
+          renderHeard(data);
+          return;
+        }
+
         if (data.type === "avatar_speak" && data.text) {
           console.log(`[avatar.js] >>> Publishing avatar.speak_text: "${data.text}"`);
           currentTurnId = data.turn_id;
