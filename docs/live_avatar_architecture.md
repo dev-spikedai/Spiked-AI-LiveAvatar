@@ -13,7 +13,7 @@ sequenceDiagram
     autonumber
     participant Participant as Meeting Participant
     participant Bot as Recall Bot
-    participant LA_SDK as LiveAvatar SDK
+    participant LASDK as LiveAvatar SDK
     participant Backend as Orchestrator
     participant DG as Deepgram Nova-3
     participant Gemini as Gemini 3.5
@@ -24,7 +24,7 @@ sequenceDiagram
     Note over Bot, Backend: 1. Meeting Start & Credentials
     Bot->>Backend: GET credentials
     Backend-->>Bot: Return WebRTC Token
-    Bot->>LA_SDK: Initialize WebRTC
+    Bot->>LASDK: Initialize WebRTC
     Bot->>Backend: Open Audio WebSocket
 
     %% Audio Streaming & STT
@@ -51,8 +51,8 @@ sequenceDiagram
         
         %% Speaking Command
         Backend->>Bot: Send avatar_speak
-        Bot->>LA_SDK: Publish speak_text
-        LA_SDK->>Participant: Render video and play Audio
+        Bot->>LASDK: Publish speak_text
+        LASDK->>Participant: Render video and play Audio
     else General Room Talk
         Backend->>Backend: Remain Silent
     end
