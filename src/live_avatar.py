@@ -8,7 +8,7 @@ import time
 import uuid
 import hashlib
 import hmac
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, AsyncGenerator
 from urllib.parse import urlencode, quote
 
 from src.supabase_client import get_user_keywords_and_products
@@ -69,6 +69,23 @@ LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
 LIVEAVATAR_AVATAR_ID = os.getenv("LIVEAVATAR_AVATAR_ID", "69cf601f-b35b-4d1b-a701-c854d223b5a5")
 LIVEAVATAR_SANDBOX = os.getenv("LIVEAVATAR_SANDBOX", "false").lower() == "true"
+# Simli AI avatar renderer (free plan: $10 signup credit + 50 min/month top-up).
+# Simli only renders + lip-syncs; the audio is synthesized by Cartesia below.
+SIMLI_API_KEY = os.getenv("SIMLI_API_KEY", "")
+SIMLI_FACE_ID = os.getenv("SIMLI_FACE_ID", "")
+SIMLI_BASE_URL = os.getenv("SIMLI_API_URL", "https://api.simli.ai")
+SIMLI_MAX_SESSION_SECONDS = int(os.getenv("SIMLI_MAX_SESSION_SECONDS", "1800"))
+SIMLI_MAX_IDLE_SECONDS = int(os.getenv("SIMLI_MAX_IDLE_SECONDS", "300"))
+# Audio frames forwarded to the avatar page. 6000 bytes = 3000 samples = 187.5ms
+# at 16kHz, which is Simli's preferred chunk size.
+SIMLI_AUDIO_CHUNK_BYTES = int(os.getenv("SIMLI_AUDIO_CHUNK_BYTES", "6000"))
+# Cartesia TTS (free plan). Output is pinned to raw PCM16 @ 16kHz mono, the
+# exact format Simli's WebRTC endpoint consumes, so the page resamples nothing.
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
+CARTESIA_BASE_URL = os.getenv("CARTESIA_BASE_URL", "https://api.cartesia.ai")
+CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "f786b574-daa5-4673-aa0c-cbe3e8534c02")
+CARTESIA_MODEL = os.getenv("CARTESIA_MODEL", "sonic-3.5")
+CARTESIA_SAMPLE_RATE = int(os.getenv("CARTESIA_SAMPLE_RATE", "16000"))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", 
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
@@ -77,7 +94,7 @@ AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
 AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
 AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
-DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
+DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tiya").strip() or "Tiya"
 
 # Turn detection. Fragments from one speaker are merged before the gate runs, so a
 # single sentence split by a pause cannot produce two replies.
@@ -265,7 +282,7 @@ async def process_transcript_with_gemini(
     ctx = user_context or {}
     company_name = ctx.get("company_name", "SpikedAI")
     products_services = ctx.get("products_services", "")
-    bot_name = ctx.get("bot_name") or "Tom"
+    bot_name = ctx.get("bot_name") or "Tiya"
     product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     catalog = build_entity_catalog(ctx)
@@ -278,7 +295,7 @@ async def process_transcript_with_gemini(
         # Fast path: skip the classification round trip only when the turn is
         # unambiguously addressed to the agent — the wake name opens the sentence
         # and a self-contained company question follows. Anything less certain
-        # ("I asked Tom about pricing", "was Tom's answer right, Sam?") still needs
+        # ("I asked Tiya about pricing", "was Tiya's answer right, Sam?") still needs
         # the LLM addressee gate below, which is the whole point of that call.
         if (
             is_directly_addressed(transcript, bot_name)
@@ -455,6 +472,8 @@ def health_check():
         "gemini_configured": bool(GEMINI_API_KEY),
         "gemini_model": GEMINI_MODEL,
         "recall_configured": bool(RECALL_API_KEY),
+        "simli_configured": bool(SIMLI_API_KEY and SIMLI_FACE_ID),
+        "cartesia_configured": bool(CARTESIA_API_KEY),
         "spiked_backend_url": SPIKED_BACKEND_URL,
         "recall_webhook_url": RECALL_WEBHOOK_URL,
         "public_base_url": PUBLIC_BASE_URL
@@ -462,7 +481,7 @@ def health_check():
 
 @app.get("/api/runs/{run_id}/credentials")
 async def get_run_credentials(run_id: str, token: Optional[str] = Query(None)):
-    """Provides LiveKit room credentials to avatar.html when loaded by Recall."""
+    """Provides Simli session credentials to avatar.html when loaded by Recall."""
     run = _ACTIVE_RUNS.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found or expired")
@@ -470,6 +489,8 @@ async def get_run_credentials(run_id: str, token: Optional[str] = Query(None)):
         "session_id": run.get("session_id"),
         "livekit_url": run.get("livekit_url"),
         "livekit_token": run.get("livekit_token"),
+        "simli_session_token": run.get("simli_session_token"),
+        "simli_base_url": run.get("simli_base_url") or SIMLI_BASE_URL,
     }
 
 @app.post("/create-live-avatar")
@@ -556,6 +577,142 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             "session_token": session_token
         }
 
+async def create_simli_session() -> str:
+    """Create a Simli compose session token (free-plan friendly).
+
+    Simli only renders the avatar and lip-syncs; the audio driving it is
+    synthesized by Cartesia and streamed to the page over the control WS.
+    """
+    if not SIMLI_API_KEY:
+        raise HTTPException(status_code=500, detail="SIMLI_API_KEY is not configured")
+    if not SIMLI_FACE_ID:
+        raise HTTPException(status_code=500, detail="SIMLI_FACE_ID is not configured")
+
+    url = f"{SIMLI_BASE_URL.rstrip('/')}/compose/token"
+    headers = {"Content-Type": "application/json", "x-simli-api-key": SIMLI_API_KEY}
+    payload = {
+        "faceId": SIMLI_FACE_ID,
+        "maxSessionLength": SIMLI_MAX_SESSION_SECONDS,
+        "maxIdleTime": SIMLI_MAX_IDLE_SECONDS,
+        "handleSilence": True,
+        "audioInputFormat": "pcm16",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+
+    if resp.status_code not in (200, 201):
+        logger.error("[Simli] token creation failed: %s", resp.text)
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:300])
+
+    data = resp.json()
+    token = data.get("session_token") if isinstance(data, dict) else None
+    if not token or not isinstance(token, str) or token in ("FAIL TOKEN", "FAIL"):
+        logger.error("[Simli] token response invalid: %s", data)
+        raise HTTPException(status_code=500, detail="Simli session token creation failed")
+
+    logger.info("[Simli] Session token created face_id=%s", SIMLI_FACE_ID)
+    return token
+
+
+async def stream_cartesia_tts(text: str) -> AsyncGenerator[bytes, None]:
+    """Synthesize `text` to raw 16kHz mono PCM16 and yield it in chunks.
+
+    Uses the Cartesia /tts/bytes endpoint: one POST per utterance, with the raw
+    PCM streamed back as the response body. output_format is pinned to what
+    Simli's WebRTC endpoint consumes (pcm_s16le @ 16kHz) so nothing is
+    resampled before the avatar page forwards it.
+    """
+    if not CARTESIA_API_KEY:
+        raise RuntimeError("CARTESIA_API_KEY is not configured")
+
+    url = f"{CARTESIA_BASE_URL.rstrip('/')}/tts/bytes"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CARTESIA_API_KEY}",
+        "Cartesia-Version": "2026-03-01",
+    }
+    payload = {
+        "model_id": CARTESIA_MODEL,
+        "transcript": text,
+        "voice": {"mode": "id", "id": CARTESIA_VOICE_ID},
+        "output_format": {
+            "container": "raw",
+            "encoding": "pcm_s16le",
+            "sample_rate": CARTESIA_SAMPLE_RATE,
+        },
+        "language": "en",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream("POST", url, headers=headers, json=payload) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode("utf-8", "replace")
+                logger.error("[Cartesia] TTS failed: %s %s", resp.status_code, body[:300])
+                raise RuntimeError(f"Cartesia TTS failed ({resp.status_code})")
+            async for chunk in resp.aiter_bytes():
+                if chunk:
+                    yield chunk
+
+
+async def _ws_send(run: Dict[str, Any], payload: dict) -> bool:
+    """Serialize all writes to the avatar control socket through a per-run lock."""
+    ws = run.get("control_ws")
+    if not ws:
+        return False
+    lock: asyncio.Lock = run.setdefault("ws_send_lock", asyncio.Lock())
+    async with lock:
+        try:
+            await ws.send_json(payload)
+            return True
+        except Exception:
+            logger.warning("[WS] Control socket send failed: %s", payload.get("type"))
+            return False
+
+
+async def _speak_reply(run: Dict[str, Any], turn_id: int, text: str) -> None:
+    """Turn `text` into spoken audio and stream it to the avatar page.
+
+    Flow: Cartesia TTS (raw PCM16 @ 16kHz) -> base64 frames over the control WS
+    -> avatar.js -> Simli WebRTC for lip-sync + playback. The page echoes back
+    avatar_speak_started / avatar_speak_ended so the floor state stays accurate.
+    """
+    if not run.get("control_ws"):
+        logger.warning("[TTS] Control socket unavailable turn_id=%s", turn_id)
+        return
+
+    async def emit(payload: dict) -> None:
+        await _ws_send(run, payload)
+
+    try:
+        await emit({"type": "avatar_speak", "text": text, "turn_id": turn_id})
+        frame = bytearray()
+        async for chunk in stream_cartesia_tts(text):
+            frame.extend(chunk)
+            while len(frame) >= SIMLI_AUDIO_CHUNK_BYTES:
+                piece = bytes(frame[:SIMLI_AUDIO_CHUNK_BYTES])
+                del frame[:SIMLI_AUDIO_CHUNK_BYTES]
+                await emit({
+                    "type": "avatar_audio",
+                    "data": base64.b64encode(piece).decode("ascii"),
+                    "turn_id": turn_id,
+                })
+        if frame:
+            await emit({
+                "type": "avatar_audio",
+                "data": base64.b64encode(bytes(frame)).decode("ascii"),
+                "turn_id": turn_id,
+            })
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+        logger.info("[TTS] Streamed reply turn_id=%s chars=%d", turn_id, len(text))
+    except asyncio.CancelledError:
+        logger.info("[TTS] Cancelled reply turn_id=%s", turn_id)
+        raise
+    except Exception:
+        logger.error("[TTS] Failed to stream reply turn_id=%s", turn_id, exc_info=True)
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+
+
 async def _deploy_live_avatar_bot(
     meeting_url: str,
     token: str,
@@ -576,15 +733,9 @@ async def _deploy_live_avatar_bot(
         run_id = f"run_{uuid.uuid4().hex}"
         recall_ws_token = uuid.uuid4().hex
 
-        # 1. Create LiveAvatar FULL Session ($0.20/min, includes TTS) with user context
-        avatar_session = await create_avatar(CreateLiveAvatarRequest(
-            avatar_id=avatar_id,
-            mode="FULL",
-            user_id=user_id,
-            client_id=client_id,
-            token=token,
-            bot_name=bot_name
-        ))
+        # 1. Create a Simli session (free plan). Simli renders + lip-syncs only;
+        #    Deepgram STT, Gemini LLM and Cartesia TTS all run in this process.
+        simli_session_token = await create_simli_session()
 
         # 2. Store session credentials for Recall's avatar.html
         _ACTIVE_RUNS[run_id] = {
@@ -592,9 +743,11 @@ async def _deploy_live_avatar_bot(
             "user_id": user_id,
             "client_id": client_id,
             "token": token,
-            "session_id": avatar_session.get("session_id"),
-            "livekit_url": avatar_session.get("livekit_url"),
-            "livekit_token": avatar_session.get("livekit_token"),
+            "session_id": None,
+            "livekit_url": None,
+            "livekit_token": None,
+            "simli_session_token": simli_session_token,
+            "simli_base_url": SIMLI_BASE_URL,
             "bot_name": bot_name,
             "recall_ws_token": recall_ws_token,
             "state": AgentState.LISTENING,
@@ -723,7 +876,7 @@ async def _deploy_live_avatar_bot(
                 "id": bot_id,
                 "bot_id": bot_id,
                 "run_id": run_id,
-                "liveavatar_session_id": avatar_session.get("session_id"),
+                "simli_session_token": simli_session_token,
                 "avatar_page_url": avatar_page_url,
                 "status": latest_status
             }
@@ -878,21 +1031,17 @@ def _push_heard(
     reason: str,
 ) -> None:
     """Mirror the gate's verdict onto the avatar page's debug overlay."""
-    control_ws = run.get("control_ws")
-    if not control_ws:
+    if not run.get("control_ws"):
         return
 
     async def send() -> None:
-        try:
-            await control_ws.send_json({
-                "type": "heard",
-                "speaker": speaker,
-                "text": text,
-                "reply": reply,
-                "reason": reason,
-            })
-        except Exception:
-            pass
+        await _ws_send(run, {
+            "type": "heard",
+            "speaker": speaker,
+            "text": text,
+            "reply": reply,
+            "reason": reason,
+        })
 
     asyncio.create_task(send())
 
@@ -920,12 +1069,11 @@ async def _interrupt_avatar(run: Dict[str, Any], participant_id: str) -> None:
         _release_floor(run)
         return
 
-    control_ws = run.get("control_ws")
-    if not control_ws:
+    if not run.get("control_ws"):
         return
     run["state"] = AgentState.INTERRUPTING
     logger.info("[Barge-In] participant_id=%s sustained_ms=%d", participant_id, AGENT_BARGE_IN_MS)
-    await control_ws.send_json({
+    await _ws_send(run, {
         "type": "avatar_interrupt",
         "turn_id": run.get("active_turn_id"),
     })
@@ -1022,7 +1170,7 @@ def _finalize_turn(
     transcript: str,
 ) -> None:
     now = time.monotonic()
-    bot_name = run.get("bot_name") or "Tom"
+    bot_name = run.get("bot_name") or "Tiya"
     floor: FloorState = run["floor"]
     governor: SpeechGovernor = run["governor"]
 
@@ -1113,8 +1261,8 @@ def _finalize_turn(
             # Register before dispatch: the echo can return before the socket ack.
             run["echo"].note_bot_speech(answer, spoken_at)
             governor.note_reply(answer, spoken_at)
-            await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
             run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
+            await _speak_reply(run, turn_id, answer)
         except asyncio.CancelledError:
             logger.info("[Agent] Cancelled superseded turn_id=%s", turn_id)
         except Exception:
@@ -1238,6 +1386,12 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
                 watchdog = run.get("watchdog_task")
                 if watchdog and not watchdog.done():
                     watchdog.cancel()
+                if event_type == "avatar_speak_interrupted":
+                    # Stop the backend from streaming further TTS frames: the
+                    # page already flushed Simli's buffer with "SKIP".
+                    pending = run.get("active_response_task")
+                    if pending and not pending.done():
+                        pending.cancel()
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
@@ -1270,7 +1424,7 @@ async def recall_separate_audio_endpoint(
         client_id=run.get("client_id"),
         auth_token=run.get("token"),
     )
-    user_context["bot_name"] = run.get("bot_name") or "Tom"
+    user_context["bot_name"] = run.get("bot_name") or "Tiya"
     run["user_context"] = user_context
     keywords = build_entity_catalog(user_context)
     transcribers: Dict[str, ParticipantTranscriber] = {}

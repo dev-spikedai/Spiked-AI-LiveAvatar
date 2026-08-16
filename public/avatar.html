@@ -4,8 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SpikedAI Live Avatar</title>
-  <!-- LiveKit Client SDK for WebRTC rendering -->
-  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
   <style>
     * {
       box-sizing: border-box;
@@ -130,6 +128,7 @@
 <body>
   <div id="video-container">
     <video id="avatar-video" autoplay playsinline muted></video>
+    <audio id="avatar-audio" autoplay playsinline></audio>
     <div id="heard-overlay">
       <div id="heard-title">Heard this turn</div>
       <div id="heard-lines"></div>

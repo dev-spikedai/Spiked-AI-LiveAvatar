@@ -24,7 +24,7 @@ _CACHE_TTL_SECONDS = 600
 
 # Default foundational terms for SpikedAI ecosystem
 DEFAULT_CORE_KEYWORDS: List[str] = [
-    "Tom",
+    "Tiya",
     "Spiked",
     "SpikedAI",
     "Spiked AI",
@@ -72,7 +72,7 @@ async def get_user_keywords_and_products(
     keywords_set: Set[str] = set(DEFAULT_CORE_KEYWORDS)
     company_name = "SpikedAI"
     products_services = ""
-    bot_name = "Tom"
+    bot_name = "Tiya"
     product_domain = "Enterprise Sales & AI Meeting Automation"
 
     client_to_use = _supabase_client
@@ -96,7 +96,7 @@ async def get_user_keywords_and_products(
             
             if res.data and len(res.data) > 0:
                 cfg = res.data[0]
-                bot_name = (config.get("bot_name") or "Tom").strip()
+                bot_name = (config.get("bot_name") or "Tiya").strip()
                 company_name = cfg.get("seller_company") or company_name
                 products_services = cfg.get("products_services") or ""
                 product_domain = cfg.get("product_domain") or product_domain

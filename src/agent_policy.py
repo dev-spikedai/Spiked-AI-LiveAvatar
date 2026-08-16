@@ -101,7 +101,7 @@ def detect_invocation(text: str, bot_name: str) -> InvocationDecision:
                 index += 1
         return collapsed
 
-    configured = (bot_name or "Tom").strip()
+    configured = (bot_name or "Tiya").strip()
     configured_words = normalized_words(configured) or ["tom"]
     aliases = {tuple(configured_words)}
     compact_name = "".join(configured_words)
@@ -208,7 +208,7 @@ _ANAPHORA = frozenset({
 def is_directly_addressed(text: str, bot_name: str) -> bool:
     """True when the turn opens by naming the agent, then asks something.
 
-    "Tom, what is your pricing?" is unambiguous. "I asked Tom about pricing" puts
+    "Tiya, what is your pricing?" is unambiguous. "I asked Tiya about pricing" puts
     the name mid-sentence and is a third-person mention, so it must not qualify —
     resolving that correctly needs the LLM addressee gate, not a regex.
     """
@@ -226,8 +226,8 @@ def is_directly_addressed(text: str, bot_name: str) -> bool:
     if not remainder:
         return False
     # A trailing "?" is the strongest signal. Otherwise only a direct imperative
-    # counts: "Tom is great at pricing" opens with the name and reads as
-    # question-shaped to a looser check, but it is a statement about him.
+    # counts: "Tiya is great at pricing" opens with the name and reads as
+    # question-shaped to a looser check, but it is a statement about her.
     # Anything else falls through to the LLM gate, which costs latency, not
     # correctness.
     return text.strip().endswith("?") or remainder[0] in _IMPERATIVE_STARTERS
