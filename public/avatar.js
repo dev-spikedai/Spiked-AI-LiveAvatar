@@ -121,6 +121,35 @@
       }
     });
 
+    let reconnecting = false;
+    room.on(LivekitClient.RoomEvent.Disconnected, async (reason) => {
+      console.warn(`[LiveKit] Room disconnected: ${reason}`);
+      if (reconnecting) return;
+      reconnecting = true;
+      updateStatus("Disconnected — reconnecting...", "error");
+      // The LiveAvatar session itself may have closed server-side (idle
+      // timeout, crash, etc.), so re-fetch fresh credentials rather than
+      // just re-dialing the stale ones.
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await new Promise((r) => setTimeout(r, Math.min(2000 * attempt, 10000)));
+        try {
+          const res = await fetch(`/api/runs/${runId}/credentials`);
+          if (!res.ok) throw new Error(`credentials ${res.status}`);
+          const data = await res.json();
+          sessionId = data.session_id;
+          await room.connect(data.livekit_url, data.livekit_token);
+          console.log("[LiveKit] Reconnected to room successfully");
+          updateStatus("Live Avatar Connected", "active");
+          reconnecting = false;
+          return;
+        } catch (err) {
+          console.warn(`[LiveKit] Reconnect attempt ${attempt} failed:`, err);
+        }
+      }
+      updateStatus("Connection lost — refresh to rejoin", "error");
+      reconnecting = false;
+    });
+
     await room.connect(livekitUrl, livekitToken);
     console.log("[LiveKit] Connected to room successfully");
     updateStatus("Live Avatar Connected", "active");

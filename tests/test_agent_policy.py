@@ -109,13 +109,30 @@ def test_sustained_speech_requires_configured_duration():
     assert detector.feed(voiced_frame)
 
 
-def test_silence_breaks_barge_in_streak():
+def test_brief_silence_is_tolerated_within_the_streak():
+    """A single dropped frame (a plosive, a breath) must not wipe the whole
+    streak — real continuous speech is not uniform acoustic energy."""
+    detector = SustainedSpeechDetector(threshold_ms=100)
+    detector._vad = None
+    voiced_frame = struct.pack("<320h", *([1000] * 320))
+    silent_frame = struct.pack("<320h", *([0] * 320))
+    for _ in range(2):
+        assert not detector.feed(voiced_frame)
+    assert not detector.feed(silent_frame)  # within tolerance, streak survives
+    for _ in range(2):
+        assert not detector.feed(voiced_frame)
+    assert detector.feed(voiced_frame)  # streak still reaches the threshold
+
+
+def test_sustained_silence_breaks_barge_in_streak():
     detector = SustainedSpeechDetector(threshold_ms=100)
     detector._vad = None
     voiced_frame = struct.pack("<320h", *([1000] * 320))
     silent_frame = struct.pack("<320h", *([0] * 320))
     for _ in range(4):
         assert not detector.feed(voiced_frame)
-    assert not detector.feed(silent_frame)
+    # Longer than the tolerance window — a genuine pause, not a dropout.
+    for _ in range(SustainedSpeechDetector.UNVOICED_TOLERANCE_FRAMES + 1):
+        assert not detector.feed(silent_frame)
     for _ in range(4):
         assert not detector.feed(voiced_frame)

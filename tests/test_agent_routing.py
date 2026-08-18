@@ -16,14 +16,17 @@ class FakeModels:
 
 
 def test_self_contained_question_skips_the_classification_round_trip(monkeypatch):
-    """A self-contained company question goes straight to RAG: one model call."""
-    models = FakeModels([
-        SimpleNamespace(text="It uses the verified security controls described in the knowledge base."),
-    ])
+    """A self-contained company question goes straight to RAG: zero model calls.
+
+    company_knowledge turns are single-shot (see _generate_grounded_reply): the
+    reply shape is folded into the question sent to /ask/handsfree, so neither
+    the classification call nor a separate compose call happens.
+    """
+    models = FakeModels([])  # any consumption attempt raises IndexError
     monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
     rag_queries = []
 
-    async def fake_rag(query, auth_token, client_id):
+    async def fake_rag(query, auth_token, client_id, **kwargs):
         rag_queries.append((query, auth_token, client_id))
         return "Verified security controls are enabled."
 
@@ -37,14 +40,19 @@ def test_self_contained_question_skips_the_classification_round_trip(monkeypatch
         user_context={"company_name": "SpikedAI", "bot_name": "Tom", "keywords": ["SpikedAI"]},
     ))
 
-    # Raw transcript is the retrieval query, and the analysis response was never consumed.
-    assert rag_queries == [("Tom, how do you handle security?", "token", "client")]
-    assert models.responses == []
-    assert answer == "It uses the verified security controls described in the knowledge base."
+    # Raw transcript is embedded in the shaped retrieval query, and no model
+    # response was ever consumed (the fake model list was empty).
+    assert len(rag_queries) == 1
+    query, token, client = rag_queries[0]
+    assert "Tom, how do you handle security?" in query
+    assert (token, client) == ("token", "client")
+    assert answer == "Verified security controls are enabled."
 
 
 def test_turn_needing_context_still_runs_query_repair(monkeypatch):
-    """A pronoun means the raw text is a poor query, so classification still runs."""
+    """A pronoun means the raw text is a poor query, so classification still
+    runs — but company_knowledge is single-shot after that: no second (compose)
+    model call, the backend's answer is spoken directly."""
     models = FakeModels([
         SimpleNamespace(
             parsed=live_avatar.TurnAnalysis(
@@ -53,12 +61,11 @@ def test_turn_needing_context_still_runs_query_repair(monkeypatch):
                 corrections=[],
             )
         ),
-        SimpleNamespace(text="Pricing starts at the published enterprise tier."),
     ])
     monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
     rag_queries = []
 
-    async def fake_rag(query, auth_token, client_id):
+    async def fake_rag(query, auth_token, client_id, **kwargs):
         rag_queries.append((query, auth_token, client_id))
         return "Enterprise pricing is published."
 
@@ -72,8 +79,12 @@ def test_turn_needing_context_still_runs_query_repair(monkeypatch):
         user_context={"company_name": "SpikedAI", "bot_name": "Tom", "keywords": ["SpikedAI"]},
     ))
 
-    assert rag_queries == [("SpikedAI enterprise pricing", "token", "client")]
-    assert answer == "Pricing starts at the published enterprise tier."
+    assert len(rag_queries) == 1
+    query, token, client = rag_queries[0]
+    assert "SpikedAI enterprise pricing" in query
+    assert (token, client) == ("token", "client")
+    assert models.responses == []
+    assert answer == "Enterprise pricing is published."
 
 
 def test_rag_failure_returns_short_honest_fallback(monkeypatch):
@@ -88,7 +99,7 @@ def test_rag_failure_returns_short_honest_fallback(monkeypatch):
     ])
     monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
 
-    async def fake_rag(*args):
+    async def fake_rag(*args, **kwargs):
         return "No specific documentation found for this query."
 
     monkeypatch.setattr(live_avatar, "query_spiked_rag", fake_rag)

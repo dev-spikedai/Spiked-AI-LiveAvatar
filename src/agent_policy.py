@@ -244,10 +244,16 @@ def needs_context_resolution(text: str) -> bool:
     return any(word in _ANAPHORA for word in words)
 
 
-def normalize_reply(text: str, max_words: int = 45, max_sentences: int = 2) -> str:
+def _clean_fragment(text: str) -> str:
+    """Collapse whitespace and strip markdown without truncating."""
+
     clean = re.sub(r"\s+", " ", (text or "").strip())
     clean = clean.replace("**", "").replace("__", "").replace("`", "")
-    clean = re.sub(r"^#+\s*", "", clean)
+    return re.sub(r"^#+\s*", "", clean).strip()
+
+
+def normalize_reply(text: str, max_words: int = 45, max_sentences: int = 2) -> str:
+    clean = _clean_fragment(text)
     if not clean:
         return ""
 
@@ -261,6 +267,58 @@ def normalize_reply(text: str, max_words: int = 45, max_sentences: int = 2) -> s
     return clean
 
 
+# Budgets for the two optional tail parts of a spoken reply. Both are short by
+# design: the bridge is one clause, the closing question is one line.
+MAX_BRIDGE_WORDS = 18
+MAX_QUESTION_WORDS = 20
+
+
+def compose_reply(
+    answer: str,
+    bridge: str = "",
+    next_question: str = "",
+    max_answer_words: int = 45,
+    max_bridge_words: int = MAX_BRIDGE_WORDS,
+    max_question_words: int = MAX_QUESTION_WORDS,
+) -> str:
+    """Assemble the agent's three-part spoken turn under a per-part budget.
+
+    The parts are budgeted separately because any whole-reply cap truncates from
+    the end, and the closing question is always last. Capping the assembled
+    string deletes precisely the part the persona is defined by, so the answer is
+    the only part allowed to be trimmed mid-thought. An over-budget bridge or
+    question is dropped outright: a half-finished clause read aloud is worse than
+    a missing one.
+    """
+
+    answer = _clean_fragment(answer)
+    if not answer:
+        return ""
+    words = answer.split()
+    if len(words) > max_answer_words:
+        answer = " ".join(words[:max_answer_words]).rstrip(",;:")
+    if answer[-1] not in ".!?":
+        answer += "."
+
+    bridge = _clean_fragment(bridge)
+    if bridge and len(bridge.split()) > max_bridge_words:
+        bridge = ""
+    if bridge and bridge[-1] not in ".!?":
+        bridge += "."
+
+    question = _clean_fragment(next_question).rstrip(".!,;:")
+    if question and len(question.split()) > max_question_words:
+        question = ""
+    # Guard against the model emitting a stub or a declarative fragment; a
+    # question mark bolted onto either one reads as a non-sequitur when spoken.
+    if len(question.split()) < 3:
+        question = ""
+    if question:
+        question = question.rstrip("?") + "?"
+
+    return " ".join(part for part in (answer, bridge, question) if part)
+
+
 WORDS_PER_SECOND = 2.5
 
 # Openers that make a nameless turn read as a continuation of the agent's answer
@@ -270,6 +328,19 @@ _FOLLOWUP_STARTERS = frozenset({
     "what", "how", "why", "when", "where", "who", "which", "whose",
     "can", "could", "would", "will", "should", "do", "does", "did",
     "is", "are", "was", "were", "tell", "explain", "elaborate", "repeat",
+})
+
+# Direct-answer openers, on top of _FOLLOWUP_STARTERS, that only count as a
+# floor-claiming follow-up (evaluate_turn), never as an answerable-question
+# signal (Level 1 insight firing, _consider_insight): a declarative answer to
+# the bot's own just-asked question — "I want to see the integrations" in
+# reply to "what would you like to see next?" — legitimately continues the
+# exchange even though it is not phrased as a question. A bare statement like
+# "we already use SCIM provisioning" must NOT trigger a proactive insight
+# prompt, so this set is deliberately not folded into _FOLLOWUP_STARTERS.
+_DIRECT_REPLY_STARTERS = _FOLLOWUP_STARTERS | frozenset({
+    "i", "id", "im", "ill", "ive", "we", "well", "lets", "yes", "yeah",
+    "yep", "sure", "no", "nope", "not", "show", "maybe",
 })
 
 # A finalized segment ending on one of these is a speaker pausing mid-thought,
@@ -304,8 +375,14 @@ def is_probably_incomplete(text: str) -> bool:
     return bool(words) and words[-1] in _DANGLING_TOKENS
 
 
-def looks_like_followup(text: str) -> bool:
-    """Question-shaped continuation that may skip the wake name inside the window."""
+def looks_like_followup(text: str, starters: frozenset = _FOLLOWUP_STARTERS) -> bool:
+    """Question-shaped continuation that may skip the wake name inside the window.
+
+    `starters` defaults to the narrow, question-only set used for Level 1
+    insight firing. evaluate_turn passes _DIRECT_REPLY_STARTERS instead, since
+    a floor-claiming follow-up may legitimately be a declarative answer to the
+    bot's own just-asked question, not just another question.
+    """
 
     clean = (text or "").strip()
     words = _normalize_for_match(clean).split()
@@ -313,10 +390,10 @@ def looks_like_followup(text: str) -> bool:
         return False
     if clean.endswith("?"):
         return True
-    if words[0] in _FOLLOWUP_STARTERS:
+    if words[0] in starters:
         return True
     # "and what about pricing", "okay how does that work"
-    if words[0] in {"and", "but", "so", "okay", "ok"} and words[1] in _FOLLOWUP_STARTERS:
+    if words[0] in {"and", "but", "so", "okay", "ok"} and words[1] in starters:
         return True
     return False
 
@@ -424,13 +501,21 @@ def evaluate_turn(
     now: float,
     followup_window_seconds: float = 8.0,
     max_consecutive_followups: int = 2,
+    followup_decay_rate: float = 0.6,
+    min_followup_window_seconds: float = 3.0,
     agent_is_idle: bool = True,
 ) -> TurnDecision:
     """Decide whether an assembled turn has the floor.
 
-    The wake name always grants it. A bounded window after the agent finishes
-    speaking also lets the same speaker ask one or two question-shaped follow-ups
-    without repeating the name, so natural conversation does not require chanting.
+    The wake name always grants it. A window after the agent finishes speaking
+    also lets the same speaker keep asking question-shaped follow-ups without
+    repeating the name, so natural conversation does not require chanting.
+
+    That window is not a fixed cliff: it shrinks by `followup_decay_rate` on
+    each successive nameless follow-up, down to a `min_followup_window_seconds`
+    floor. A long, genuinely on-topic exchange tapers instead of hitting a hard
+    count at some arbitrary Nth question — a fixed cap is what makes floor
+    control read as a chatbot rule rather than a conversation.
 
     Set `max_consecutive_followups=0` to disable nameless follow-ups entirely and
     fall back to requiring the wake name on every single turn.
@@ -439,6 +524,8 @@ def evaluate_turn(
     invocation = detect_invocation(text, bot_name)
     if invocation.addressed:
         return TurnDecision(True, "explicit_name", invocation.matched_name)
+    if max_consecutive_followups <= 0:
+        return TurnDecision(False, "name_not_present")
     if not agent_is_idle:
         # Room chatter overlapping the agent's own reply is never a follow-up.
         # Without the name it has no claim on the floor.
@@ -447,17 +534,30 @@ def evaluate_turn(
         return TurnDecision(False, "name_not_present")
     if participant_id != floor.last_addressed_participant:
         return TurnDecision(False, "different_speaker")
-    if now - floor.last_bot_finished_at > followup_window_seconds:
+    window = max(
+        min_followup_window_seconds,
+        followup_window_seconds * (followup_decay_rate ** floor.consecutive_followups),
+    )
+    if now - floor.last_bot_finished_at > window:
         return TurnDecision(False, "followup_window_expired")
-    if floor.consecutive_followups >= max_consecutive_followups:
-        return TurnDecision(False, "followup_limit")
-    if not looks_like_followup(text):
+    if not looks_like_followup(text, starters=_DIRECT_REPLY_STARTERS):
         return TurnDecision(False, "not_followup_shaped")
     return TurnDecision(True, "followup_window")
 
 
 class SustainedSpeechDetector:
     """20 ms voice-frame detector used only for barge-in, never invocation."""
+
+    # Real continuous speech is not uniform acoustic energy: plosives, brief
+    # inter-word pauses, and Recall's audio resampling all produce isolated
+    # frames a frame-level VAD flags as non-speech even mid-utterance. A zero-
+    # tolerance streak (any single unvoiced frame wipes the whole count)
+    # requires a user to speak for the full threshold with not one dropped
+    # frame to ever trigger barge-in, which real speech essentially never
+    # does. Tolerating a short run of unvoiced frames absorbs those dropouts
+    # while a genuine pause (silence for longer than the tolerance) still
+    # correctly resets the streak.
+    UNVOICED_TOLERANCE_FRAMES = 4  # 80ms at the 20ms frame size below
 
     def __init__(self, sample_rate: int = 16000, threshold_ms: int = 700):
         self.sample_rate = sample_rate
@@ -466,11 +566,13 @@ class SustainedSpeechDetector:
         self.required_frames = max(1, threshold_ms // self.frame_ms)
         self._buffer = bytearray()
         self._consecutive_voiced = 0
+        self._unvoiced_streak = 0
         self._vad = webrtcvad.Vad(2) if webrtcvad else None
 
     def reset(self) -> None:
         self._buffer.clear()
         self._consecutive_voiced = 0
+        self._unvoiced_streak = 0
 
     def feed(self, pcm: bytes) -> bool:
         self._buffer.extend(pcm)
@@ -483,8 +585,16 @@ class SustainedSpeechDetector:
                 samples = struct.unpack(f"<{len(frame) // 2}h", frame)
                 rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
                 voiced = rms >= 350
-            self._consecutive_voiced = self._consecutive_voiced + 1 if voiced else 0
+            if voiced:
+                self._consecutive_voiced += 1
+                self._unvoiced_streak = 0
+            else:
+                self._unvoiced_streak += 1
+                if self._unvoiced_streak > self.UNVOICED_TOLERANCE_FRAMES:
+                    self._consecutive_voiced = 0
+                    self._unvoiced_streak = 0
             if self._consecutive_voiced >= self.required_frames:
                 self._consecutive_voiced = 0
+                self._unvoiced_streak = 0
                 return True
         return False

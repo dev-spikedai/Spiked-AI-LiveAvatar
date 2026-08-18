@@ -22,14 +22,19 @@ from src.agent_policy import (
     apply_validated_corrections,
     build_entity_catalog,
     closest_entities,
+    compose_reply,
     estimate_speech_seconds,
     is_directly_addressed,
     evaluate_turn,
     is_probably_incomplete,
+    looks_like_followup,
+    MAX_QUESTION_WORDS,
     needs_context_resolution,
     normalize_reply,
     requires_company_knowledge,
 )
+
+from src.call_intelligence import CallIntelligence
 
 import httpx
 import websockets
@@ -60,24 +65,93 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
-RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://us-west-2.recall.ai")
+# ap-northeast-1, not the API's own us-west-2 default: our RECALL_API_KEY is
+# region-bound to that workspace and 401s against any other region.
+RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://ap-northeast-1.recall.ai")
 RECALL_WEBHOOK_URL = os.getenv(
     "RECALL_WEBHOOK_URL", 
     "https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript"
 )
 LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
-LIVEAVATAR_AVATAR_ID = os.getenv("LIVEAVATAR_AVATAR_ID", "69cf601f-b35b-4d1b-a701-c854d223b5a5")
+LIVEAVATAR_AVATAR_ID = "9650a758-1085-4d49-8bf3-f347565ec229"
 LIVEAVATAR_SANDBOX = os.getenv("LIVEAVATAR_SANDBOX", "false").lower() == "true"
+# LiveAvatar auto-closes a session that sees no join/interaction for a while
+# (docs.liveavatar.com/reference/keep_session_alive_v1_sessions_keep_alive_post).
+# Tom is silent unless addressed, so a long idle stretch in a meeting would
+# otherwise trip that timeout — ping it well under the observed ~3 minute cliff.
+LIVEAVATAR_KEEPALIVE_INTERVAL_S = float(os.getenv("LIVEAVATAR_KEEPALIVE_INTERVAL_S", "60"))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", 
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
 AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
 AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
-AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "800"))
+# Deepgram rejects the whole connection with HTTP 400 when utterance_end_ms is
+# below 1000, which manifests as an agent that hears nothing at all rather than
+# as a config error. Clamped rather than trusted: a tuning value must not be
+# able to silently deafen the bot.
+DEEPGRAM_MIN_UTTERANCE_END_MS = 1000
+_requested_utterance_end_ms = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
+AGENT_UTTERANCE_END_MS = max(_requested_utterance_end_ms, DEEPGRAM_MIN_UTTERANCE_END_MS)
+if _requested_utterance_end_ms < DEEPGRAM_MIN_UTTERANCE_END_MS:
+    logger.warning(
+        "[Deepgram] AGENT_UTTERANCE_END_MS=%d is below the API minimum; using %d",
+        _requested_utterance_end_ms,
+        AGENT_UTTERANCE_END_MS,
+    )
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
 DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
+# Retrieval budget on the live speak path. Nobody is waiting on a prefetch, so
+# that path passes AGENT_RAG_PREFETCH_TIMEOUT_S instead.
+AGENT_RAG_TIMEOUT_S = float(os.getenv("AGENT_RAG_TIMEOUT_S", "12"))
+# Off-path budget for the Level 1 insight prefetch (see _maybe_prefetch_insight
+# below): nobody is waiting on it, so it can afford to wait longer than the
+# live speak path before giving up. Was referenced but never defined — every
+# prefetch NameError'd and got silently swallowed by its own except block.
+AGENT_RAG_PREFETCH_TIMEOUT_S = float(os.getenv("AGENT_RAG_PREFETCH_TIMEOUT_S", "12"))
+
+# TEMPORARY (see TEMP_WIRING.md): when the backend's live Groq answer stream
+# errors, fall back to polling its slower cognitive (background) answer, which
+# is currently the only healthy generation path. Remove once Groq is restored.
+# TEMP (see TEMP_WIRING.md): off by default. The live Groq path is healthy as
+# of 2026-08-17 and ~4s; the cognitive fallback adds ~16s. Flip to "true" only
+# if the live stream starts erroring platform-wide again.
+AGENT_COGNITIVE_FALLBACK = os.getenv("AGENT_COGNITIVE_FALLBACK", "false").lower() == "true"
+AGENT_COGNITIVE_FALLBACK_TIMEOUT_S = float(os.getenv("AGENT_COGNITIVE_FALLBACK_TIMEOUT_S", "25"))
+AGENT_COGNITIVE_POLL_INTERVAL_S = float(os.getenv("AGENT_COGNITIVE_POLL_INTERVAL_S", "1.5"))
+
+# The backend's short error yields from a failed live answer stream. Kept in one
+# place: query_spiked_rag uses them to trigger the cognitive fallback, and the
+# reply path uses them to refuse composing a reply out of a non-answer.
+BACKEND_STREAM_ERROR_MARKERS = ("request timed out", "service unavailable", "failed to get response")
+
+# Per-run cache of resolved source_ids. Resolving them costs two backend round
+# trips (~1s+) on the speak path; the client's document set changes on the scale
+# of minutes, not turns.
+_SOURCE_IDS_CACHE: Dict[str, Any] = {}
+SOURCE_IDS_CACHE_TTL_S = float(os.getenv("AGENT_SOURCE_IDS_CACHE_TTL_S", "300"))
+
+# Shared connection pool for backend calls on the speak path. A per-call
+# AsyncClient pays a fresh TLS handshake to Cloud Run every turn; keeping the
+# connection warm shaves a few hundred ms off every RAG round trip. Timeouts
+# are passed per-request, so one pool serves both the live and prefetch paths.
+_backend_http: Optional[httpx.AsyncClient] = None
+
+def _get_backend_http() -> httpx.AsyncClient:
+    global _backend_http
+    if _backend_http is None or _backend_http.is_closed:
+        _backend_http = httpx.AsyncClient(
+            timeout=AGENT_RAG_TIMEOUT_S,
+            limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=120),
+        )
+    return _backend_http
+
+# Level 1: the agent noticed something it could speak to but was not invited.
+# The cue goes to the rep and the answer is warmed silently. Rate-limited so a
+# technical stretch of conversation does not fire retrieval on every sentence.
+AGENT_INSIGHT_COOLDOWN_S = float(os.getenv("AGENT_INSIGHT_COOLDOWN_S", "25"))
+AGENT_INSIGHT_TTL_S = float(os.getenv("AGENT_INSIGHT_TTL_S", "120"))
 
 # Turn detection. Fragments from one speaker are merged before the gate runs, so a
 # single sentence split by a pause cannot produce two replies.
@@ -87,7 +161,12 @@ AGENT_TURN_MERGE_INCOMPLETE_MS = int(os.getenv("AGENT_TURN_MERGE_INCOMPLETE_MS",
 # which is the behavior the product expects. Raise it only to allow nameless
 # question-shaped continuations shortly after the agent stops speaking.
 AGENT_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_FOLLOWUP_WINDOW_MS", "8000"))
-AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "0"))
+AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "1"))
+# The follow-up window shrinks by this factor on each successive nameless
+# follow-up, down to AGENT_MIN_FOLLOWUP_WINDOW_MS, instead of hard-cutting at a
+# fixed count — a long on-topic exchange tapers rather than hitting a cliff.
+AGENT_FOLLOWUP_DECAY_RATE = float(os.getenv("AGENT_FOLLOWUP_DECAY_RATE", "0.6"))
+AGENT_MIN_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_MIN_FOLLOWUP_WINDOW_MS", "3000"))
 # Speech governor: hard ceiling on reply frequency and repetition.
 AGENT_REPLY_COOLDOWN_MS = int(os.getenv("AGENT_REPLY_COOLDOWN_MS", "2000"))
 AGENT_MAX_REPLIES_PER_WINDOW = int(os.getenv("AGENT_MAX_REPLIES_PER_WINDOW", "4"))
@@ -162,6 +241,7 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     user_id: Optional[str] = Field(default=None, description="Supabase user ID")
     token: Optional[str] = Field(default=None, description="User's Supabase JWT access token for document RAG")
     client_id: Optional[str] = Field(default=None, description="Client/Company scope identifier")
+    kyc_id: Optional[str] = Field(default=None, description="Active KYC overlay for buyer-aware answers; backend falls back to the manual overlay when absent")
     bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
 
@@ -174,9 +254,37 @@ class TranscriptCorrection(BaseModel):
 
 class TurnAnalysis(BaseModel):
     response_action: Literal["respond", "acknowledge", "silent"] = "respond"
-    intent: Literal["company_knowledge", "meeting_context", "social", "command"]
+    intent: Literal["company_knowledge", "meeting_context", "social", "command", "coaching"]
     resolved_query: str
     corrections: List[TranscriptCorrection] = Field(default_factory=list)
+
+
+class GroundedReply(BaseModel):
+    """A spoken turn split into its three parts so each gets its own budget.
+
+    Generated as separate fields rather than one string because the closing
+    question is the agent's signature and is also the last thing produced, which
+    makes it the first casualty of any length cap applied to the whole reply.
+    """
+
+    answer: str = Field(
+        description="The direct answer, for spoken delivery. No markdown, lists, or filler."
+    )
+    bridge: str = Field(
+        default="",
+        description=(
+            "At most one short clause connecting the answer to what this speaker "
+            "is deciding. Empty when it would only pad."
+        ),
+    )
+    next_question: str = Field(
+        default="",
+        description=(
+            "One question opening the next useful step in the conversation. "
+            "Empty for greetings, audio checks, commands, and short factual "
+            "confirmations."
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # Static Webpage Hosting (Self-Hosted avatar.html for Recall Output Media)
@@ -204,46 +312,205 @@ async def get_avatar_js():
 # RAG Helper: Query SpikedAI-Backend-One
 # ---------------------------------------------------------------------------
 
-async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[str] = None) -> str:
+async def resolve_source_ids(token_to_use: str, target_client_id: str) -> List[str]:
+    """Resolve a client's ingested (COMPLETED) document/website ids via the
+    backend's own /documents and /websites endpoints, authenticated with the
+    caller's JWT. Cached per user+client (SOURCE_IDS_CACHE_TTL_S) since this
+    costs two Cloud Run round trips and the document set changes on the scale
+    of minutes, not turns.
+
+    Split out from query_spiked_rag so callers on the speak path (see
+    process_transcript_with_gemini) can kick this off *before* the turn is
+    classified and overlap it with that Gemini call instead of paying for it
+    serially afterward.
     """
-    Executes Document RAG by calling SpikedAI-Backend-One /ask/handsfree endpoint.
-    Passes the customer's Supabase JWT in the Authorization header.
-    """
-    url = f"{SPIKED_BACKEND_URL.rstrip('/')}/ask/handsfree"
+    if not target_client_id or not token_to_use:
+        return []
+    cache_key = f"{extract_user_id_from_jwt(token_to_use)}|{target_client_id}"
+    cached = _SOURCE_IDS_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached["ts"] <= SOURCE_IDS_CACHE_TTL_S:
+        return cached["ids"]
+    _t0 = time.monotonic()
+    try:
+        base = SPIKED_BACKEND_URL.rstrip('/')
+        auth_headers = {"Authorization": f"Bearer {token_to_use}"}
+        params = {"client_id": target_client_id}
+        client = _get_backend_http()
+        doc_res, web_res = await asyncio.gather(
+            client.get(f"{base}/documents", headers=auth_headers, params=params, timeout=8.0),
+            client.get(f"{base}/websites", headers=auth_headers, params=params, timeout=8.0),
+        )
+        resolved: List[str] = []
+        for res in (doc_res, web_res):
+            if res.status_code != 200:
+                logger.warning("[RAG] Source listing %s returned %s", res.request.url.path, res.status_code)
+                continue
+            for item in res.json():
+                if item.get("id") and item.get("status") == "COMPLETED":
+                    resolved.append(item["id"])
+        if resolved:
+            _SOURCE_IDS_CACHE[cache_key] = {"ts": time.monotonic(), "ids": resolved}
+            logger.info("[RAG] Auto-resolved %d completed source_ids for client_id=%s", len(resolved), target_client_id)
+        logger.info("[RAG][TIMING] resolve_source_ids=%.2fs (cache_miss)", time.monotonic() - _t0)
+        return resolved
+    except Exception as err:
+        # With a client_id set and no source_ids, the backend will fail
+        # closed — this request cannot succeed. Error, not warning.
+        logger.error("[RAG] Failed to auto-resolve source_ids (request will fail closed): %s", err)
+        return []
+
+
+async def query_spiked_rag(
+    question: str,
+    auth_token: str,
+    client_id: Optional[str] = None,
+    source_ids: Optional[List[str]] = None,
+    timeout_s: float = AGENT_RAG_TIMEOUT_S,
+    kyc_id: Optional[str] = None,
+    source_ids_task: "Optional[asyncio.Task[List[str]]]" = None,
+) -> str:
+    # /ask/regular, not /ask/handsfree: measured, not assumed. /ask/handsfree
+    # was picked earlier for its smaller 5-chunk retrieval and terser prompt on
+    # the theory that less work is faster — a real side-by-side showed the
+    # opposite: /ask/regular (10 chunks, full prompt) at ~4s from the console vs
+    # /ask/handsfree at ~9.7s from here for a comparable question. /ask/regular
+    # also keeps KYC-steered query augmentation (search.py's ask_handsfree omits
+    # _build_query_augment), which handsfree traded away for no measured benefit.
+    url = f"{SPIKED_BACKEND_URL.rstrip('/')}/ask/regular"
+    token_to_use = auth_token or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    target_client_id = client_id or os.getenv("DEFAULT_CLIENT_ID") or ""
     headers = {
-        "Authorization": f"Bearer {auth_token}" if auth_token else "",
+        "Authorization": f"Bearer {token_to_use}" if token_to_use else "",
         "Content-Type": "application/json",
         "Accept": "text/event-stream"
     }
-    payload = {
+    payload: Dict[str, Any] = {
         "question": question,
-        "client_id": client_id
     }
-    
-    logger.info("[RAG] Querying SpikedAI-Backend-One client_id=%s query_chars=%d", client_id, len(question))
-    
+    if target_client_id:
+        payload["client_id"] = target_client_id
+    if kyc_id:
+        payload["kyc_id"] = kyc_id
+    # If source_ids is missing but client_id is present, resolve the client's
+    # ingested documents. The backend fails CLOSED on client_id + empty
+    # source_ids (a selected client with no docs must not fall back to
+    # all-docs), so an empty resolution here guarantees "no relevant
+    # documents". A caller that already started resolution in parallel with
+    # classification (see process_transcript_with_gemini) passes the task in
+    # via source_ids_task so this call just joins it instead of resolving
+    # again — the whole ~1s round trip then costs nothing on the speak path.
+    effective_source_ids = source_ids
+    if not effective_source_ids and source_ids_task is not None:
+        effective_source_ids = await source_ids_task
+    elif not effective_source_ids and target_client_id and token_to_use:
+        effective_source_ids = await resolve_source_ids(token_to_use, target_client_id)
+
+    if effective_source_ids:
+        payload["source_ids"] = effective_source_ids
+    elif target_client_id:
+        logger.error(
+            "[RAG] client_id=%s with no source_ids — backend will answer 'no relevant documents'",
+            target_client_id,
+        )
+
+    logger.info("[RAG] Querying SpikedAI-Backend-One client_id=%s sources=%s query_chars=%d has_auth=%s kyc=%s", target_client_id, len(effective_source_ids or []), len(question), bool(token_to_use), bool(kyc_id))
+
+    t0 = time.monotonic()
+    ttfb = None
+    first_chunk_at = None
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
+        # Stream so the read timeout applies per-chunk, not to the whole
+        # generation — a long but healthy answer must not be killed mid-stream.
+        client = _get_backend_http()
+        async with client.stream("POST", url, headers=headers, json=payload, timeout=timeout_s) as response:
+            ttfb = time.monotonic() - t0
             if response.status_code != 200:
-                logger.error("[RAG] Failed with status %s", response.status_code)
+                body = (await response.aread())[:200]
+                logger.error("[RAG] Failed status=%s body=%s ttfb=%.2fs", response.status_code, body, ttfb)
                 return "I could not retrieve the relevant company documents for this question."
-            
-            full_text = ""
+
+            # /ask/regular streams plain text fragments (the backend already
+            # unwraps the LLM SSE). Concatenate verbatim; a real newline from
+            # the model is preserved as a space by the whitespace collapse
+            # downstream, and no separator is invented between fragments.
+            parts: List[str] = []
             async for line in response.aiter_lines():
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic() - t0
                 if line.startswith("data:"):
-                    chunk = line.replace("data:", "").strip()
-                    full_text += chunk + " "
-                elif line:
-                    full_text += line + " "
-            
-            result = full_text.strip()
-            logger.info("[RAG] Received grounded answer (%d chars)", len(result))
-            return result or "No specific documentation found for this query."
-            
+                    chunk = line[5:].strip()
+                    if not chunk or chunk == "[DONE]":
+                        continue
+                    if chunk.startswith('"') and chunk.endswith('"'):
+                        try:
+                            chunk = json.loads(chunk)
+                        except Exception:
+                            pass
+                    parts.append(chunk if isinstance(chunk, str) else str(chunk))
+                    parts.append(" ")
+                elif not line.startswith("event:") and not line.startswith("id:"):
+                    parts.append(line)
+                    parts.append("\n")
+
+            result = "".join(parts).strip()
+            cognitive_key = (response.headers.get("x-cognitive-key") or "").strip()
+            total = time.monotonic() - t0
+            logger.info(
+                "[RAG][TIMING] ttfb=%.2fs first_chunk=%.2fs total=%.2fs chars=%d",
+                ttfb, first_chunk_at if first_chunk_at is not None else -1, total, len(result),
+            )
+
+        # TEMPORARY (see TEMP_WIRING.md): the live Groq stream is currently
+        # failing platform-wide. When it yields one of its short error strings,
+        # fall back to the backend's cognitive (background) answer for the same
+        # question — same retrieval context, healthier model, just slower.
+        lowered = result.lower()
+        live_failed = lowered.startswith("error:") or any(m in lowered for m in BACKEND_STREAM_ERROR_MARKERS)
+        if live_failed and AGENT_COGNITIVE_FALLBACK and cognitive_key:
+            cognitive = await _poll_cognitive_answer(cognitive_key, headers["Authorization"])
+            if cognitive:
+                return cognitive
+        return result or "No specific documentation found for this query."
+
     except Exception as e:
         logger.error(f"[RAG] Error calling SpikedAI backend: {e}", exc_info=True)
         return "An error occurred while accessing the company knowledge base."
+
+
+async def _poll_cognitive_answer(cognitive_key: str, authorization: str) -> Optional[str]:
+    """TEMPORARY (see TEMP_WIRING.md): poll the backend's background cognitive
+    answer until it lands or the budget runs out. Only called when the live
+    answer stream has already failed, so the added wait is strictly better than
+    the apology Tom would otherwise give."""
+    url = f"{SPIKED_BACKEND_URL.rstrip('/')}/cognitive"
+    deadline = time.monotonic() + AGENT_COGNITIVE_FALLBACK_TIMEOUT_S
+    logger.warning("[RAG] Live answer errored; polling cognitive answer key=%s...", cognitive_key[:12])
+    try:
+        client = _get_backend_http()
+        while time.monotonic() < deadline:
+            res = await client.get(
+                url,
+                params={"cognitive_key": cognitive_key},
+                headers={"Authorization": authorization},
+                timeout=10.0,
+            )
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "done" and data.get("answer"):
+                    logger.info("[RAG] Cognitive fallback answered (%d chars)", len(data["answer"]))
+                    return data["answer"]
+                if data.get("status") == "failed":
+                    logger.warning("[RAG] Cognitive fallback reported failed")
+                    return None
+            elif res.status_code != 404:
+                # 404 just means the row hasn't been written yet; keep waiting.
+                logger.warning("[RAG] Cognitive poll returned %s", res.status_code)
+                return None
+            await asyncio.sleep(AGENT_COGNITIVE_POLL_INTERVAL_S)
+    except Exception as err:
+        logger.warning("[RAG] Cognitive fallback poll failed: %s", err)
+    logger.warning("[RAG] Cognitive fallback timed out after %.0fs", AGENT_COGNITIVE_FALLBACK_TIMEOUT_S)
+    return None
 
 # ---------------------------------------------------------------------------
 # Gemini turn routing with deterministic RAG execution
@@ -255,9 +522,13 @@ async def process_transcript_with_gemini(
     conversation_history: List[Dict[str, str]],
     auth_token: str,
     client_id: Optional[str] = None,
-    user_context: Optional[Dict[str, Any]] = None
+    user_context: Optional[Dict[str, Any]] = None,
+    intel: Optional[CallIntelligence] = None,
+    source_ids: Optional[List[str]] = None,
+    kyc_id: Optional[str] = None,
 ) -> Optional[str]:
     """Route an already-addressed, complete turn and produce a short spoken reply."""
+    _t_turn_start = time.monotonic()
     if not gemini_client:
         logger.error("[Google GenAI] Client is not initialized")
         return None
@@ -274,12 +545,19 @@ async def process_transcript_with_gemini(
         f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
         for turn in conversation_history[-12:]
     )
+
+    # Speculative source-id resolution: most addressed, wake-name-matched
+    # turns end up needing RAG, and this has no dependency on classification's
+    # result — only on client_id + the JWT, both known already. Kicking it off
+    # now overlaps its ~1s (cold) / ~0ms (cached) cost with the classification
+    # call below instead of paying for it serially after. Cancelled wherever
+    # the turn turns out not to need it.
+    target_client_id_for_prefetch = client_id or os.getenv("DEFAULT_CLIENT_ID") or ""
+    source_ids_task: "Optional[asyncio.Task[List[str]]]" = None
+    if not source_ids and target_client_id_for_prefetch and auth_token:
+        source_ids_task = asyncio.create_task(resolve_source_ids(auth_token, target_client_id_for_prefetch))
+
     try:
-        # Fast path: skip the classification round trip only when the turn is
-        # unambiguously addressed to the agent — the wake name opens the sentence
-        # and a self-contained company question follows. Anything less certain
-        # ("I asked Tom about pricing", "was Tom's answer right, Sam?") still needs
-        # the LLM addressee gate below, which is the whole point of that call.
         if (
             is_directly_addressed(transcript, bot_name)
             and requires_company_knowledge(transcript, catalog)
@@ -292,7 +570,7 @@ async def process_transcript_with_gemini(
                 resolved_query=transcript,
                 corrections=[],
             )
-            return await _generate_grounded_reply(
+            reply = await _generate_grounded_reply(
                 analysis=analysis,
                 transcript=transcript,
                 speaker=speaker,
@@ -303,14 +581,22 @@ async def process_transcript_with_gemini(
                 auth_token=auth_token,
                 client_id=client_id,
                 preferred_model=preferred_model,
+                intel=intel,
+                source_ids=source_ids,
+                kyc_id=kyc_id,
+                source_ids_task=source_ids_task,
             )
+            logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (fast_path)", time.monotonic() - _t_turn_start)
+            return reply
 
+        call_state = intel.call_state_block() if intel else ""
         analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn.
 Company: {company_name}
 Offerings: {products_services or product_domain}
 Verified entity candidates: {candidate_entities}
 Recent finalized conversation:
 {history_text}
+{f'What this call has established so far:{chr(10)}{call_state}' if call_state else ''}
 Current speaker: {speaker}
 Raw ASR: {transcript}
 
@@ -321,8 +607,10 @@ Set response_action to:
 The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
 Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
 Use meeting_context only for questions about what meeting participants said or discussed.
+Use coaching when the sales rep asks {bot_name} for help running the call itself rather than for an answer to relay: what to ask next, what is being missed, how to handle an objection, where the conversation should go.
 Use social for greetings and audio checks. Use command for stop/wait/repeat commands.
 Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates."""
+        _t_classify_start = time.monotonic()
         try:
             analysis_response = await gemini_client.aio.models.generate_content(
                 model=preferred_model,
@@ -333,6 +621,7 @@ Resolve pronouns and omitted context only in resolved_query. Propose corrections
                     response_schema=TurnAnalysis,
                 ),
             )
+            logger.info("[TIMING] classification_call=%.2fs", time.monotonic() - _t_classify_start)
             parsed = getattr(analysis_response, "parsed", None)
             if isinstance(parsed, TurnAnalysis):
                 analysis = parsed
@@ -356,14 +645,18 @@ Resolve pronouns and omitted context only in resolved_query. Propose corrections
             analysis.intent,
         )
         if analysis.response_action == "silent":
+            if source_ids_task is not None:
+                source_ids_task.cancel()
             return None
         if analysis.response_action == "acknowledge":
+            if source_ids_task is not None:
+                source_ids_task.cancel()
             return "Understood."
 
         if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
             analysis.intent = "company_knowledge"
 
-        return await _generate_grounded_reply(
+        reply = await _generate_grounded_reply(
             analysis=analysis,
             transcript=transcript,
             speaker=speaker,
@@ -374,8 +667,16 @@ Resolve pronouns and omitted context only in resolved_query. Propose corrections
             auth_token=auth_token,
             client_id=client_id,
             preferred_model=preferred_model,
+            intel=intel,
+            source_ids=source_ids,
+            kyc_id=kyc_id,
+            source_ids_task=source_ids_task,
         )
+        logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (classified_path)", time.monotonic() - _t_turn_start)
+        return reply
     except Exception as e:
+        if source_ids_task is not None:
+            source_ids_task.cancel()
         logger.error(f"[Gemini Agent] Inference error with google-genai SDK: {e}", exc_info=True)
         return None
 
@@ -391,6 +692,11 @@ async def _generate_grounded_reply(
     auth_token: str,
     client_id: Optional[str],
     preferred_model: str,
+    intel: Optional[CallIntelligence] = None,
+    source_ids: Optional[List[str]] = None,
+    rag_timeout_s: float = AGENT_RAG_TIMEOUT_S,
+    kyc_id: Optional[str] = None,
+    source_ids_task: "Optional[asyncio.Task[List[str]]]" = None,
 ) -> Optional[str]:
     """Run RAG when the intent requires it, then produce the spoken reply."""
 
@@ -402,26 +708,113 @@ async def _generate_grounded_reply(
         for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive")
     )
     reply_word_limit = 90 if detailed_request else AGENT_MAX_REPLY_WORDS
-    reply_sentence_limit = 4 if detailed_request else 2
     rag_result = ""
     rag_used = analysis.intent == "company_knowledge"
     if rag_used:
-        rag_result = await query_spiked_rag(resolved_query, auth_token, client_id)
-        if not rag_result or any(marker in rag_result.lower() for marker in (
-            "could not retrieve", "no specific documentation", "an error occurred"
-        )):
-            logger.warning("[Agent Route] RAG unavailable for addressed knowledge turn")
-            return "I don’t have verified information on that available right now."
+        # Degraded-answer markers. The first three are our own client-side
+        # fallbacks; the rest are the backend's: its fail-closed empty-context
+        # message and the short "Error: ..." strings its Groq stream yields on
+        # timeout/rate-limit. None of these are facts, so none may reach the
+        # compose prompt — a model told to "never invent" will paraphrase them
+        # into a confident-sounding refusal.
+        def _rag_degraded(text: str) -> bool:
+            lowered = text.lower()
+            return not text or lowered.startswith("error:") or any(marker in lowered for marker in (
+                "could not retrieve", "no specific documentation", "an error occurred",
+                "could not find relevant documents",
+                # /ask/handsfree's empty-context fallback (worded differently
+                # from /ask/regular's, same fail-closed meaning).
+                "no relevant information found",
+                "request timed out", "service unavailable", "failed to get response",
+            ))
 
-    answer_prompt = f"""You are {bot_name}, a concise meeting participant representing {company_name}.
-Answer {speaker}'s addressed turn naturally for spoken delivery.
-Use at most {reply_sentence_limit} sentences and {reply_word_limit} words. No markdown, lists, filler, sales pitch, or automatic follow-up question.
+        # A short one-liner only, not a full instruction paragraph. /ask/regular's
+        # `question` field is used verbatim for BOTH the retrieval embedding
+        # (build_rag_context(question, ...)) and the final "Question: {question}"
+        # line in the Groq prompt (search.py:893-952) — there is no separate
+        # field for instructions, so whatever travels here also becomes the
+        # retrieval query. An earlier version prepended a ~90-word persona/
+        # format paragraph: it dominated the embedding and pulled visibly
+        # different chunks/facts than the console's clean question against the
+        # same knowledge base. This one-liner is short enough to identify Tom
+        # without meaningfully diluting the question's own embedding. Format
+        # shaping (markdown strip, word backstop) still happens entirely in
+        # post-processing below, not in this line.
+        persona_hint = (
+            f" ({bot_name}, an American Solution Architect avatar backing the sales rep — "
+            f"not the pitch person: answer concisely, end with a relevant question.)"
+        )
+        shaped_query = f"{resolved_query}{persona_hint}"
+        rag_result = await query_spiked_rag(shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s, kyc_id=kyc_id, source_ids_task=source_ids_task)
+        source_ids_task = None  # consumed; a retry below must not double-await it
+        if _rag_degraded(rag_result) and rag_result.lower().startswith("error:") and not AGENT_COGNITIVE_FALLBACK:
+            # The backend reached retrieval but its LLM call failed — these are
+            # typically transient (rate limit / upstream blip), so one retry is
+            # cheap and often the difference between an answer and an apology.
+            # Skipped when the cognitive fallback is active: that path already
+            # spent its own budget waiting, and stacking a second full attempt
+            # on the speak path would blow past anyone's patience.
+            logger.warning("[Agent Route] Backend answer stream errored (%r); retrying once", rag_result)
+            rag_result = await query_spiked_rag(shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s, kyc_id=kyc_id)
+        if _rag_degraded(rag_result):
+            logger.warning("[Agent Route] RAG unavailable for addressed knowledge turn (result=%r)", rag_result[:80])
+            return "I don’t have verified information on that available right now."
+        # Strip markdown, source tags [1], and list markers, then apply a
+        # generous word-budget backstop. Not a strict sentence cap like
+        # normalize_reply: this text may legitimately end in a question mark,
+        # and a sentence-count cap risks lopping the question off if the model
+        # over-answered — a word cap sized to include it does not.
+        rag_result = re.sub(r"\[\d+\]", "", rag_result)
+        rag_result = re.sub(r"[#*`_~]", "", rag_result)
+        rag_result = re.sub(r"^\s*[-+•]\s+", "", rag_result, flags=re.MULTILINE)
+        rag_result = re.sub(r"\s+", " ", rag_result).strip()
+        words = rag_result.split()
+        backstop_words = reply_word_limit + MAX_QUESTION_WORDS
+        if len(words) > backstop_words:
+            rag_result = " ".join(words[:backstop_words]).rstrip(",;:")
+            if rag_result[-1:] not in ".!?":
+                rag_result += "."
+            logger.warning("[Agent Route] Single-shot answer exceeded backstop (%d words); hard-trimmed", len(words))
+        return rag_result
+    elif source_ids_task is not None:
+        # Speculatively started before classification decided this turn does
+        # not need RAG after all — don't leave it running unobserved.
+        source_ids_task.cancel()
+
+    dossier = intel.speaker_dossier(speaker) if intel else ""
+    room = intel.room_block() if intel else ""
+    call_state = intel.call_state_block() if intel else ""
+
+    if analysis.intent == "coaching":
+        # Coaching is addressed to the rep about how to run the call, so it is
+        # aimed at the conversation rather than at the knowledge base. The reply
+        # is still spoken into the room: there is no rep-private channel here.
+        task_block = f"""{speaker} is the sales rep asking you for help running this call, not for a fact to relay.
+Give one specific, actionable suggestion grounded in what this call has actually established.
+Name the gap or the risk plainly. Do not summarize the call back to them, and do not pitch.
+Your next_question should be the question you think {speaker} should ask the room next, phrased so they can say it verbatim."""
+    else:
+        task_block = f"""Answer {speaker}'s addressed turn."""
+
+    answer_prompt = f"""You are {bot_name}, an American Solution Architect representing {company_name} in this meeting.
+You are the technical authority supporting the sales rep. You are not the salesperson, and you never pitch.
+You are concise, conversational, and technically credible. Never invent facts.
+{f'{chr(10)}Who is speaking: {dossier}' if dossier else ''}{f'{chr(10)}Aim the answer at what this person is accountable for. A finance stakeholder and an engineering stakeholder need the same fact framed differently.' if dossier else ''}
+{task_block}
+
+Produce the reply for spoken delivery, in three parts:
+- answer: the direct answer, at most {reply_word_limit} words. No markdown, lists, or filler.
+- bridge: at most one short clause connecting the answer to what {speaker} is trying to decide. Leave empty rather than padding.
+- next_question: one question, at most {MAX_QUESTION_WORDS} words, that opens the next useful step in the conversation.
+
+Ask a question by default: it is how you hand the conversation back. Leave next_question empty only when one would be unwelcome — greetings and audio checks, a command you are acknowledging, or a short factual confirmation the speaker only needed verified.
 Use the speaker's first name only if it improves a greeting or clarification.
-Never invent facts.
 
 Intent: {analysis.intent}
 Corrected turn: {corrected_transcript}
 Resolved meaning: {resolved_query}
+{f'In the room:{chr(10)}{room}' if room else ''}
+{f'What this call has established so far:{chr(10)}{call_state}' if call_state else ''}
 Recent finalized conversation:
 {history_text}
 Verified RAG facts (the only source for company facts):
@@ -429,16 +822,42 @@ Verified RAG facts (the only source for company facts):
     response = await gemini_client.aio.models.generate_content(
         model=preferred_model,
         contents=answer_prompt,
-        config=types.GenerateContentConfig(max_output_tokens=120),
+        config=types.GenerateContentConfig(
+            # Three short fields plus JSON scaffolding. A cap tight enough to
+            # truncate the payload yields unparseable JSON, not a shorter reply.
+            max_output_tokens=360 if detailed_request else 220,
+            response_mime_type="application/json",
+            response_schema=GroundedReply,
+        ),
     )
-    reply = normalize_reply(response.text or "", reply_word_limit, reply_sentence_limit)
+    parsed = getattr(response, "parsed", None)
+    try:
+        if isinstance(parsed, GroundedReply):
+            structured = parsed
+        elif parsed is not None:
+            structured = GroundedReply.model_validate(parsed)
+        else:
+            structured = GroundedReply.model_validate_json(response.text or "")
+    except Exception:
+        # Falling back to the raw text keeps a usable turn when structured
+        # decoding fails, at the cost of the closing question for that turn.
+        logger.warning("[Agent Route] Structured reply decode failed; using raw text", exc_info=True)
+        reply = normalize_reply(response.text or "", reply_word_limit, 3)
+    else:
+        reply = compose_reply(
+            answer=structured.answer,
+            bridge=structured.bridge,
+            next_question=structured.next_question,
+            max_answer_words=reply_word_limit,
+        )
     logger.info(
-        "[Agent Route] speaker=%s intent=%s rag_used=%s corrections=%d reply_words=%d",
+        "[Agent Route] speaker=%s intent=%s rag_used=%s corrections=%d reply_words=%d asked=%s",
         speaker,
         analysis.intent,
         rag_used,
         len(corrections),
         len(reply.split()),
+        reply.endswith("?"),
     )
     return reply or None
 
@@ -459,6 +878,108 @@ def health_check():
         "recall_webhook_url": RECALL_WEBHOOK_URL,
         "public_base_url": PUBLIC_BASE_URL
     }
+
+class InvokeAgentRequest(BaseModel):
+    question: Optional[str] = Field(
+        default=None,
+        description="Explicit question to answer. Omit to accept the agent's pending insight.",
+    )
+    coaching: bool = Field(
+        default=False,
+        description="Ask the agent how to run the call rather than for an answer to relay.",
+    )
+
+
+@app.post("/api/runs/{run_id}/invoke")
+async def invoke_agent(run_id: str, payload: Optional[InvokeAgentRequest] = None):
+    """Level 2 by explicit invitation — the 'Ask Tom' / 'Bring Tom In' path.
+
+    The rep pressing the button *is* the invocation, so this bypasses the wake
+    name and the addressee gate. It does not bypass the floor or the governor:
+    an invited agent still cannot talk over anybody, which is the one rule that
+    holds regardless of who asked.
+    """
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Unknown run")
+
+    payload = payload or InvokeAgentRequest()
+
+    if run.get("state") != AgentState.LISTENING:
+        # Busy, not broken. The caller can retry once the current turn lands.
+        raise HTTPException(status_code=409, detail=f"Agent is {run.get('state')}")
+
+    now = time.monotonic()
+    insight = run.get("pending_insight") or {}
+    insight_fresh = bool(insight) and (now - insight.get("created_at", 0)) <= AGENT_INSIGHT_TTL_S
+
+    question = (payload.question or "").strip()
+    if not question:
+        if not insight_fresh:
+            raise HTTPException(status_code=400, detail="No question supplied and no fresh insight pending")
+        question = insight.get("question") or ""
+
+    run["turn_counter"] = int(run.get("turn_counter", 0)) + 1
+    turn_id = run["turn_counter"]
+    run["active_turn_id"] = turn_id
+    run["state"] = AgentState.THINKING
+
+    previous_task = run.get("active_response_task")
+    if previous_task and not previous_task.done():
+        previous_task.cancel()
+
+    # Accepting a pending insight verbatim is the fast path the prefetch exists
+    # for: the answer is already composed, so this is a socket send.
+    warm = insight.get("reply") if (insight_fresh and not payload.question and not payload.coaching) else None
+    run["pending_insight"] = None
+
+    async def deliver() -> None:
+        try:
+            answer = warm
+            if not answer:
+                ctx = run.get("user_context") or {}
+                history = run.get("history") or []
+                answer = await _generate_grounded_reply(
+                    analysis=TurnAnalysis(
+                        response_action="respond",
+                        intent="coaching" if payload.coaching else "company_knowledge",
+                        resolved_query=question,
+                        corrections=[],
+                    ),
+                    transcript=question,
+                    speaker=insight.get("speaker") or "the rep",
+                    bot_name=run.get("bot_name") or "Tom",
+                    company_name=ctx.get("company_name", "SpikedAI"),
+                    history_text="\n".join(
+                        f"{t.get('speaker', 'Participant')}: {t.get('text', '')}"
+                        for t in history[-12:]
+                    ),
+                    catalog=build_entity_catalog(ctx),
+                    auth_token=run.get("token") or "",
+                    client_id=run.get("client_id"),
+                    preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                    intel=run.get("intel"),
+                    kyc_id=run.get("kyc_id"),
+                )
+            if turn_id != run.get("active_turn_id"):
+                return
+            if not answer:
+                _release_floor(run)
+                return
+            await _dispatch_reply(run, answer, turn_id)
+        except asyncio.CancelledError:
+            logger.info("[Invoke] Cancelled superseded turn_id=%s", turn_id)
+        except Exception:
+            _release_floor(run)
+            logger.error("[Invoke] Failed turn_id=%s", turn_id, exc_info=True)
+
+    run["active_response_task"] = asyncio.create_task(deliver())
+    logger.info(
+        "[Invoke] run_id=%s turn_id=%s warm=%s coaching=%s",
+        run_id, turn_id, bool(warm), payload.coaching,
+    )
+    return {"accepted": True, "turn_id": turn_id, "warm": bool(warm)}
+
 
 @app.get("/api/runs/{run_id}/credentials")
 async def get_run_credentials(run_id: str, token: Optional[str] = Query(None)):
@@ -556,11 +1077,43 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             "session_token": session_token
         }
 
+async def _keep_avatar_session_alive(run_id: str, session_id: str) -> None:
+    """Ping LiveAvatar's keep-alive endpoint for the life of the run.
+
+    LiveAvatar auto-closes sessions that see no join/interaction for a while;
+    Tom stays silent unless addressed, so without this a quiet stretch in a
+    meeting kills the avatar session out from under an otherwise-healthy run.
+    """
+    la_headers = {"X-API-KEY": LIVEAVATAR_API_KEY, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while True:
+                await asyncio.sleep(LIVEAVATAR_KEEPALIVE_INTERVAL_S)
+                if run_id not in _ACTIVE_RUNS:
+                    return
+                try:
+                    resp = await client.post(
+                        f"{LIVEAVATAR_BASE_URL}/v1/sessions/keep-alive",
+                        headers=la_headers,
+                        json={"session_id": session_id},
+                    )
+                    if resp.status_code not in (200, 201):
+                        logger.warning(
+                            "[LiveAvatar] keep-alive for session %s -> %s: %s",
+                            session_id, resp.status_code, resp.text,
+                        )
+                except Exception:
+                    logger.warning("[LiveAvatar] keep-alive request failed for session %s", session_id, exc_info=True)
+    except asyncio.CancelledError:
+        raise
+
+
 async def _deploy_live_avatar_bot(
     meeting_url: str,
     token: str,
     user_id: Optional[str] = None,
     client_id: Optional[str] = None,
+    kyc_id: Optional[str] = None,
     bot_name: str = DEFAULT_BOT_NAME,
     avatar_id: Optional[str] = None,
     request: Optional[Request] = None
@@ -589,8 +1142,10 @@ async def _deploy_live_avatar_bot(
         # 2. Store session credentials for Recall's avatar.html
         _ACTIVE_RUNS[run_id] = {
             "run_id": run_id,
+            "avatar_id": avatar_id,
             "user_id": user_id,
             "client_id": client_id,
+            "kyc_id": kyc_id,
             "token": token,
             "session_id": avatar_session.get("session_id"),
             "livekit_url": avatar_session.get("livekit_url"),
@@ -601,9 +1156,23 @@ async def _deploy_live_avatar_bot(
             "history": [],
             "turn_counter": 0,
             "control_ws": None,
+            # Separate from control_ws on purpose: that socket belongs to the
+            # avatar page and is a single slot. A rep's browser connecting there
+            # would displace the avatar and silence the bot entirely.
+            # A set, not a slot: the console legitimately has several consumers
+            # (insight panel, transcript feed) and may be open in more than one
+            # tab. A single slot would let the newest connection silently
+            # displace the others, which is the failure control_ws already has.
+            "rep_sockets": set(),
             "active_response_task": None,
             "watchdog_task": None,
+            "keepalive_task": None,
             "pending_turns": {},
+            "intel": None,
+            # Level 1: a warmed answer the agent is holding but was not invited
+            # to give. Consumed by the invoke endpoint, expired by TTL.
+            "pending_insight": None,
+            "last_insight_at": None,
             "floor": FloorState(),
             "echo": EchoSuppressor(
                 similarity_threshold=AGENT_ECHO_SIMILARITY,
@@ -615,6 +1184,19 @@ async def _deploy_live_avatar_bot(
                 window_seconds=AGENT_REPLY_WINDOW_S,
             ),
         }
+
+        # Warm the conversation-intelligence snapshot in the background. It is
+        # empty for the first cycle, which simply means the earliest turns get
+        # the name-only behavior until the backend has something to say.
+        intel = CallIntelligence(auth_token=token)
+        intel.start()
+        _ACTIVE_RUNS[run_id]["intel"] = intel
+
+        session_id = avatar_session.get("session_id")
+        if session_id:
+            _ACTIVE_RUNS[run_id]["keepalive_task"] = asyncio.create_task(
+                _keep_avatar_session_alive(run_id, session_id)
+            )
 
         # 3. Build Output Media URL
         base_url = PUBLIC_BASE_URL.rstrip('/')
@@ -750,6 +1332,7 @@ async def start_bot_endpoint(
 
         meeting_url = ""
         client_id = None
+        kyc_id = None
         bot_name = DEFAULT_BOT_NAME
         avatar_id = None
 
@@ -758,6 +1341,7 @@ async def start_bot_endpoint(
             body = await request.json()
             meeting_url = body.get("meeting_url", "")
             client_id = body.get("client_id")
+            kyc_id = body.get("kyc_id")
             bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = body.get("avatar_id")
             if not token:
@@ -766,6 +1350,7 @@ async def start_bot_endpoint(
             form = await request.form()
             meeting_url = form.get("meeting_url", "")
             client_id = form.get("client_id")
+            kyc_id = form.get("kyc_id")
             bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = form.get("avatar_id")
             if not token:
@@ -778,6 +1363,7 @@ async def start_bot_endpoint(
             meeting_url=meeting_url,
             token=token,
             client_id=client_id,
+            kyc_id=kyc_id,
             bot_name=bot_name,
             avatar_id=avatar_id,
             request=request
@@ -805,25 +1391,164 @@ async def create_live_avatar_bot(
         token=token or "",
         user_id=payload.user_id,
         client_id=payload.client_id,
+        kyc_id=payload.kyc_id,
         bot_name=payload.bot_name,
         avatar_id=payload.avatar_id,
         request=request
     )
 
+async def _stop_avatar_session(session_id: Optional[str]) -> Optional[int]:
+    """Release the LiveAvatar session so the concurrency slot is freed.
+
+    LiveAvatar allows one concurrent session per key, so a session that outlives
+    its meeting does not merely bill — it blocks every subsequent start with
+    `4032 Session concurrency limit reached`. Stopping it is the single most
+    important half of teardown.
+    """
+    if not session_id or not LIVEAVATAR_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{LIVEAVATAR_BASE_URL}/v1/sessions/stop",
+                headers={"X-API-KEY": LIVEAVATAR_API_KEY, "Content-Type": "application/json"},
+                json={"session_id": session_id},
+            )
+        logger.info("[Teardown] LiveAvatar session %s stop -> %s", session_id, resp.status_code)
+        return resp.status_code
+    except Exception:
+        logger.error("[Teardown] Failed to stop LiveAvatar session %s", session_id, exc_info=True)
+        return None
+
+
+async def _leave_recall_call(bot_id: Optional[str]) -> Optional[int]:
+    if not bot_id or not RECALL_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/{bot_id}/leave_call/",
+                headers={"Authorization": f"Token {RECALL_API_KEY}"},
+            )
+        logger.info("[Teardown] Recall bot %s leave_call -> %s", bot_id, resp.status_code)
+        return resp.status_code
+    except Exception:
+        logger.error("[Teardown] Failed to evict Recall bot %s", bot_id, exc_info=True)
+        return None
+
+
+async def _teardown_run(run_id: str) -> Dict[str, Any]:
+    """Release every resource a run holds, then evict it from the registry.
+
+    Written to be idempotent and to never raise: disconnect is the path a user
+    reaches for when something has already gone wrong, so a failure in one leg
+    must not strand the others. Each leg is attempted independently and the
+    run is evicted regardless of what the remote services report.
+    """
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run:
+        return {"ok": True, "already_gone": True}
+
+    for key in ("active_response_task", "watchdog_task", "keepalive_task"):
+        task = run.get(key)
+        if task and not task.done():
+            task.cancel()
+    for entry in (run.get("pending_turns") or {}).values():
+        timer = entry.get("timer")
+        if timer and not timer.done():
+            timer.cancel()
+
+    intel = run.get("intel")
+    if intel:
+        intel.stop()
+
+    control_ws = run.get("control_ws")
+    if control_ws:
+        try:
+            await control_ws.close()
+        except Exception:
+            pass
+        run["control_ws"] = None
+
+    for socket in list(run.get("rep_sockets") or ()):
+        try:
+            await socket.close()
+        except Exception:
+            pass
+    run["rep_sockets"] = set()
+
+    recall_status, avatar_status = await asyncio.gather(
+        _leave_recall_call(run.get("bot_id")),
+        _stop_avatar_session(run.get("session_id")),
+    )
+
+    _ACTIVE_RUNS.pop(run_id, None)
+    logger.info("[Teardown] Run %s released (%d still active)", run_id, len(_ACTIVE_RUNS))
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "recall_status": recall_status,
+        "avatar_session_status": avatar_status,
+    }
+
+
+def _find_run_id_by_bot(bot_id: str) -> Optional[str]:
+    for run_id, run in _ACTIVE_RUNS.items():
+        if run.get("bot_id") == bot_id:
+            return run_id
+    return None
+
+
+@app.get("/api/active-runs")
+async def list_active_runs():
+    """Every run this process is currently driving.
+
+    The orchestrator is the only component that knows a self-started avatar bot
+    exists — the recall backend never saw it created. Exposing the registry lets
+    the mock backend (and, later, run recovery after a refresh) answer "is a bot
+    live for this user?" truthfully instead of guessing.
+    """
+    return {
+        "runs": [
+            {
+                "run_id": run_id,
+                "bot_id": run.get("bot_id"),
+                "user_id": run.get("user_id"),
+                "client_id": run.get("client_id"),
+                "bot_name": run.get("bot_name"),
+                "state": str(run.get("state")),
+            }
+            for run_id, run in _ACTIVE_RUNS.items()
+            if run.get("bot_id")
+        ]
+    }
+
+
+@app.post("/api/runs/{run_id}/stop")
+async def stop_run_endpoint(run_id: str):
+    """Full teardown by run id. The disconnect path the frontend should use."""
+    return await _teardown_run(run_id)
+
+
 @app.post("/remove-bot/{bot_id}")
 @app.post("/leave-call/{bot_id}")
 async def leave_call_endpoint(bot_id: str):
-    """Instructs Recall bot to leave meeting call immediately."""
-    if not RECALL_API_KEY:
-        raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
+    """Evict a bot by Recall id, tearing down its run when one is known.
 
-    headers = {"Authorization": f"Token {RECALL_API_KEY}"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(
-            f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/{bot_id}/leave_call/",
-            headers=headers
-        )
-        return {"ok": True, "status": resp.status_code}
+    Kept on the bot id because that is what callers hold, but it no longer stops
+    at telling Recall to leave: without releasing the avatar session too, the
+    next start fails on the concurrency limit.
+    """
+    run_id = _find_run_id_by_bot(bot_id)
+    if run_id:
+        return await _teardown_run(run_id)
+
+    # No run in this process — a redeploy, another instance, or a plain
+    # audio-mode bot. Evicting from the meeting is still the right thing.
+    status = await _leave_recall_call(bot_id)
+    if status is None and not RECALL_API_KEY:
+        raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
+    return {"ok": True, "status": status, "run_matched": False}
 
 @app.get("/bot/{bot_id}")
 async def get_bot_endpoint(bot_id: str):
@@ -877,7 +1602,21 @@ def _push_heard(
     reply: bool,
     reason: str,
 ) -> None:
-    """Mirror the gate's verdict onto the avatar page's debug overlay."""
+    """Mirror the gate's verdict onto the avatar overlay and the rep console.
+
+    In avatar mode this is the *only* path a transcript can reach the frontend:
+    the recall backend never saw this bot created, so its transcript stream is
+    empty by construction. These are the same finalized, speaker-attributed
+    turns the agent itself reasons over.
+    """
+    _push_rep(run, {
+        "type": "heard",
+        "speaker": speaker,
+        "text": text,
+        "reply": reply,
+        "reason": reason,
+    })
+
     control_ws = run.get("control_ws")
     if not control_ws:
         return
@@ -897,11 +1636,87 @@ def _push_heard(
     asyncio.create_task(send())
 
 
+def _push_rep(run: Dict[str, Any], message: Dict[str, Any]) -> None:
+    """Fire-and-forget a message to the rep's console, if one is attached.
+
+    Never awaited by the turn pipeline: a rep with a wedged socket must not be
+    able to slow down or block what the agent says in the room.
+    """
+    sockets = list(run.get("rep_sockets") or ())
+    if not sockets:
+        return
+
+    async def send() -> None:
+        for socket in sockets:
+            try:
+                await socket.send_json(message)
+            except Exception:
+                # A dead console is dropped on its own disconnect path; failing
+                # to reach one must not stop the others from being told.
+                pass
+
+    try:
+        asyncio.create_task(send())
+    except RuntimeError:
+        # No running loop. Notifying the console is never worth raising into a
+        # caller — _release_floor is on the speak path, and an exception there
+        # would strand the agent out of LISTENING permanently.
+        send().close()
+
+
+def _push_insight(run: Dict[str, Any], speaker: str, topic: str) -> None:
+    """Signal that the agent has something, without it taking the floor.
+
+    This is the whole of Level 1 on the wire: the rep's console learns the agent
+    could contribute, and nothing is said in the room unless somebody accepts.
+    """
+    _push_rep(run, {
+        "type": "insight_available",
+        "speaker": speaker,
+        "topic": topic,
+    })
+
+
+async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int) -> bool:
+    """Send a finished reply to the avatar and arm the speak watchdog.
+
+    Shared by the addressed-turn path and the invoke endpoint so an explicitly
+    requested turn still passes the duplicate guard and still registers echo
+    suppression — invitation bypasses the wake name, not the safety rails.
+    """
+    governor: SpeechGovernor = run["governor"]
+    bot_name = run.get("bot_name") or "Tom"
+    spoken_at = time.monotonic()
+
+    if governor.is_duplicate(answer, spoken_at):
+        logger.info("[Governor] Suppressed duplicate reply turn_id=%s", turn_id)
+        _release_floor(run, spoken_at)
+        return False
+
+    control_ws = run.get("control_ws")
+    if not control_ws:
+        logger.warning("[Agent] Avatar control socket unavailable for turn_id=%s", turn_id)
+        _release_floor(run, spoken_at)
+        return False
+
+    history = run.setdefault("history", [])
+    history.append({"speaker": bot_name, "participant_id": "bot", "text": answer})
+    del history[:-40]
+    # Register before dispatch: the echo can return before the socket ack.
+    run["echo"].note_bot_speech(answer, spoken_at)
+    governor.note_reply(answer, spoken_at)
+    _push_rep(run, {"type": "agent_spoke", "text": answer, "turn_id": turn_id})
+    await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
+    run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
+    return True
+
+
 def _release_floor(run: Dict[str, Any], now: Optional[float] = None) -> None:
     """Return the agent to LISTENING and open the follow-up window."""
     run["state"] = AgentState.LISTENING
     floor: FloorState = run["floor"]
     floor.last_bot_finished_at = now if now is not None else time.monotonic()
+    _push_rep(run, {"type": "agent_state", "state": AgentState.LISTENING.value})
 
 
 async def _interrupt_avatar(run: Dict[str, Any], participant_id: str) -> None:
@@ -1015,6 +1830,87 @@ def _ingest_utterance(
     }
 
 
+def _consider_insight(
+    run: Dict[str, Any],
+    speaker: str,
+    transcript: str,
+    history_snapshot: List[Dict[str, str]],
+) -> None:
+    """Level 1: notice a moment worth speaking into, without speaking into it.
+
+    The agent was not addressed, so it stays silent — that rule is not relaxed
+    here. What it does instead is tell the rep it has something and warm the
+    answer in the background, so accepting the offer costs a socket round trip
+    instead of a retrieval one. An agent that pauses eight seconds after being
+    waved in is not perceived as the smartest participant in the room, whatever
+    the answer eventually says.
+    """
+    if run.get("state") != AgentState.LISTENING:
+        return
+
+    ctx = run.get("user_context") or {}
+    catalog = build_entity_catalog(ctx)
+    # Deliberately narrow: a question-shaped turn about something the knowledge
+    # base actually covers. Everything else is conversation the agent has no
+    # standing to volunteer into.
+    if not looks_like_followup(transcript) or not requires_company_knowledge(transcript, catalog):
+        return
+
+    now = time.monotonic()
+    last = run.get("last_insight_at")
+    if last is not None and now - last < AGENT_INSIGHT_COOLDOWN_S:
+        return
+    run["last_insight_at"] = now
+
+    logger.info("[Insight] Level 1 moment speaker=%s text=%r", speaker, transcript[:80])
+    _push_insight(run, speaker, transcript)
+
+    bot_name = run.get("bot_name") or "Tom"
+    history_text = "\n".join(
+        f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
+        for turn in history_snapshot[-12:]
+    )
+
+    async def prefetch() -> None:
+        try:
+            reply = await _generate_grounded_reply(
+                analysis=TurnAnalysis(
+                    response_action="respond",
+                    intent="company_knowledge",
+                    resolved_query=transcript,
+                    corrections=[],
+                ),
+                transcript=transcript,
+                speaker=speaker,
+                bot_name=bot_name,
+                company_name=ctx.get("company_name", "SpikedAI"),
+                history_text=history_text,
+                catalog=catalog,
+                auth_token=run.get("token") or "",
+                client_id=run.get("client_id"),
+                preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                intel=run.get("intel"),
+                rag_timeout_s=AGENT_RAG_PREFETCH_TIMEOUT_S,
+                kyc_id=run.get("kyc_id"),
+            )
+            if reply:
+                run["pending_insight"] = {
+                    "speaker": speaker,
+                    "question": transcript,
+                    "reply": reply,
+                    "created_at": time.monotonic(),
+                }
+                logger.info("[Insight] Warmed reply words=%d", len(reply.split()))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed prefetch costs nothing: the cue already reached the rep,
+            # and invoking regenerates from scratch.
+            logger.warning("[Insight] Prefetch failed", exc_info=True)
+
+    asyncio.create_task(prefetch())
+
+
 def _finalize_turn(
     run: Dict[str, Any],
     participant_id: str,
@@ -1034,6 +1930,8 @@ def _finalize_turn(
         now,
         followup_window_seconds=AGENT_FOLLOWUP_WINDOW_MS / 1000,
         max_consecutive_followups=AGENT_MAX_FOLLOWUPS,
+        followup_decay_rate=AGENT_FOLLOWUP_DECAY_RATE,
+        min_followup_window_seconds=AGENT_MIN_FOLLOWUP_WINDOW_MS / 1000,
         agent_is_idle=run.get("state") == AgentState.LISTENING,
     )
 
@@ -1053,6 +1951,7 @@ def _finalize_turn(
     )
     _push_heard(run, participant_name, transcript, decision.should_reply, decision.reason)
     if not decision.should_reply:
+        _consider_insight(run, participant_name, transcript, history_snapshot)
         return
 
     allowed, governor_reason = governor.allows_reply(now)
@@ -1086,8 +1985,11 @@ def _finalize_turn(
                 speaker=participant_name,
                 conversation_history=history_snapshot,
                 auth_token=run.get("token") or "",
-                client_id=run.get("client_id"),
+                client_id=run.get("client_id") or (run.get("user_context") or {}).get("client_id"),
                 user_context=run.get("user_context") or {},
+                intel=run.get("intel"),
+                source_ids=run.get("source_ids") or (run.get("user_context") or {}).get("source_ids"),
+                kyc_id=run.get("kyc_id"),
             )
             if turn_id != run.get("active_turn_id"):
                 logger.info("[Agent] Discarded stale response turn_id=%s", turn_id)
@@ -1096,25 +1998,7 @@ def _finalize_turn(
                 _release_floor(run)
                 return
 
-            spoken_at = time.monotonic()
-            if governor.is_duplicate(answer, spoken_at):
-                logger.info("[Governor] Suppressed duplicate reply turn_id=%s", turn_id)
-                _release_floor(run, spoken_at)
-                return
-
-            control_ws = run.get("control_ws")
-            if not control_ws:
-                logger.warning("[Agent] Avatar control socket unavailable for turn_id=%s", turn_id)
-                _release_floor(run, spoken_at)
-                return
-
-            history.append({"speaker": bot_name, "participant_id": "bot", "text": answer})
-            del history[:-40]
-            # Register before dispatch: the echo can return before the socket ack.
-            run["echo"].note_bot_speech(answer, spoken_at)
-            governor.note_reply(answer, spoken_at)
-            await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
-            run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
+            await _dispatch_reply(run, answer, turn_id)
         except asyncio.CancelledError:
             logger.info("[Agent] Cancelled superseded turn_id=%s", turn_id)
         except Exception:
@@ -1174,9 +2058,24 @@ class ParticipantTranscriber:
                 url += "&" + "&".join(f"keyterm={quote(item.strip())}" for item in keyterms)
             headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
             try:
-                self.ws = await websockets.connect(url, additional_headers=headers)
-            except TypeError:
-                self.ws = await websockets.connect(url, extra_headers=headers)
+                try:
+                    self.ws = await websockets.connect(url, additional_headers=headers)
+                except TypeError:
+                    self.ws = await websockets.connect(url, extra_headers=headers)
+            except websockets.exceptions.InvalidStatus as exc:
+                # Deepgram puts the actual reason in the response body. Without
+                # logging it, a rejected query parameter looks identical to an
+                # agent that simply never hears anybody.
+                detail = ""
+                try:
+                    detail = exc.response.body.decode()[:300]
+                except Exception:
+                    pass
+                logger.error(
+                    "[Deepgram] Handshake rejected status=%s detail=%s params=%s",
+                    exc.response.status_code, detail, params,
+                )
+                raise
             self.receiver_task = asyncio.create_task(self._receive())
             logger.info(
                 "[Deepgram] Connected participant_id=%s participant_name=%s",
@@ -1244,6 +2143,48 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
         if run.get("control_ws") is websocket:
             run["control_ws"] = None
         logger.info("[Control WS] Avatar disconnected run_id=%s", run_id)
+
+
+@app.websocket("/ws/rep/{run_id}")
+async def rep_console_endpoint(websocket: WebSocket, run_id: str):
+    """The sales rep's read-mostly view of the agent.
+
+    Deliberately a different socket from /ws/control: that one is the avatar's
+    speech transport and holds a single slot. This one carries Level 1 cues and
+    agent state to the rep's console and can drop at any time without affecting
+    what happens in the meeting.
+    """
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run:
+        await websocket.close(code=4404)
+        return
+    await websocket.accept()
+    run.setdefault("rep_sockets", set()).add(websocket)
+    logger.info("[Rep WS] Console connected run_id=%s", run_id)
+
+    # Replay a still-fresh insight so a console that connects late, or
+    # reconnects after a refresh, does not miss the offer.
+    insight = run.get("pending_insight") or {}
+    if insight and (time.monotonic() - insight.get("created_at", 0)) <= AGENT_INSIGHT_TTL_S:
+        try:
+            await websocket.send_json({
+                "type": "insight_available",
+                "speaker": insight.get("speaker"),
+                "topic": insight.get("question"),
+            })
+        except Exception:
+            pass
+
+    try:
+        while True:
+            # The console is not a control surface; speaking goes through the
+            # invoke endpoint so it passes the same gates as any other turn.
+            await websocket.receive_text()
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        (run.get("rep_sockets") or set()).discard(websocket)
+        logger.info("[Rep WS] Console disconnected run_id=%s", run_id)
 
 
 @app.websocket("/ws/recall/audio/{run_id}")

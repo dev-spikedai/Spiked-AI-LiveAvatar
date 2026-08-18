@@ -96,7 +96,7 @@ async def get_user_keywords_and_products(
             
             if res.data and len(res.data) > 0:
                 cfg = res.data[0]
-                bot_name = (config.get("bot_name") or "Tom").strip()
+                bot_name = (cfg.get("bot_name") or "Tom").strip()
                 company_name = cfg.get("seller_company") or company_name
                 products_services = cfg.get("products_services") or ""
                 product_domain = cfg.get("product_domain") or product_domain
