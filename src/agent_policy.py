@@ -42,6 +42,7 @@ class FloorState:
     last_bot_finished_at: Optional[float] = None
     last_addressed_participant: Optional[str] = None
     consecutive_followups: int = 0
+    last_reply_seconds: float = 0.0
 
 
 @dataclass
@@ -203,6 +204,86 @@ _ANAPHORA = frozenset({
     "it", "its", "it's", "that", "this", "they", "them", "their", "those",
     "these", "he", "she", "him", "her", "his", "one", "ones",
 })
+
+
+_MUTE_PHRASE_RE = re.compile(
+    r"\b(stay|be|go)\s+quiet\b"
+    r"|\bstop\s+(listening|talking)\b"
+    r"|\bdon.?t\s+(listen|talk|speak|respond|answer)\b"
+    r"|\bmute\s+yourself\b"
+    r"|\bshut\s+up\b"
+    r"|\b(hold\s+on|hold\s+off|pause|wait|give\s+me\s+(a\s+|\d+\s+)?(secs?|seconds?|minutes?|moments?))\b"
+    r"|\bgo\s+silent\b|\bstand\s+by\b|\bstand\s+down\b"
+)
+_MUTE_DURATION_RE = re.compile(r"(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b")
+MUTE_MIN_SECONDS = 5
+MUTE_MAX_SECONDS = 3600
+
+# Deepgram transcribes a spoken duration as words ("thirty seconds"), not
+# digits ("30 seconds") — _MUTE_DURATION_RE only ever matches digits, so a
+# mute command with a spelled-out number silently fell through to None every
+# time. Converting common spoken numbers to digits first closes that gap;
+# covers what someone would actually say for a mute duration, not every
+# number in English.
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+}
+
+
+def _words_to_digits(text: str) -> str:
+    """Replace spelled-out numbers with digits, handling "forty five" /
+    "forty-five" style compounds (a tens word directly followed by a ones
+    word sums to one number, not two)."""
+    tokens = text.replace("-", " ").split()
+    out: List[str] = []
+    i = 0
+    while i < len(tokens):
+        word = tokens[i]
+        value = _NUMBER_WORDS.get(word)
+        if value is not None and value >= 20 and value % 10 == 0 and i + 1 < len(tokens):
+            next_value = _NUMBER_WORDS.get(tokens[i + 1])
+            if next_value is not None and next_value < 10:
+                out.append(str(value + next_value))
+                i += 2
+                continue
+        out.append(str(value) if value is not None else word)
+        i += 1
+    return " ".join(out)
+
+
+def detect_mute_command(text: str, bot_name: str) -> Optional[int]:
+    """Return the requested mute duration in seconds, or None if this turn is
+    not a mute command.
+
+    Deterministic regex, not a Gemini call, so it costs nothing on the speak
+    path — same tier as detect_invocation. Requires the bot to be directly
+    addressed: this is a command, not something inferred from passive room
+    chatter, so a false positive here would silently deafen the agent.
+    """
+    invocation = detect_invocation(text, bot_name)
+    if not invocation.addressed:
+        return None
+    lowered = _words_to_digits((text or "").casefold())
+    if not _MUTE_PHRASE_RE.search(lowered):
+        return None
+    match = _MUTE_DURATION_RE.search(lowered)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("min"):
+        seconds = amount * 60
+    elif unit.startswith(("hour", "hr")):
+        seconds = amount * 3600
+    else:
+        seconds = amount
+    # MUTE_MAX_SECONDS already caps this at 1 hour, so "two hours" clamps to
+    # the same ceiling as "ninety minutes" would — recognized, not silently
+    # dropped, even though the literal duration is capped.
+    return max(MUTE_MIN_SECONDS, min(seconds, MUTE_MAX_SECONDS))
 
 
 def is_directly_addressed(text: str, bot_name: str) -> bool:
@@ -504,6 +585,7 @@ def evaluate_turn(
     followup_decay_rate: float = 0.6,
     min_followup_window_seconds: float = 3.0,
     agent_is_idle: bool = True,
+    reply_length_scale: float = 0.0,
 ) -> TurnDecision:
     """Decide whether an assembled turn has the floor.
 
@@ -516,6 +598,14 @@ def evaluate_turn(
     floor. A long, genuinely on-topic exchange tapers instead of hitting a hard
     count at some arbitrary Nth question — a fixed cap is what makes floor
     control read as a chatbot rule rather than a conversation.
+
+    The base window also scales with how long the agent's last reply actually
+    took to say (`floor.last_reply_seconds * reply_length_scale`, floored at
+    `followup_window_seconds`): a 25s answer earns the listener more think-time
+    before asking a follow-up than a 3s one — a flat window starves itself on
+    every long reply, since the clock starts only once speech finishes. Set
+    `reply_length_scale=0` (the default) to keep the window flat, matching the
+    previous behavior exactly.
 
     Set `max_consecutive_followups=0` to disable nameless follow-ups entirely and
     fall back to requiring the wake name on every single turn.
@@ -534,13 +624,22 @@ def evaluate_turn(
         return TurnDecision(False, "name_not_present")
     if participant_id != floor.last_addressed_participant:
         return TurnDecision(False, "different_speaker")
+    base_window = max(followup_window_seconds, floor.last_reply_seconds * reply_length_scale)
     window = max(
         min_followup_window_seconds,
-        followup_window_seconds * (followup_decay_rate ** floor.consecutive_followups),
+        base_window * (followup_decay_rate ** floor.consecutive_followups),
     )
     if now - floor.last_bot_finished_at > window:
         return TurnDecision(False, "followup_window_expired")
-    if not looks_like_followup(text, starters=_DIRECT_REPLY_STARTERS):
+    # The phrase-shape check decays in strictness the same way the window
+    # does: the very first nameless reply after the agent finishes is the
+    # highest-confidence case (the same speaker, right away, is almost
+    # certainly answering whatever the agent just said or asked — including
+    # a declarative answer no fixed keyword list will ever fully enumerate,
+    # e.g. "Pricing is what I care about"). Subsequent follow-ups, further
+    # from that anchor, fall back to the starter-word check so an unrelated
+    # aside from the same speaker doesn't keep riding the window indefinitely.
+    if floor.consecutive_followups > 0 and not looks_like_followup(text, starters=_DIRECT_REPLY_STARTERS):
         return TurnDecision(False, "not_followup_shaped")
     return TurnDecision(True, "followup_window")
 

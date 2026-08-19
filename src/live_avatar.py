@@ -8,7 +8,7 @@ import time
 import uuid
 import hashlib
 import hmac
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Callable, Awaitable
 from urllib.parse import urlencode, quote
 
 from src.supabase_client import get_user_keywords_and_products
@@ -23,6 +23,7 @@ from src.agent_policy import (
     build_entity_catalog,
     closest_entities,
     compose_reply,
+    detect_mute_command,
     estimate_speech_seconds,
     is_directly_addressed,
     evaluate_turn,
@@ -167,6 +168,11 @@ AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "1"))
 # fixed count — a long on-topic exchange tapers rather than hitting a cliff.
 AGENT_FOLLOWUP_DECAY_RATE = float(os.getenv("AGENT_FOLLOWUP_DECAY_RATE", "0.6"))
 AGENT_MIN_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_MIN_FOLLOWUP_WINDOW_MS", "3000"))
+# The window's base also stretches with how long the agent's last reply took
+# to say (last_reply_seconds * this factor), so a long answer buys the
+# listener proportionally more think-time than a short one instead of racing
+# the same flat clock regardless of what was just said. 0 keeps it flat.
+AGENT_FOLLOWUP_WINDOW_REPLY_SCALE = float(os.getenv("AGENT_FOLLOWUP_WINDOW_REPLY_SCALE", "0.5"))
 # Speech governor: hard ceiling on reply frequency and repetition.
 AGENT_REPLY_COOLDOWN_MS = int(os.getenv("AGENT_REPLY_COOLDOWN_MS", "2000"))
 AGENT_MAX_REPLIES_PER_WINDOW = int(os.getenv("AGENT_MAX_REPLIES_PER_WINDOW", "4"))
@@ -257,6 +263,26 @@ class TurnAnalysis(BaseModel):
     intent: Literal["company_knowledge", "meeting_context", "social", "command", "coaching"]
     resolved_query: str
     corrections: List[TranscriptCorrection] = Field(default_factory=list)
+
+
+class TurnAnalysisAndReply(TurnAnalysis):
+    """TurnAnalysis plus an optional draft reply, for the single-shot classify
+    path (agent_policy: coaching/meeting_context/social/command).
+
+    company_knowledge needs retrieved facts before it can answer, so the
+    reply fields are left empty by prompt instruction whenever intent is
+    company_knowledge or response_action isn't "respond" — those turns still
+    take the classification result down the existing RAG or short-circuit
+    path. For every other addressed turn, this collapses what used to be two
+    sequential Gemini calls (classify, then compose) into one.
+    """
+
+    answer: str = Field(
+        default="",
+        description="The direct answer, for spoken delivery. Empty if intent is company_knowledge or response_action isn't 'respond'.",
+    )
+    bridge: str = Field(default="", description="At most one short clause connecting the answer to what the speaker is deciding. Empty when it would only pad.")
+    next_question: str = Field(default="", description="One question opening the next useful step. Empty for greetings, audio checks, commands, and short confirmations.")
 
 
 class GroundedReply(BaseModel):
@@ -360,6 +386,9 @@ async def resolve_source_ids(token_to_use: str, target_client_id: str) -> List[s
         return []
 
 
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
 async def query_spiked_rag(
     question: str,
     auth_token: str,
@@ -368,6 +397,7 @@ async def query_spiked_rag(
     timeout_s: float = AGENT_RAG_TIMEOUT_S,
     kyc_id: Optional[str] = None,
     source_ids_task: "Optional[asyncio.Task[List[str]]]" = None,
+    on_sentence: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     # /ask/regular, not /ask/handsfree: measured, not assumed. /ask/handsfree
     # was picked earlier for its smaller 5-chunk retrieval and terser prompt on
@@ -434,9 +464,25 @@ async def query_spiked_rag(
             # the model is preserved as a space by the whitespace collapse
             # downstream, and no separator is invented between fragments.
             parts: List[str] = []
+            # When on_sentence is given, sentence boundaries are detected as
+            # fragments arrive and each complete sentence is handed off
+            # immediately — the caller can start speaking it before the rest
+            # of the answer has even finished generating. pending holds text
+            # since the last boundary; it may never resolve to a full
+            # sentence (e.g. punctuation-free text), so it's flushed as-is
+            # after the loop.
+            pending = ""
+            # on_sentence, when given, awaits actual TTS playback of each
+            # chunk before returning (see _speak_chunk) — that time is real,
+            # but it's Tom talking, not the backend generating. Tracked
+            # separately so the [RAG][TIMING] log below still means what it
+            # always meant (backend response time), not backend time plus
+            # however long the answer took to speak.
+            playback_wait_s = 0.0
             async for line in response.aiter_lines():
                 if first_chunk_at is None:
                     first_chunk_at = time.monotonic() - t0
+                text_piece: Optional[str] = None
                 if line.startswith("data:"):
                     chunk = line[5:].strip()
                     if not chunk or chunk == "[DONE]":
@@ -446,18 +492,38 @@ async def query_spiked_rag(
                             chunk = json.loads(chunk)
                         except Exception:
                             pass
-                    parts.append(chunk if isinstance(chunk, str) else str(chunk))
+                    text_piece = chunk if isinstance(chunk, str) else str(chunk)
+                    parts.append(text_piece)
                     parts.append(" ")
                 elif not line.startswith("event:") and not line.startswith("id:"):
-                    parts.append(line)
+                    text_piece = line
+                    parts.append(text_piece)
                     parts.append("\n")
+
+                if text_piece and on_sentence is not None:
+                    pending += text_piece + " "
+                    segments = _SENTENCE_BOUNDARY_RE.split(pending)
+                    if len(segments) > 1:
+                        for segment in segments[:-1]:
+                            segment = segment.strip()
+                            if segment:
+                                _t_wait_start = time.monotonic()
+                                await on_sentence(segment)
+                                playback_wait_s += time.monotonic() - _t_wait_start
+                        pending = segments[-1]
+
+            if on_sentence is not None and pending.strip():
+                _t_wait_start = time.monotonic()
+                await on_sentence(pending.strip())
+                playback_wait_s += time.monotonic() - _t_wait_start
 
             result = "".join(parts).strip()
             cognitive_key = (response.headers.get("x-cognitive-key") or "").strip()
             total = time.monotonic() - t0
+            backend_total = total - playback_wait_s
             logger.info(
-                "[RAG][TIMING] ttfb=%.2fs first_chunk=%.2fs total=%.2fs chars=%d",
-                ttfb, first_chunk_at if first_chunk_at is not None else -1, total, len(result),
+                "[RAG][TIMING] ttfb=%.2fs first_chunk=%.2fs backend_total=%.2fs playback_wait=%.2fs wall_total=%.2fs chars=%d",
+                ttfb, first_chunk_at if first_chunk_at is not None else -1, backend_total, playback_wait_s, total, len(result),
             )
 
         # TEMPORARY (see TEMP_WIRING.md): the live Groq stream is currently
@@ -526,8 +592,15 @@ async def process_transcript_with_gemini(
     intel: Optional[CallIntelligence] = None,
     source_ids: Optional[List[str]] = None,
     kyc_id: Optional[str] = None,
+    run: Optional[Dict[str, Any]] = None,
+    turn_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Route an already-addressed, complete turn and produce a short spoken reply."""
+    """Route an already-addressed, complete turn and produce a short spoken reply.
+
+    run+turn_id are optional, passed straight through to _generate_grounded_reply
+    to enable sentence-by-sentence streaming dispatch — see its docstring for
+    the contract callers must honor (check run["_streamed_turn_id"] afterward).
+    """
     _t_turn_start = time.monotonic()
     if not gemini_client:
         logger.error("[Google GenAI] Client is not initialized")
@@ -585,18 +658,35 @@ async def process_transcript_with_gemini(
                 source_ids=source_ids,
                 kyc_id=kyc_id,
                 source_ids_task=source_ids_task,
+                run=run,
+                turn_id=turn_id,
             )
             logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (fast_path)", time.monotonic() - _t_turn_start)
             return reply
 
         call_state = intel.call_state_block() if intel else ""
-        analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn.
+        # Dossier/room, needed only if this turn ends up coaching/social/
+        # meeting_context/command, are computed up front (cheap, local intel
+        # reads, no I/O) so they can ride along in the single classify+reply
+        # call below instead of requiring a second call once the intent is
+        # known — company_knowledge is the one intent that still can't be
+        # answered here, since it needs facts this call has no access to.
+        dossier = intel.speaker_dossier(speaker) if intel else ""
+        room = intel.room_block() if intel else ""
+        detailed_request = any(
+            phrase in transcript.casefold()
+            for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive")
+        )
+        reply_word_limit = 90 if detailed_request else AGENT_MAX_REPLY_WORDS
+        analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn. If the turn also needs a spoken reply and isn't a company_knowledge question, draft that reply in the same response.
 Company: {company_name}
 Offerings: {products_services or product_domain}
 Verified entity candidates: {candidate_entities}
 Recent finalized conversation:
 {history_text}
 {f'What this call has established so far:{chr(10)}{call_state}' if call_state else ''}
+{f'In the room:{chr(10)}{room}' if room else ''}
+{f'Who is speaking: {dossier}' if dossier else ''}
 Current speaker: {speaker}
 Raw ASR: {transcript}
 
@@ -606,32 +696,37 @@ Set response_action to:
 - silent: {bot_name} is merely mentioned, quoted, discussed in third person, explicitly told not to answer, or the request is directed to somebody else.
 The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
 Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
-Use meeting_context only for questions about what meeting participants said or discussed.
+Use meeting_context for questions about what meeting participants said or discussed, and for questions about this specific call's live state — sentiment, mood, engagement, or how a participant seems — never company_knowledge for those, since the knowledge base has no data on this call or its participants.
 Use coaching when the sales rep asks {bot_name} for help running the call itself rather than for an answer to relay: what to ask next, what is being missed, how to handle an objection, where the conversation should go.
-Use social for greetings and audio checks. Use command for stop/wait/repeat commands.
-Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates."""
+Use social for greetings, audio checks, and questions about {bot_name}'s own identity/role ("who are you", "what are you") — never company_knowledge for those, since the knowledge base has no document about {bot_name} himself. Use command for stop/wait/repeat commands.
+Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates.
+
+Reply fields (answer/bridge/next_question): leave ALL THREE empty if intent is company_knowledge (a separate step with retrieved facts will answer it) or if response_action is not "respond". Otherwise fill them in for spoken delivery:
+- answer: the direct answer, at most {reply_word_limit} words. No markdown, lists, or filler. If intent is coaching, this is one specific, actionable suggestion grounded in what this call has established — name the gap or risk plainly, do not summarize the call back, do not pitch — and aim it at what {f"{dossier}" if dossier else "the sales rep"} is accountable for if that framing is known.
+- bridge: at most one short clause connecting the answer to what {speaker} is trying to decide. Leave empty rather than padding.
+- next_question: one question, at most {MAX_QUESTION_WORDS} words, that opens the next useful step. For coaching, phrase it as the question {speaker} should ask the room next, verbatim. Ask a question by default — leave it empty only when one would be unwelcome (greetings, audio checks, a command being acknowledged, a short confirmation)."""
         _t_classify_start = time.monotonic()
         try:
             analysis_response = await gemini_client.aio.models.generate_content(
                 model=preferred_model,
                 contents=analysis_prompt,
                 config=types.GenerateContentConfig(
-                    max_output_tokens=220,
+                    max_output_tokens=320,
                     response_mime_type="application/json",
-                    response_schema=TurnAnalysis,
+                    response_schema=TurnAnalysisAndReply,
                 ),
             )
             logger.info("[TIMING] classification_call=%.2fs", time.monotonic() - _t_classify_start)
             parsed = getattr(analysis_response, "parsed", None)
-            if isinstance(parsed, TurnAnalysis):
+            if isinstance(parsed, TurnAnalysisAndReply):
                 analysis = parsed
             elif parsed is not None:
-                analysis = TurnAnalysis.model_validate(parsed)
+                analysis = TurnAnalysisAndReply.model_validate(parsed)
             else:
-                analysis = TurnAnalysis.model_validate_json(analysis_response.text)
+                analysis = TurnAnalysisAndReply.model_validate_json(analysis_response.text)
         except Exception:
             logger.warning("[Agent Route] Structured routing failed; defaulting substantive turn to RAG", exc_info=True)
-            analysis = TurnAnalysis(
+            analysis = TurnAnalysisAndReply(
                 response_action="respond",
                 intent="company_knowledge",
                 resolved_query=transcript,
@@ -656,24 +751,53 @@ Resolve pronouns and omitted context only in resolved_query. Propose corrections
         if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
             analysis.intent = "company_knowledge"
 
-        reply = await _generate_grounded_reply(
-            analysis=analysis,
-            transcript=transcript,
-            speaker=speaker,
-            bot_name=bot_name,
-            company_name=company_name,
-            history_text=history_text,
-            catalog=catalog,
-            auth_token=auth_token,
-            client_id=client_id,
-            preferred_model=preferred_model,
-            intel=intel,
-            source_ids=source_ids,
-            kyc_id=kyc_id,
-            source_ids_task=source_ids_task,
+        if analysis.intent == "company_knowledge":
+            # The one intent this single call can't finish — it needs RAG
+            # facts this prompt never saw. Falls through to the existing
+            # retrieval + reply path; the draft reply fields above (left
+            # empty by instruction) are simply unused here.
+            reply = await _generate_grounded_reply(
+                analysis=analysis,
+                transcript=transcript,
+                speaker=speaker,
+                bot_name=bot_name,
+                company_name=company_name,
+                history_text=history_text,
+                catalog=catalog,
+                auth_token=auth_token,
+                client_id=client_id,
+                preferred_model=preferred_model,
+                intel=intel,
+                source_ids=source_ids,
+                kyc_id=kyc_id,
+                source_ids_task=source_ids_task,
+                run=run,
+                turn_id=turn_id,
+            )
+            logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (classified_path, rag)", time.monotonic() - _t_turn_start)
+            return reply
+
+        # coaching / meeting_context / social / command: the reply already
+        # came back in this same call — compose it directly, no second
+        # Gemini round trip.
+        if source_ids_task is not None:
+            source_ids_task.cancel()
+        reply = compose_reply(
+            answer=analysis.answer,
+            bridge=analysis.bridge,
+            next_question=analysis.next_question,
+            max_answer_words=reply_word_limit,
         )
-        logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (classified_path)", time.monotonic() - _t_turn_start)
-        return reply
+        logger.info(
+            "[Agent Route] speaker=%s intent=%s rag_used=False corrections=%d reply_words=%d asked=%s (single_shot)",
+            speaker,
+            analysis.intent,
+            len(analysis.corrections),
+            len(reply.split()),
+            reply.endswith("?"),
+        )
+        logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (classified_path, single_shot)", time.monotonic() - _t_turn_start)
+        return reply or None
     except Exception as e:
         if source_ids_task is not None:
             source_ids_task.cancel()
@@ -697,8 +821,22 @@ async def _generate_grounded_reply(
     rag_timeout_s: float = AGENT_RAG_TIMEOUT_S,
     kyc_id: Optional[str] = None,
     source_ids_task: "Optional[asyncio.Task[List[str]]]" = None,
+    run: Optional[Dict[str, Any]] = None,
+    turn_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Run RAG when the intent requires it, then produce the spoken reply."""
+    """Run RAG when the intent requires it, then produce the spoken reply.
+
+    run+turn_id are optional and used only to enable sentence-by-sentence
+    streaming dispatch on the company_knowledge path: when both are given,
+    the answer is spoken chunk-by-chunk as it streams in from the backend
+    instead of being spoken all at once after the full answer arrives, and
+    dispatch happens as a side effect inside this call — the caller must
+    check run["_streamed_turn_id"] == turn_id afterward and, if it matches,
+    must NOT also call _dispatch_reply with the returned text (it was
+    already spoken). Omit both (as the Level 1 insight prefetch does) to get
+    the original behavior exactly: pure generation, no side effects, caller
+    always dispatches.
+    """
 
     corrections = [item.model_dump() for item in analysis.corrections]
     corrected_transcript = apply_validated_corrections(transcript, corrections, catalog)
@@ -740,13 +878,48 @@ async def _generate_grounded_reply(
         # without meaningfully diluting the question's own embedding. Format
         # shaping (markdown strip, word backstop) still happens entirely in
         # post-processing below, not in this line.
+        # "Answer concisely" alone (no number) let real answers run 135-249
+        # words in practice — a spoken reply that long takes 25-30s to
+        # actually say, which is a bigger drag on the conversation than any
+        # of the numbers this session has been chasing. A single explicit
+        # word count is a few tokens, nowhere near the ~90-word paragraph
+        # this replaced, so it shouldn't meaningfully repollute the query.
+        # First person, explicitly: this string is appended to the question and
+        # travels verbatim into the backend's own prompt as its final
+        # "Question: ..." line (no separate persona/system field exists there —
+        # see the note above). A third-person aside describing "{bot_name},
+        # an ... avatar" here previously read as background about someone
+        # else, not an instruction for who is answering, and produced replies
+        # like "Tom would explain..." instead of Tom actually answering.
         persona_hint = (
-            f" ({bot_name}, an American Solution Architect avatar backing the sales rep — "
-            f"not the pitch person: answer concisely, end with a relevant question.)"
+            f" (You are {bot_name}, a Solution Architect avatar, not the pitch person — "
+            f"answer as {bot_name}, first person, under {reply_word_limit} words, "
+            f"end with a relevant question.)"
         )
         shaped_query = f"{resolved_query}{persona_hint}"
-        rag_result = await query_spiked_rag(shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s, kyc_id=kyc_id, source_ids_task=source_ids_task)
+
+        stream_enabled = run is not None and turn_id is not None
+        on_sentence, stream_state = (
+            _make_streaming_sentence_handler(run, turn_id, reply_word_limit)
+            if stream_enabled else (None, None)
+        )
+        rag_result = await query_spiked_rag(
+            shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s,
+            kyc_id=kyc_id, source_ids_task=source_ids_task, on_sentence=on_sentence,
+        )
         source_ids_task = None  # consumed; a retry below must not double-await it
+
+        if stream_enabled and stream_state["dispatched"]:
+            # Already spoken chunk-by-chunk as it streamed in — the degraded/
+            # retry/backstop logic below never runs for this attempt, since
+            # the streaming handler already applied its own equivalents
+            # (first-sentence degraded check, incremental word budget) before
+            # ever speaking anything.
+            spoken_text = " ".join(stream_state["spoken_parts"])
+            run["_streamed_turn_id"] = turn_id
+            _finish_streamed_reply(run, turn_id, spoken_text)
+            return spoken_text
+
         if _rag_degraded(rag_result) and rag_result.lower().startswith("error:") and not AGENT_COGNITIVE_FALLBACK:
             # The backend reached retrieval but its LLM call failed — these are
             # typically transient (rate limit / upstream blip), so one retry is
@@ -755,15 +928,31 @@ async def _generate_grounded_reply(
             # spent its own budget waiting, and stacking a second full attempt
             # on the speak path would blow past anyone's patience.
             logger.warning("[Agent Route] Backend answer stream errored (%r); retrying once", rag_result)
-            rag_result = await query_spiked_rag(shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s, kyc_id=kyc_id)
+            retry_on_sentence, retry_state = (
+                _make_streaming_sentence_handler(run, turn_id, reply_word_limit)
+                if stream_enabled else (None, None)
+            )
+            rag_result = await query_spiked_rag(
+                shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s,
+                kyc_id=kyc_id, on_sentence=retry_on_sentence,
+            )
+            if stream_enabled and retry_state["dispatched"]:
+                spoken_text = " ".join(retry_state["spoken_parts"])
+                run["_streamed_turn_id"] = turn_id
+                _finish_streamed_reply(run, turn_id, spoken_text)
+                return spoken_text
         if _rag_degraded(rag_result):
             logger.warning("[Agent Route] RAG unavailable for addressed knowledge turn (result=%r)", rag_result[:80])
             return "I don’t have verified information on that available right now."
         # Strip markdown, source tags [1], and list markers, then apply a
-        # generous word-budget backstop. Not a strict sentence cap like
-        # normalize_reply: this text may legitimately end in a question mark,
-        # and a sentence-count cap risks lopping the question off if the model
-        # over-answered — a word cap sized to include it does not.
+        # generous word-budget backstop. Not a strict word-count slice: the
+        # backend has no word-budget instruction anymore (removed with the
+        # persona paragraph — see query_spiked_rag), so its answers are full
+        # document-length text, and a raw words[:N] cut lops off mid-sentence,
+        # producing a spoken reply that trails off instead of ending on a
+        # thought. Trim at the last complete sentence that still fits the
+        # budget instead — the same total-length ceiling, without the
+        # mid-clause cutoff.
         rag_result = re.sub(r"\[\d+\]", "", rag_result)
         rag_result = re.sub(r"[#*`_~]", "", rag_result)
         rag_result = re.sub(r"^\s*[-+•]\s+", "", rag_result, flags=re.MULTILINE)
@@ -771,10 +960,30 @@ async def _generate_grounded_reply(
         words = rag_result.split()
         backstop_words = reply_word_limit + MAX_QUESTION_WORDS
         if len(words) > backstop_words:
-            rag_result = " ".join(words[:backstop_words]).rstrip(",;:")
-            if rag_result[-1:] not in ".!?":
-                rag_result += "."
-            logger.warning("[Agent Route] Single-shot answer exceeded backstop (%d words); hard-trimmed", len(words))
+            sentences = re.split(r"(?<=[.!?])\s+", rag_result)
+            kept: List[str] = []
+            kept_words = 0
+            for sentence in sentences:
+                sentence_words = len(sentence.split())
+                if kept and kept_words + sentence_words > backstop_words:
+                    break
+                kept.append(sentence)
+                kept_words += sentence_words
+                if kept_words >= backstop_words:
+                    break
+            rag_result = " ".join(kept)
+            trimmed_words = rag_result.split()
+            if len(trimmed_words) > backstop_words:
+                # The only sentence that fit was itself oversized (a single
+                # long run-on, or punctuation-free text) — fall back to a
+                # hard word cut so the budget is still a real ceiling.
+                rag_result = " ".join(trimmed_words[:backstop_words]).rstrip(",;:")
+                if rag_result[-1:] not in ".!?":
+                    rag_result += "."
+            logger.warning(
+                "[Agent Route] Single-shot answer exceeded backstop (%d words); trimmed to %d complete sentence(s)",
+                len(words), len(kept) or 1,
+            )
         return rag_result
     elif source_ids_task is not None:
         # Speculatively started before classification decided this turn does
@@ -904,6 +1113,7 @@ async def invoke_agent(run_id: str, payload: Optional[InvokeAgentRequest] = None
         raise HTTPException(status_code=404, detail="Unknown run")
 
     payload = payload or InvokeAgentRequest()
+    _clear_mute(run, reason="invoked")
 
     if run.get("state") != AgentState.LISTENING:
         # Busy, not broken. The caller can retry once the current turn lands.
@@ -960,7 +1170,13 @@ async def invoke_agent(run_id: str, payload: Optional[InvokeAgentRequest] = None
                     preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
                     intel=run.get("intel"),
                     kyc_id=run.get("kyc_id"),
+                    run=run,
+                    turn_id=turn_id,
                 )
+            if run.get("_streamed_turn_id") == turn_id:
+                # Already spoken chunk-by-chunk — see process_transcript_with_
+                # gemini's respond() for the same pattern and why.
+                return
             if turn_id != run.get("active_turn_id"):
                 return
             if not answer:
@@ -1167,6 +1383,17 @@ async def _deploy_live_avatar_bot(
             "active_response_task": None,
             "watchdog_task": None,
             "keepalive_task": None,
+            # "Tom, stay quiet for 30 seconds" — muted_until is monotonic, used
+            # for gating; muted_until_epoch_ms is wall-clock, sent to the
+            # frontend so it can render a countdown against Date.now().
+            "muted_until": None,
+            "muted_until_epoch_ms": None,
+            "mute_expiry_task": None,
+            # Sentence-by-sentence dispatch: chunk_id -> asyncio.Event, set
+            # when that chunk's avatar_speak_ended arrives. Lets the
+            # streaming dispatch loop wait for exactly one chunk to finish
+            # playing before sending the next, so audio never overlaps.
+            "chunk_events": {},
             "pending_turns": {},
             "intel": None,
             # Level 1: a warmed answer the agent is holding but was not invited
@@ -1197,6 +1424,17 @@ async def _deploy_live_avatar_bot(
             _ACTIVE_RUNS[run_id]["keepalive_task"] = asyncio.create_task(
                 _keep_avatar_session_alive(run_id, session_id)
             )
+
+        # Warm the source-id cache now instead of paying for it on the first
+        # real question — resolve_source_ids costs ~0.7-1.9s the first time
+        # it runs, and nothing else is happening yet to overlap it with (later
+        # turns overlap it with classification, but the very first one never
+        # gets that for free). Cache key matches exactly what process_
+        # transcript_with_gemini uses later, so a hit here is a hit there too.
+        # Cheap even if it goes to waste: if the first real question comes
+        # after the 5-minute cache TTL, this was just one harmless early call.
+        if client_id and token:
+            asyncio.create_task(resolve_source_ids(token, client_id))
 
         # 3. Build Output Media URL
         base_url = PUBLIC_BASE_URL.rstrip('/')
@@ -1449,7 +1687,7 @@ async def _teardown_run(run_id: str) -> Dict[str, Any]:
     if not run:
         return {"ok": True, "already_gone": True}
 
-    for key in ("active_response_task", "watchdog_task", "keepalive_task"):
+    for key in ("active_response_task", "watchdog_task", "keepalive_task", "mute_expiry_task"):
         task = run.get(key)
         if task and not task.done():
             task.cancel()
@@ -1517,6 +1755,11 @@ async def list_active_runs():
                 "client_id": run.get("client_id"),
                 "bot_name": run.get("bot_name"),
                 "state": str(run.get("state")),
+                "muted_until_epoch_ms": (
+                    run.get("muted_until_epoch_ms")
+                    if run.get("muted_until") is not None and time.monotonic() < run["muted_until"]
+                    else None
+                ),
             }
             for run_id, run in _ACTIVE_RUNS.items()
             if run.get("bot_id")
@@ -1636,6 +1879,29 @@ def _push_heard(
     asyncio.create_task(send())
 
 
+def _push_control(run: Dict[str, Any], message: Dict[str, Any]) -> None:
+    """Fire-and-forget a message to the avatar page itself (/ws/control).
+
+    Distinct from _push_rep: that reaches the rep's console, this reaches the
+    actual meeting video feed avatar.js renders — used for the mute countdown
+    overlay, which every meeting participant sees, not just the rep.
+    """
+    control_ws = run.get("control_ws")
+    if not control_ws:
+        return
+
+    async def send() -> None:
+        try:
+            await control_ws.send_json(message)
+        except Exception:
+            pass
+
+    try:
+        asyncio.create_task(send())
+    except RuntimeError:
+        send().close()
+
+
 def _push_rep(run: Dict[str, Any], message: Dict[str, Any]) -> None:
     """Fire-and-forget a message to the rep's console, if one is attached.
 
@@ -1662,6 +1928,57 @@ def _push_rep(run: Dict[str, Any], message: Dict[str, Any]) -> None:
         # caller — _release_floor is on the speak path, and an exception there
         # would strand the agent out of LISTENING permanently.
         send().close()
+
+
+def _set_mute(run: Dict[str, Any], seconds: int) -> None:
+    """Mute the agent for `seconds`. A voice command reissued while already
+    muted simply replaces the previous timer, matching how the wake name
+    always grants the floor regardless of current state."""
+    now_mono = time.monotonic()
+    until_mono = now_mono + seconds
+    until_epoch_ms = int((time.time() + seconds) * 1000)
+    run["muted_until"] = until_mono
+    run["muted_until_epoch_ms"] = until_epoch_ms
+
+    previous = run.get("mute_expiry_task")
+    if previous and not previous.done():
+        previous.cancel()
+
+    logger.info("[Mute] Agent muted for %ds run_id=%s", seconds, run.get("run_id"))
+    mute_message = {"type": "agent_muted", "muted_until_epoch_ms": until_epoch_ms, "seconds": seconds}
+    _push_rep(run, mute_message)
+    _push_control(run, mute_message)
+
+    async def expire() -> None:
+        try:
+            await asyncio.sleep(seconds)
+            # Only clear if nothing re-muted (or cleared) it in the meantime.
+            if run.get("muted_until") == until_mono:
+                run["muted_until"] = None
+                run["muted_until_epoch_ms"] = None
+                logger.info("[Mute] Expired run_id=%s", run.get("run_id"))
+                _push_rep(run, {"type": "agent_unmuted", "reason": "expired"})
+                _push_control(run, {"type": "agent_unmuted", "reason": "expired"})
+        except asyncio.CancelledError:
+            pass
+
+    run["mute_expiry_task"] = asyncio.create_task(expire())
+
+
+def _clear_mute(run: Dict[str, Any], reason: str = "invoked") -> None:
+    """Ask Tom / explicit invocation always overrides mute — the button press
+    is itself the invitation, so it bypasses mute the same way it bypasses
+    the wake name and the addressee gate."""
+    if run.get("muted_until") is None:
+        return
+    run["muted_until"] = None
+    run["muted_until_epoch_ms"] = None
+    task = run.get("mute_expiry_task")
+    if task and not task.done():
+        task.cancel()
+    logger.info("[Mute] Cleared (%s) run_id=%s", reason, run.get("run_id"))
+    _push_rep(run, {"type": "agent_unmuted", "reason": reason})
+    _push_control(run, {"type": "agent_unmuted", "reason": reason})
 
 
 def _push_insight(run: Dict[str, Any], speaker: str, topic: str) -> None:
@@ -1706,16 +2023,194 @@ async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int) -> boo
     run["echo"].note_bot_speech(answer, spoken_at)
     governor.note_reply(answer, spoken_at)
     _push_rep(run, {"type": "agent_spoke", "text": answer, "turn_id": turn_id})
+
+    timing = run.setdefault("turn_timing", {}).setdefault(turn_id, {})
+    timing["dispatched_at"] = spoken_at
+    finalized_at = timing.get("finalized_at")
+    if finalized_at is not None:
+        logger.info(
+            "[TIMING] turn_id=%s finalize->dispatch=%.2fs (turn gate + classification + RAG)",
+            turn_id, spoken_at - finalized_at,
+        )
+
     await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
     run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
     return True
 
 
-def _release_floor(run: Dict[str, Any], now: Optional[float] = None) -> None:
-    """Return the agent to LISTENING and open the follow-up window."""
+async def _speak_chunk(run: Dict[str, Any], turn_id: int, chunk_id: str, text: str) -> bool:
+    """Send one sentence and wait for it to actually finish playing before
+    returning, so sequential chunks of one answer never overlap in the
+    avatar's audio. Returns False once the turn is no longer live (barge-in,
+    superseded turn, or the control socket dropped) — callers use that to
+    stop dispatching further chunks rather than talking over a turn that's
+    already over.
+    """
+    control_ws = run.get("control_ws")
+    # active_turn_id alone isn't enough: an in-place barge-in during SPEAKING
+    # releases the floor (state -> LISTENING) without changing active_turn_id
+    # at all, so a state check is the only thing that actually catches "this
+    # exact turn was just interrupted" between one chunk and the next.
+    if (
+        not control_ws
+        or run.get("active_turn_id") != turn_id
+        or run.get("state") not in (AgentState.THINKING, AgentState.SPEAKING)
+    ):
+        return False
+    event = asyncio.Event()
+    run.setdefault("chunk_events", {})[chunk_id] = event
+    # Stamp once, on this turn's first chunk only: the same field name
+    # _dispatch_reply writes for the legacy single-shot path, so the
+    # avatar_speak_started handler's dispatch->speaking log works for both
+    # without duplicating that logic. Streamed replies never went through
+    # _dispatch_reply at all, so without this, that log line's gating field
+    # was silently never set and the line never printed — see live_avatar.py
+    # avatar_control_endpoint's avatar_speak_started handling.
+    timing = run.setdefault("turn_timing", {}).setdefault(turn_id, {})
+    timing.setdefault("dispatched_at", time.monotonic())
+    try:
+        await control_ws.send_json({"type": "avatar_speak", "text": text, "turn_id": turn_id, "chunk_id": chunk_id})
+        timeout = estimate_speech_seconds(text) + 5.0
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[Stream] turn_id=%s chunk_id=%s timed out waiting for speak_ended; continuing", turn_id, chunk_id)
+    finally:
+        (run.get("chunk_events") or {}).pop(chunk_id, None)
+    return run.get("active_turn_id") == turn_id and run.get("state") in (AgentState.THINKING, AgentState.SPEAKING)
+
+
+def _make_streaming_sentence_handler(
+    run: Dict[str, Any], turn_id: int, reply_word_limit: int,
+) -> "tuple[Callable[[str], Awaitable[None]], Dict[str, Any]]":
+    """Build the on_sentence callback query_spiked_rag calls per sentence.
+
+    Speaks each complete sentence as soon as it's ready instead of waiting
+    for the whole answer — the entire point of streaming. Two safety checks
+    apply before anything is actually spoken:
+    - The first sentence is checked against the same degraded/error markers
+      _generate_grounded_reply already checks the full answer against. If it
+      looks like a failure, nothing is spoken here at all — the caller falls
+      through to the existing full-buffer degraded-check-and-retry path
+      exactly as if streaming had never been attempted.
+    - A running word count enforces the same backstop as the non-streaming
+      path (reply_word_limit + MAX_QUESTION_WORDS), stopping at a sentence
+      boundary instead of a raw word-count slice — so a long answer still
+      ends on a complete thought, just decided incrementally instead of
+      after the fact.
+
+    Returns (callback, state) — state accumulates what was actually spoken
+    (state["spoken_parts"]) and whether anything was dispatched
+    (state["dispatched"]), which the caller uses to decide whether this
+    attempt already committed to speaking or is still free to retry.
+    """
+    backstop_words = reply_word_limit + MAX_QUESTION_WORDS
+    state: Dict[str, Any] = {
+        "dispatched": False,
+        "aborted": False,
+        "seen_first": False,
+        "cumulative_words": 0,
+        "chunk_n": 0,
+        "spoken_parts": [],
+    }
+
+    def _degraded_marker(text: str) -> bool:
+        lowered = text.lower()
+        return not text or lowered.startswith("error:") or any(marker in lowered for marker in (
+            "could not retrieve", "no specific documentation", "an error occurred",
+            "could not find relevant documents", "no relevant information found",
+            "request timed out", "service unavailable", "failed to get response",
+        ))
+
+    async def on_sentence(raw_sentence: str) -> None:
+        if state["aborted"]:
+            return
+        cleaned = re.sub(r"\[\d+\]", "", raw_sentence)
+        cleaned = re.sub(r"[#*`_~]", "", cleaned)
+        cleaned = re.sub(r"^\s*[-+•]\s+", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return
+        if not state["seen_first"]:
+            state["seen_first"] = True
+            if _degraded_marker(cleaned):
+                # Don't speak a raw failure string — bail out entirely and
+                # let the caller's existing full-buffer path (degraded
+                # check, one retry) handle it exactly as before.
+                state["aborted"] = True
+                return
+        if state["dispatched"] and (
+            run.get("active_turn_id") != turn_id
+            or run.get("state") not in (AgentState.THINKING, AgentState.SPEAKING)
+        ):
+            # Superseded, or barge-in released the floor without changing
+            # active_turn_id (see _speak_chunk) — stop speaking further
+            # chunks. The backend stream is still left to finish reading
+            # quietly in the background so the connection isn't torn down
+            # mid-response, but nothing more will be dispatched.
+            state["aborted"] = True
+            return
+        sentence_words = len(cleaned.split())
+        if state["cumulative_words"] and state["cumulative_words"] + sentence_words > backstop_words:
+            state["aborted"] = True  # budget hit; stop, same as the non-streaming backstop
+            return
+        state["chunk_n"] += 1
+        chunk_id = f"{turn_id}-{state['chunk_n']}"
+        state["dispatched"] = True
+        state["cumulative_words"] += sentence_words
+        state["spoken_parts"].append(cleaned)
+        still_live = await _speak_chunk(run, turn_id, chunk_id, cleaned)
+        if not still_live:
+            state["aborted"] = True
+        if state["cumulative_words"] >= backstop_words:
+            state["aborted"] = True
+
+    return on_sentence, state
+
+
+def _finish_streamed_reply(run: Dict[str, Any], turn_id: int, spoken_text: str) -> None:
+    """Bookkeeping for a reply already spoken chunk-by-chunk via _speak_chunk.
+
+    Mirrors what _dispatch_reply does after a single-shot send — history,
+    echo registration, governor, timing log — without re-sending audio.
+    Unlike _dispatch_reply, this can't check governor.is_duplicate() before
+    speaking (there's no full text to check until streaming is already
+    underway), so within-window duplicate suppression doesn't apply to a
+    streamed reply — a real, accepted gap, not an oversight.
+    """
+    bot_name = run.get("bot_name") or "Tom"
+    spoken_at = time.monotonic()
+    governor: SpeechGovernor = run["governor"]
+
+    history = run.setdefault("history", [])
+    history.append({"speaker": bot_name, "participant_id": "bot", "text": spoken_text})
+    del history[:-40]
+    run["echo"].note_bot_speech(spoken_text, spoken_at)
+    governor.note_reply(spoken_text, spoken_at)
+    _push_rep(run, {"type": "agent_spoke", "text": spoken_text, "turn_id": turn_id})
+
+    timing = (run.get("turn_timing") or {}).pop(turn_id, None)
+    if timing and timing.get("finalized_at") is not None:
+        logger.info(
+            "[TIMING] turn_id=%s streamed reply complete, total=%.2fs (turn_finalize->last_chunk_spoken)",
+            turn_id, spoken_at - timing["finalized_at"],
+        )
+    _release_floor(run, spoken_at, reply_text=spoken_text)
+
+
+def _release_floor(run: Dict[str, Any], now: Optional[float] = None, reply_text: str = "") -> None:
+    """Return the agent to LISTENING and open the follow-up window.
+
+    reply_text, when given, sizes the follow-up window to how long that reply
+    actually took to say (see AGENT_FOLLOWUP_WINDOW_REPLY_SCALE) — omitted on
+    release paths where nothing was actually spoken (failures, duplicates,
+    watchdog timeouts), which correctly leaves the window at its flat floor.
+    """
     run["state"] = AgentState.LISTENING
     floor: FloorState = run["floor"]
     floor.last_bot_finished_at = now if now is not None else time.monotonic()
+    if reply_text:
+        floor.last_reply_seconds = estimate_speech_seconds(reply_text)
     _push_rep(run, {"type": "agent_state", "state": AgentState.LISTENING.value})
 
 
@@ -1803,6 +2298,12 @@ def _ingest_utterance(
 
     pending: Dict[str, Any] = run.setdefault("pending_turns", {})
     entry = pending.get(participant_id)
+    # started_at: first fragment of this turn (Deepgram's earliest is_final
+    # segment) — the closest thing to "when the participant started talking."
+    # last_fragment_at: this fragment's arrival — updated every merge, so the
+    # gap to the eventual flush is purely the deliberate merge-pause wait, not
+    # speech itself.
+    started_at = entry.get("started_at", now) if entry else now
     if entry:
         timer: Optional[asyncio.Task] = entry.get("timer")
         if timer and not timer.done():
@@ -1820,13 +2321,19 @@ def _ingest_utterance(
             await asyncio.sleep(delay_ms / 1000)
             current = run.get("pending_turns", {}).pop(participant_id, None)
             if current:
-                _finalize_turn(run, participant_id, participant_name, current["text"])
+                _finalize_turn(
+                    run, participant_id, participant_name, current["text"],
+                    speech_started_at=current.get("started_at"),
+                    speech_ended_at=current.get("last_fragment_at"),
+                )
         except asyncio.CancelledError:
             pass
 
     pending[participant_id] = {
         "text": transcript,
         "timer": asyncio.create_task(flush_after_pause()),
+        "started_at": started_at,
+        "last_fragment_at": now,
     }
 
 
@@ -1916,11 +2423,38 @@ def _finalize_turn(
     participant_id: str,
     participant_name: str,
     transcript: str,
+    speech_started_at: Optional[float] = None,
+    speech_ended_at: Optional[float] = None,
 ) -> None:
     now = time.monotonic()
     bot_name = run.get("bot_name") or "Tom"
     floor: FloorState = run["floor"]
     governor: SpeechGovernor = run["governor"]
+
+    if speech_started_at is not None and speech_ended_at is not None:
+        logger.info(
+            "[TIMING] speech_duration=%.2fs merge_pause=%.2fs (last_fragment->turn_finalize) participant_id=%s",
+            speech_ended_at - speech_started_at,
+            now - speech_ended_at,
+            participant_id,
+        )
+
+    # A mute command is checked before anything else, including while already
+    # muted — re-issuing it (or a different duration) always takes effect, the
+    # same way the wake name always grants the floor regardless of state.
+    mute_seconds = detect_mute_command(transcript, bot_name)
+    if mute_seconds is not None:
+        logger.info("[Turn Gate] Detected mute command text=%r seconds=%d", transcript[:200], mute_seconds)
+        _set_mute(run, mute_seconds)
+        _push_heard(run, participant_name, transcript, False, "mute_command")
+        return
+
+    if run.get("muted_until") is not None and now < run["muted_until"]:
+        # Muted: only the "Ask Tom" button (_clear_mute, called from invoke)
+        # or the timer expiring can end this — not the wake name.
+        logger.info("[Turn Gate] Dropped (muted) text=%r", transcript[:200])
+        _push_heard(run, participant_name, transcript, False, "muted")
+        return
 
     decision = evaluate_turn(
         transcript,
@@ -1933,6 +2467,7 @@ def _finalize_turn(
         followup_decay_rate=AGENT_FOLLOWUP_DECAY_RATE,
         min_followup_window_seconds=AGENT_MIN_FOLLOWUP_WINDOW_MS / 1000,
         agent_is_idle=run.get("state") == AgentState.LISTENING,
+        reply_length_scale=AGENT_FOLLOWUP_WINDOW_REPLY_SCALE,
     )
 
     history = run.setdefault("history", [])
@@ -1941,13 +2476,14 @@ def _finalize_turn(
     del history[:-40]
 
     logger.info(
-        "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s reply=%s reason=%s matched_name=%s",
+        "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s reply=%s reason=%s matched_name=%s text=%r",
         participant_id,
         participant_name,
         bot_name,
         decision.should_reply,
         decision.reason,
         decision.matched_name,
+        transcript[:200],
     )
     _push_heard(run, participant_name, transcript, decision.should_reply, decision.reason)
     if not decision.should_reply:
@@ -1977,6 +2513,7 @@ def _finalize_turn(
     turn_id = run["turn_counter"]
     run["active_turn_id"] = turn_id
     run["state"] = AgentState.THINKING
+    run.setdefault("turn_timing", {})[turn_id] = {"finalized_at": now}
 
     async def respond() -> None:
         try:
@@ -1990,20 +2527,31 @@ def _finalize_turn(
                 intel=run.get("intel"),
                 source_ids=run.get("source_ids") or (run.get("user_context") or {}).get("source_ids"),
                 kyc_id=run.get("kyc_id"),
+                run=run,
+                turn_id=turn_id,
             )
+            if run.get("_streamed_turn_id") == turn_id:
+                # Already spoken chunk-by-chunk inside _generate_grounded_reply
+                # (see its docstring) — floor already released, history/echo/
+                # governor already updated. Nothing left to do here.
+                return
             if turn_id != run.get("active_turn_id"):
                 logger.info("[Agent] Discarded stale response turn_id=%s", turn_id)
+                (run.get("turn_timing") or {}).pop(turn_id, None)
                 return
             if not answer:
                 _release_floor(run)
+                (run.get("turn_timing") or {}).pop(turn_id, None)
                 return
 
             await _dispatch_reply(run, answer, turn_id)
         except asyncio.CancelledError:
             logger.info("[Agent] Cancelled superseded turn_id=%s", turn_id)
+            (run.get("turn_timing") or {}).pop(turn_id, None)
         except Exception:
             _release_floor(run)
             logger.error("[Agent] Failed addressed turn_id=%s", turn_id, exc_info=True)
+            (run.get("turn_timing") or {}).pop(turn_id, None)
 
     run["active_response_task"] = asyncio.create_task(respond())
 
@@ -2024,6 +2572,13 @@ class ParticipantTranscriber:
         self.receiver_task: Optional[asyncio.Task] = None
         self.buffer = FinalUtteranceBuffer()
         self.start_lock = asyncio.Lock()
+        # Wall-clock time the last Results message carrying actual words arrived
+        # (interim or final) — the closest proxy we have to "when this person
+        # stopped talking," since we have no independent timestamp for that.
+        # Diffing this against the flush-triggering message's own arrival time
+        # isolates Deepgram's own endpointing/utterance_end wait from our own
+        # merge_pause (already logged separately in _ingest_utterance).
+        self._last_words_at: Optional[float] = None
 
     async def ensure_started(self) -> None:
         if self.ws:
@@ -2090,11 +2645,36 @@ class ParticipantTranscriber:
     async def _receive(self) -> None:
         try:
             while True:
+                now = time.monotonic()
                 data = json.loads(await self.ws.recv())
+                msg_type = data.get("type")
+
+                has_words = False
+                is_speech_final = False
+                if msg_type == "Results":
+                    alternatives = data.get("channel", {}).get("alternatives", [])
+                    has_words = bool(alternatives and (alternatives[0].get("transcript") or "").strip())
+                    is_speech_final = bool(data.get("speech_final"))
+
                 utterance = self.buffer.add_result(data)
                 if utterance:
+                    # Flush triggered by this message (speech_final Results, or an
+                    # UtteranceEnd with no words of its own). If speech_final fired
+                    # on a content-bearing message, this gap is ~0 — the fast path
+                    # working as intended. A large gap means it fell back to
+                    # utterance_end_ms (floored at Deepgram's 1000ms API minimum).
+                    if self._last_words_at is not None:
+                        logger.info(
+                            "[TIMING] deepgram_finalize_wait=%.2fs trigger=%s participant_id=%s "
+                            "(last words heard -> Deepgram signaled utterance done)",
+                            now - self._last_words_at, msg_type, self.participant_id,
+                        )
+                    self._last_words_at = None
                     self.on_utterance(self.participant_id, self.participant_name, utterance)
-                if data.get("type") == "Error":
+                elif has_words:
+                    self._last_words_at = now
+
+                if msg_type == "Error":
                     logger.error("[Deepgram] participant_id=%s error=%s", self.participant_id, data)
         except (ConnectionClosed, asyncio.CancelledError):
             pass
@@ -2130,9 +2710,45 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
                 continue
             if event_type == "avatar_speak_started":
                 run["state"] = AgentState.SPEAKING
-            elif event_type in ("avatar_speak_ended", "avatar_speak_interrupted"):
-                # Opens the follow-up window so the same speaker can continue
-                # without repeating the wake name.
+                timing = (run.get("turn_timing") or {}).pop(turn_id, None) if turn_id is not None else None
+                if timing:
+                    speak_started_at = time.monotonic()
+                    dispatched_at = timing.get("dispatched_at")
+                    finalized_at = timing.get("finalized_at")
+                    if dispatched_at is not None:
+                        parts = [f"dispatch->speaking={speak_started_at - dispatched_at:.2f}s (network + LiveKit + HeyGen TTS start)"]
+                        if finalized_at is not None:
+                            parts.append(f"total={speak_started_at - finalized_at:.2f}s (turn_finalize->speaking)")
+                        logger.info("[TIMING] turn_id=%s %s", turn_id, " ".join(parts))
+            elif event_type == "avatar_speak_ended":
+                chunk_id = event.get("chunk_id")
+                if chunk_id is not None:
+                    # Sentence-by-sentence dispatch: this is one chunk of a
+                    # longer answer, not necessarily the last. Unblock the
+                    # streaming dispatch loop waiting on it; that loop — not
+                    # this handler — decides when the whole turn is done and
+                    # releases the floor.
+                    chunk_event = (run.get("chunk_events") or {}).get(chunk_id)
+                    if chunk_event is not None:
+                        chunk_event.set()
+                    continue
+                # Legacy single-shot dispatch: this is the whole answer, so
+                # it opens the follow-up window immediately, same as before.
+                # _dispatch_reply appended it to history right before sending,
+                # so the last bot turn there is what was just spoken.
+                history = run.get("history") or []
+                last_reply = history[-1]["text"] if history and history[-1].get("participant_id") == "bot" else ""
+                _release_floor(run, reply_text=last_reply)
+                watchdog = run.get("watchdog_task")
+                if watchdog and not watchdog.done():
+                    watchdog.cancel()
+            elif event_type == "avatar_speak_interrupted":
+                # Barge-in: unblock a streaming dispatch loop that may be
+                # mid-answer waiting on a chunk that will now never arrive,
+                # then release the floor same as the legacy path always did.
+                for chunk_event in (run.get("chunk_events") or {}).values():
+                    chunk_event.set()
+                run["chunk_events"] = {}
                 _release_floor(run)
                 watchdog = run.get("watchdog_task")
                 if watchdog and not watchdog.done():

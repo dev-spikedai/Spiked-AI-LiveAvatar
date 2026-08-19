@@ -62,6 +62,147 @@ def _run_reply(intent="company_knowledge", **overrides):
     return asyncio.run(live_avatar._generate_grounded_reply(**kwargs))
 
 
+class FakeControlWs:
+    """Records every avatar_speak send and instantly resolves the matching
+    chunk_events entry, as if the avatar finished speaking immediately —
+    lets _speak_chunk's await return without a real avatar.js round trip."""
+
+    def __init__(self, run):
+        self.run = run
+        self.sent: list = []
+
+    async def send_json(self, message):
+        self.sent.append(message)
+        if message.get("type") == "avatar_speak":
+            chunk_id = message.get("chunk_id")
+            event = (self.run.get("chunk_events") or {}).get(chunk_id)
+            if event is not None:
+                event.set()
+
+
+def _streaming_run(**overrides):
+    run = {
+        "run_id": "r1",
+        "bot_name": "Tom",
+        "state": live_avatar.AgentState.THINKING,
+        "active_turn_id": 1,
+        "history": [],
+        "echo": EchoSuppressor(),
+        "governor": SpeechGovernor(),
+        "floor": FloorState(),
+        "rep_sockets": set(),
+        "chunk_events": {},
+        "turn_timing": {},
+    }
+    run["control_ws"] = FakeControlWs(run)
+    run.update(overrides)
+    return run
+
+
+# -- sentence-by-sentence streaming dispatch ---------------------------------
+
+
+def test_company_knowledge_streams_sentence_by_sentence(monkeypatch):
+    """With run+turn_id given, each sentence is spoken as it arrives — not
+    buffered and sent as one block after the whole answer is ready."""
+    _install_model(monkeypatch, [])
+    run = _streaming_run()
+
+    async def streaming_rag(question, *args, on_sentence=None, **kwargs):
+        assert on_sentence is not None
+        await on_sentence("We hold SOC 2 Type II certification.")
+        await on_sentence("Our last audit closed in March.")
+        return "We hold SOC 2 Type II certification. Our last audit closed in March."
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", streaming_rag)
+
+    reply = _run_reply(run=run, turn_id=1)
+
+    speak_messages = [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+    assert len(speak_messages) == 2
+    assert speak_messages[0]["text"] == "We hold SOC 2 Type II certification."
+    assert speak_messages[1]["text"] == "Our last audit closed in March."
+    # Distinct chunk_ids, same turn_id, so the control_ws handler can tell
+    # these apart while still knowing they belong to one turn.
+    assert speak_messages[0]["chunk_id"] != speak_messages[1]["chunk_id"]
+    assert speak_messages[0]["turn_id"] == speak_messages[1]["turn_id"] == 1
+    assert run["_streamed_turn_id"] == 1
+    assert reply == "We hold SOC 2 Type II certification. Our last audit closed in March."
+    # Bookkeeping the caller would otherwise do via _dispatch_reply already
+    # happened as a side effect of streaming.
+    assert run["history"][-1] == {"speaker": "Tom", "participant_id": "bot", "text": reply}
+    assert run["state"] == live_avatar.AgentState.LISTENING  # floor released
+
+
+def test_streaming_never_speaks_a_raw_degraded_first_sentence(monkeypatch):
+    """If the very first sentence looks like a backend failure marker,
+    nothing is spoken via streaming — it falls through to the existing
+    full-buffer degraded-answer handling instead."""
+    _install_model(monkeypatch, [])
+    run = _streaming_run()
+
+    async def degraded_rag(question, *args, on_sentence=None, **kwargs):
+        if on_sentence is not None:
+            await on_sentence("An error occurred while accessing the company knowledge base.")
+        return "An error occurred while accessing the company knowledge base."
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", degraded_rag)
+
+    reply = _run_reply(run=run, turn_id=1)
+
+    assert run["control_ws"].sent == []
+    assert "_streamed_turn_id" not in run
+    assert "don" in reply.lower()  # the standard apology fallback
+
+
+def test_streaming_stops_at_the_word_backstop_on_a_sentence_boundary(monkeypatch):
+    """The incremental word budget behaves like the non-streaming backstop:
+    it stops at a complete sentence, never mid-clause, and never speaks past
+    the budget."""
+    _install_model(monkeypatch, [])
+    run = _streaming_run()
+    budget = live_avatar.AGENT_MAX_REPLY_WORDS + live_avatar.MAX_QUESTION_WORDS
+    first = " ".join(["alpha"] * (budget - 5)) + "."
+    second = " ".join(["beta"] * 20) + "."
+
+    async def long_rag(question, *args, on_sentence=None, **kwargs):
+        if on_sentence is not None:
+            await on_sentence(first)
+            await on_sentence(second)
+        return f"{first} {second}"
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", long_rag)
+
+    reply = _run_reply(run=run, turn_id=1)
+
+    speak_messages = [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+    assert len(speak_messages) == 1
+    assert speak_messages[0]["text"] == first
+    assert reply == first
+
+
+def test_streaming_stops_when_the_turn_is_superseded_mid_answer(monkeypatch):
+    """Barge-in / a new turn taking over mid-stream must stop further chunks
+    from being spoken, not talk over whatever superseded it."""
+    _install_model(monkeypatch, [])
+    run = _streaming_run()
+
+    async def interrupting_rag(question, *args, on_sentence=None, **kwargs):
+        if on_sentence is not None:
+            await on_sentence("First sentence spoken normally.")
+            run["active_turn_id"] = 2  # a new turn took the floor mid-stream
+            await on_sentence("This one must never be spoken.")
+        return "First sentence spoken normally. This one must never be spoken."
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", interrupting_rag)
+
+    _run_reply(run=run, turn_id=1)
+
+    speak_messages = [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+    assert len(speak_messages) == 1
+    assert speak_messages[0]["text"] == "First sentence spoken normally."
+
+
 # -- the three-part reply ---------------------------------------------------
 
 
@@ -133,6 +274,32 @@ def test_single_shot_backstop_trims_an_overlong_answer(monkeypatch):
 
     assert len(reply.split()) <= live_avatar.AGENT_MAX_REPLY_WORDS + live_avatar.MAX_QUESTION_WORDS
     assert reply[-1] in ".!?"
+
+
+def test_backstop_trims_on_a_sentence_boundary_not_mid_clause(monkeypatch):
+    """A document-length backend answer (real sentences, not a word blob)
+    must be trimmed at the last complete sentence that fits, never cut off
+    mid-thought — a live test caught this trailing off ("...orchestrates.")
+    when the trim was a raw word-count slice."""
+    _install_model(monkeypatch, [])
+    budget = live_avatar.AGENT_MAX_REPLY_WORDS + live_avatar.MAX_QUESTION_WORDS
+    # Three real sentences: the first two together stay under budget, the
+    # third alone would push the raw word count over it.
+    first = " ".join(["alpha"] * (budget - 10)) + "."
+    second = " ".join(["beta"] * 5) + "."
+    third = " ".join(["gamma"] * 20) + "."
+    long_answer = f"{first} {second} {third}"
+
+    async def long_rag(*args, **kwargs):
+        return long_answer
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", long_rag)
+
+    reply = _run_reply()
+
+    assert reply == f"{first} {second}"
+    assert reply.endswith(".")
+    assert "gamma" not in reply
 
 
 def test_coaching_intent_skips_retrieval(monkeypatch):

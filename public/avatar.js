@@ -11,6 +11,44 @@
     statusDot.className = `status-dot ${state === "active" ? "active" : state === "error" ? "error" : ""}`;
   }
 
+  // "Tom, stay quiet for 30 seconds" — bottom-center countdown ring on the
+  // actual meeting video feed, visible to everyone, not just the rep's console.
+  const muteOverlay = document.getElementById("mute-overlay");
+  const muteCount = document.getElementById("mute-count");
+  const muteRingProgress = document.getElementById("mute-ring-progress");
+  const MUTE_RING_RADIUS = 28;
+  const MUTE_RING_CIRCUMFERENCE = 2 * Math.PI * MUTE_RING_RADIUS;
+  muteRingProgress.style.strokeDasharray = `${MUTE_RING_CIRCUMFERENCE}`;
+  let muteIntervalId = null;
+
+  function stopMuteOverlay() {
+    if (muteIntervalId !== null) {
+      clearInterval(muteIntervalId);
+      muteIntervalId = null;
+    }
+    muteOverlay.classList.remove("visible");
+  }
+
+  function startMuteOverlay(mutedUntilEpochMs, totalSeconds) {
+    if (muteIntervalId !== null) clearInterval(muteIntervalId);
+    muteOverlay.classList.add("visible");
+
+    function tick() {
+      const remainingMs = mutedUntilEpochMs - Date.now();
+      if (remainingMs <= 0) {
+        stopMuteOverlay();
+        return;
+      }
+      const remainingSeconds = Math.ceil(remainingMs / 1000);
+      muteCount.textContent = String(remainingSeconds);
+      const fraction = totalSeconds > 0 ? remainingSeconds / totalSeconds : 0;
+      muteRingProgress.style.strokeDashoffset = String(MUTE_RING_CIRCUMFERENCE * (1 - fraction));
+    }
+
+    tick();
+    muteIntervalId = setInterval(tick, 250);
+  }
+
   // Debug overlay: shows every finalized turn the backend evaluated, with the
   // gate's verdict. Clears on each speaking -> listening transition so the panel
   // always reflects the current turn rather than the whole meeting.
@@ -90,12 +128,20 @@
     });
 
     let currentTurnId = null;
+    // Sentence-by-sentence dispatch: the backend sends one avatar_speak per
+    // sentence, each carrying a chunk_id, and waits for that exact chunk's
+    // speak_ended before sending the next — so audio never overlaps or
+    // races. speakEventTurns maps the LiveKit event_id HeyGen echoes back to
+    // {turnId, chunkId} so the ended/started notification round-trips with
+    // enough identity for the backend to know which chunk just finished.
     const speakEventTurns = new Map();
     let controlWs = null;
-    function sendControlState(type, turnId = currentTurnId) {
+    function sendControlState(type, turnId = currentTurnId, chunkId = null) {
       if (turnId === null || turnId === undefined) return;
       if (controlWs && controlWs.readyState === WebSocket.OPEN) {
-        controlWs.send(JSON.stringify({ type, turn_id: turnId }));
+        const message = { type, turn_id: turnId };
+        if (chunkId !== null && chunkId !== undefined) message.chunk_id = chunkId;
+        controlWs.send(JSON.stringify(message));
       }
     }
     const decoder = new TextDecoder();
@@ -104,14 +150,14 @@
         if (topic && topic !== "agent-response") return;
         const decoded = JSON.parse(decoder.decode(payload));
         const eventType = decoded.event_type || decoded.type;
-        const eventTurnId = speakEventTurns.get(decoded.source_event_id) ?? currentTurnId;
+        const eventInfo = speakEventTurns.get(decoded.source_event_id) ?? { turnId: currentTurnId, chunkId: null };
         console.log(`[LiveKit DataReceived] topic=${topic}:`, decoded);
-        
+
         if (eventType === "avatar.speak_started") {
-          sendControlState("avatar_speak_started", eventTurnId);
+          sendControlState("avatar_speak_started", eventInfo.turnId, eventInfo.chunkId);
           updateStatus("Avatar Speaking", "active");
         } else if (eventType === "avatar.speak_ended") {
-          sendControlState("avatar_speak_ended", eventTurnId);
+          sendControlState("avatar_speak_ended", eventInfo.turnId, eventInfo.chunkId);
           if (decoded.source_event_id) speakEventTurns.delete(decoded.source_event_id);
           updateStatus("Listening...", "active");
           clearHeard();
@@ -204,16 +250,22 @@
         }
 
         if (data.type === "avatar_speak" && data.text) {
-          console.log(`[avatar.js] >>> Publishing avatar.speak_text: "${data.text}"`);
+          console.log(`[avatar.js] >>> Publishing avatar.speak_text (chunk ${data.chunk_id}): "${data.text}"`);
           currentTurnId = data.turn_id;
           const eventId = sendLiveAvatarCommand("avatar.speak_text", { text: data.text });
-          speakEventTurns.set(eventId, currentTurnId);
+          speakEventTurns.set(eventId, { turnId: data.turn_id, chunkId: data.chunk_id ?? null });
           updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
         } else if (data.type === "avatar_interrupt") {
           console.log("[avatar.js] >>> Received avatar_interrupt command from backend");
           sendLiveAvatarCommand("avatar.interrupt");
           sendControlState("avatar_speak_interrupted");
           updateStatus("Listening...", "active");
+        } else if (data.type === "agent_muted" && data.muted_until_epoch_ms) {
+          console.log(`[avatar.js] >>> Muted for ${data.seconds}s`);
+          startMuteOverlay(data.muted_until_epoch_ms, data.seconds || 0);
+        } else if (data.type === "agent_unmuted") {
+          console.log("[avatar.js] >>> Unmuted");
+          stopMuteOverlay();
         }
       } catch (err) {
         console.error("Error processing WS message:", err);

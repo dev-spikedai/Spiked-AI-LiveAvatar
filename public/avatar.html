@@ -125,6 +125,65 @@
       background: rgba(239, 68, 68, 0.18);
       color: #f87171;
     }
+    /* "Tom, stay quiet for 30 seconds" — a countdown ring bottom-center of
+       the actual meeting video feed, visible to everyone in the call, not
+       just the rep's console. */
+    #mute-overlay {
+      position: absolute;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      z-index: 30;
+    }
+    #mute-overlay.visible {
+      display: flex;
+    }
+    #mute-ring {
+      width: 64px;
+      height: 64px;
+      transform: rotate(-90deg);
+    }
+    #mute-ring-bg {
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.15);
+      stroke-width: 5;
+    }
+    #mute-ring-progress {
+      fill: none;
+      stroke: #38bdf8;
+      stroke-width: 5;
+      stroke-linecap: round;
+      transition: stroke-dashoffset 0.2s linear;
+    }
+    #mute-count {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 15px;
+      font-weight: 600;
+      color: #e2e8f0;
+    }
+    #mute-ring-wrap {
+      position: relative;
+      width: 64px;
+      height: 64px;
+    }
+    #mute-label {
+      padding: 3px 10px;
+      border-radius: 6px;
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #94a3b8;
+      font-size: 10px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
   </style>
 </head>
 <body>
@@ -137,6 +196,16 @@
     <div id="status-overlay">
       <div id="status-dot" class="status-dot"></div>
       <span id="status-text">Initializing SpikedAI Live Avatar...</span>
+    </div>
+    <div id="mute-overlay">
+      <div id="mute-ring-wrap">
+        <svg id="mute-ring" viewBox="0 0 64 64">
+          <circle id="mute-ring-bg" cx="32" cy="32" r="28"></circle>
+          <circle id="mute-ring-progress" cx="32" cy="32" r="28"></circle>
+        </svg>
+        <div id="mute-count">0</div>
+      </div>
+      <div id="mute-label">Staying quiet</div>
     </div>
   </div>
 

@@ -55,7 +55,7 @@ def test_turn_needing_context_still_runs_query_repair(monkeypatch):
     model call, the backend's answer is spoken directly."""
     models = FakeModels([
         SimpleNamespace(
-            parsed=live_avatar.TurnAnalysis(
+            parsed=live_avatar.TurnAnalysisAndReply(
                 intent="company_knowledge",
                 resolved_query="SpikedAI enterprise pricing",
                 corrections=[],
@@ -90,7 +90,7 @@ def test_turn_needing_context_still_runs_query_repair(monkeypatch):
 def test_rag_failure_returns_short_honest_fallback(monkeypatch):
     models = FakeModels([
         SimpleNamespace(
-            parsed=live_avatar.TurnAnalysis(
+            parsed=live_avatar.TurnAnalysisAndReply(
                 intent="company_knowledge",
                 resolved_query="pricing",
                 corrections=[],
@@ -116,7 +116,7 @@ def test_rag_failure_returns_short_honest_fallback(monkeypatch):
 def test_llm_response_gate_can_keep_the_agent_silent(monkeypatch):
     models = FakeModels([
         SimpleNamespace(
-            parsed=live_avatar.TurnAnalysis(
+            parsed=live_avatar.TurnAnalysisAndReply(
                 response_action="silent",
                 intent="social",
                 resolved_query="",
@@ -143,7 +143,7 @@ def test_llm_response_gate_can_keep_the_agent_silent(monkeypatch):
 def test_llm_response_gate_can_acknowledge_without_generation(monkeypatch):
     models = FakeModels([
         SimpleNamespace(
-            parsed=live_avatar.TurnAnalysis(
+            parsed=live_avatar.TurnAnalysisAndReply(
                 response_action="acknowledge",
                 intent="command",
                 resolved_query="wait",
@@ -160,6 +160,43 @@ def test_llm_response_gate_can_acknowledge_without_generation(monkeypatch):
         user_context={"company_name": "SpikedAI", "bot_name": "Tom"},
     ))
     assert answer == "Understood."
+
+
+def test_non_rag_intent_is_single_shot_and_never_composes_twice(monkeypatch):
+    """coaching/meeting_context/social/command turns used to cost two
+    sequential Gemini calls (classify, then compose). The classify call now
+    drafts the reply itself, so composing it must not consume a second
+    response — FakeModels([...]) with exactly one entry proves that: a second
+    .pop(0) would raise IndexError and fail the test."""
+    models = FakeModels([
+        SimpleNamespace(
+            parsed=live_avatar.TurnAnalysisAndReply(
+                response_action="respond",
+                intent="command",
+                resolved_query="wait a moment",
+                corrections=[],
+                answer="Sure, I'll hold off.",
+                bridge="",
+                next_question="",
+            )
+        ),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+
+    async def fail_if_rag_called(*args, **kwargs):
+        raise AssertionError("command intent must not touch RAG")
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", fail_if_rag_called)
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="Tom, please wait a moment.",
+        speaker="Alice",
+        conversation_history=[],
+        auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Tom"},
+    ))
+
+    assert answer == "Sure, I'll hold off."
+    assert models.responses == []
 
 
 def make_run(**overrides):
@@ -187,7 +224,7 @@ def test_third_person_mention_cannot_take_the_fast_path(monkeypatch):
     """
     models = FakeModels([
         SimpleNamespace(
-            parsed=live_avatar.TurnAnalysis(
+            parsed=live_avatar.TurnAnalysisAndReply(
                 response_action="silent",
                 intent="meeting_context",
                 resolved_query="",
