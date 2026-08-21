@@ -35,6 +35,18 @@ class TurnDecision:
     matched_name: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class InterjectionJudgment:
+    """Outcome of the stricter Level 1.5 judgment: not 'can Tom answer this'
+    (the Level 1 heuristic already screens for that) but 'would a solution
+    architect actually volunteer here, unprompted, in front of a customer'.
+    """
+
+    worth_interjecting: bool
+    confidence: float  # 0-1
+    reason: str  # short, shown on the rep console for audit/trust
+
+
 @dataclass
 class FloorState:
     """Who currently holds the conversational floor with the agent."""

@@ -4,10 +4,12 @@ import base64
 import asyncio
 import logging
 import re
+import sys
 import time
 import uuid
 import hashlib
 import hmac
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal, Callable, Awaitable
 from urllib.parse import urlencode, quote
 
@@ -17,6 +19,7 @@ from src.agent_policy import (
     EchoSuppressor,
     FinalUtteranceBuffer,
     FloorState,
+    InterjectionJudgment,
     SpeechGovernor,
     SustainedSpeechDetector,
     apply_validated_corrections,
@@ -52,11 +55,24 @@ from google.genai import types
 
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Setup logging: terminal keeps today's exact output, and every process start
+# (a fresh `npm start` launch, or a --reload respawn on file save) also gets
+# its own on-disk copy at logs/app.log -- opened in "w" (truncate), not
+# append or size-rotation, so each run starts a clean file instead of
+# yesterday's session still being at the top when you scroll for today's.
+_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+_file_handler = logging.FileHandler(_LOG_DIR / "app.log", mode="w", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_file_handler.setLevel(logging.INFO)
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_console_handler.setLevel(logging.INFO)
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 logger = logging.getLogger("LiveAvatar-Spiked")
 
 # Environment variables
@@ -154,6 +170,16 @@ def _get_backend_http() -> httpx.AsyncClient:
 AGENT_INSIGHT_COOLDOWN_S = float(os.getenv("AGENT_INSIGHT_COOLDOWN_S", "25"))
 AGENT_INSIGHT_TTL_S = float(os.getenv("AGENT_INSIGHT_TTL_S", "120"))
 
+# Level 1.5: autonomous interjection. A stricter judgment on top of the Level 1
+# heuristic above — "would a solution architect actually volunteer here" vs.
+# "the KB happens to cover this" — gated per-run (autospeak_enabled) and
+# capped hard, since this is the only behavior where the agent takes the floor
+# with no human in the loop. Cooldown is deliberately longer than the Level 1
+# cue cooldown: cueing is cheap, speaking isn't.
+AGENT_AUTOSPEAK_MIN_CONFIDENCE = float(os.getenv("AGENT_AUTOSPEAK_MIN_CONFIDENCE", "0.75"))
+AGENT_AUTOSPEAK_COOLDOWN_S = float(os.getenv("AGENT_AUTOSPEAK_COOLDOWN_S", "90"))
+AGENT_AUTOSPEAK_MAX_PER_RUN = int(os.getenv("AGENT_AUTOSPEAK_MAX_PER_RUN", "3"))
+
 # Turn detection. Fragments from one speaker are merged before the gate runs, so a
 # single sentence split by a pause cannot produce two replies.
 AGENT_TURN_MERGE_MS = int(os.getenv("AGENT_TURN_MERGE_MS", "250"))
@@ -250,6 +276,7 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     kyc_id: Optional[str] = Field(default=None, description="Active KYC overlay for buyer-aware answers; backend falls back to the manual overlay when absent")
     bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
+    autospeak_enabled: bool = Field(default=False, description="Level 1.5: let the agent take the floor unprompted for high-value moments, capped per run")
 
 
 class TranscriptCorrection(BaseModel):
@@ -311,6 +338,17 @@ class GroundedReply(BaseModel):
             "confirmations."
         ),
     )
+
+
+class InterjectionJudgmentModel(BaseModel):
+    """Pydantic mirror of agent_policy.InterjectionJudgment, for structured
+    parsing of the Level 1.5 judgment call. Kept separate from the dataclass
+    the rest of the codebase consumes, the same split GroundedReply/compose_
+    reply already uses between the wire schema and the internal type."""
+
+    worth_interjecting: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str
 
 # ---------------------------------------------------------------------------
 # Static Webpage Hosting (Self-Hosted avatar.html for Recall Output Media)
@@ -697,14 +735,15 @@ Set response_action to:
 The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
 Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
 Use meeting_context for questions about what meeting participants said or discussed, and for questions about this specific call's live state — sentiment, mood, engagement, or how a participant seems — never company_knowledge for those, since the knowledge base has no data on this call or its participants.
-Use coaching when the sales rep asks {bot_name} for help running the call itself rather than for an answer to relay: what to ask next, what is being missed, how to handle an objection, where the conversation should go.
-Use social for greetings, audio checks, and questions about {bot_name}'s own identity/role ("who are you", "what are you") — never company_knowledge for those, since the knowledge base has no document about {bot_name} himself. Use command for stop/wait/repeat commands.
+Use coaching when the sales rep asks {bot_name} for help running the call itself rather than for an answer to relay: what to ask next, what is being missed, how to handle an objection, where the conversation should go — including a vague invitation to contribute ("can you hop in", "jump in here", "chime in", "anything to add") with no specific ask attached. Treat that as coaching, not social: synthesize one useful thing from Recent finalized conversation / What this call has established, the same as if the rep had asked "what am I missing?"
+Use social only for actual greetings, audio checks, and questions about {bot_name}'s own identity/role ("who are you", "what are you") — never company_knowledge for those, since the knowledge base has no document about {bot_name} himself. Use command for stop/wait/repeat commands.
 Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates.
 
 Reply fields (answer/bridge/next_question): leave ALL THREE empty if intent is company_knowledge (a separate step with retrieved facts will answer it) or if response_action is not "respond". Otherwise fill them in for spoken delivery:
 - answer: the direct answer, at most {reply_word_limit} words. No markdown, lists, or filler. If intent is coaching, this is one specific, actionable suggestion grounded in what this call has established — name the gap or risk plainly, do not summarize the call back, do not pitch — and aim it at what {f"{dossier}" if dossier else "the sales rep"} is accountable for if that framing is known.
 - bridge: at most one short clause connecting the answer to what {speaker} is trying to decide. Leave empty rather than padding.
-- next_question: one question, at most {MAX_QUESTION_WORDS} words, that opens the next useful step. For coaching, phrase it as the question {speaker} should ask the room next, verbatim. Ask a question by default — leave it empty only when one would be unwelcome (greetings, audio checks, a command being acknowledged, a short confirmation)."""
+- next_question: one question, at most {MAX_QUESTION_WORDS} words, that opens the next useful step. For coaching, phrase it as the question {speaker} should ask the room next, verbatim. Ask a question by default — leave it empty only when one would be unwelcome (greetings, audio checks, a command being acknowledged, a short confirmation).
+Neither answer nor next_question may restate or re-ask anything Recent finalized conversation or What this call has established already covers — check both before writing either field. If the only thing you have to offer already happened, say what's genuinely still open instead."""
         _t_classify_start = time.monotonic()
         try:
             analysis_response = await gemini_client.aio.models.generate_content(
@@ -1018,6 +1057,7 @@ Produce the reply for spoken delivery, in three parts:
 
 Ask a question by default: it is how you hand the conversation back. Leave next_question empty only when one would be unwelcome — greetings and audio checks, a command you are acknowledging, or a short factual confirmation the speaker only needed verified.
 Use the speaker's first name only if it improves a greeting or clarification.
+Neither answer nor next_question may restate or re-ask anything Recent finalized conversation or What this call has established already covers — check both before writing either field.
 
 Intent: {analysis.intent}
 Corrected turn: {corrected_transcript}
@@ -1070,6 +1110,61 @@ Verified RAG facts (the only source for company facts):
     )
     return reply or None
 
+
+async def _judge_interjection(
+    transcript: str,
+    history_text: str,
+    bot_name: str,
+    preferred_model: str,
+) -> InterjectionJudgment:
+    """Level 1.5: is this warmed reply worth volunteering unprompted?
+
+    Deliberately a second, stricter classification rather than a threshold on
+    the Level 1 heuristic (looks_like_followup + requires_company_knowledge)
+    that already ran to get here — that heuristic answers "is this even a
+    candidate", this answers "would a solution architect actually speak up
+    right now". Runs only for turns that already cleared the cheap heuristic,
+    so the extra call is bounded, not per-sentence.
+    """
+    judgment_prompt = f"""You are judging whether {bot_name}, a Solution Architect silently sitting in on this sales call, should interrupt the conversation right now with unsolicited input — nobody asked him anything.
+
+Recent finalized conversation:
+{history_text}
+
+The moment in question: {transcript}
+
+{bot_name} has a warmed, accurate answer ready. Set worth_interjecting to true ONLY if staying silent would let something real go wrong: a wrong technical assumption is being stated as fact, a decision-blocking gap is being glossed over, or a genuine risk/compliance issue is going unmentioned. Do NOT set it true just because the knowledge base happens to cover the topic, or because the answer would be a nice-to-have addition — a real solution architect lets most things pass without comment. When in doubt, false.
+
+confidence should reflect how clearly this crosses that bar, not how confident you are in the answer's factual accuracy.
+reason: one short clause, for an internal audit log a sales rep will read."""
+    try:
+        response = await gemini_client.aio.models.generate_content(
+            model=preferred_model,
+            contents=judgment_prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=120,
+                response_mime_type="application/json",
+                response_schema=InterjectionJudgmentModel,
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, InterjectionJudgmentModel):
+            structured = parsed
+        elif parsed is not None:
+            structured = InterjectionJudgmentModel.model_validate(parsed)
+        else:
+            structured = InterjectionJudgmentModel.model_validate_json(response.text or "")
+        return InterjectionJudgment(
+            worth_interjecting=structured.worth_interjecting,
+            confidence=structured.confidence,
+            reason=structured.reason,
+        )
+    except Exception:
+        # Fail closed: an unparseable or failed judgment call must never be
+        # treated as permission to take the floor unprompted.
+        logger.warning("[Autospeak] Judgment call failed", exc_info=True)
+        return InterjectionJudgment(False, 0.0, "judgment_failed")
+
 # ---------------------------------------------------------------------------
 # API Endpoints: Session & Bot Creation
 # ---------------------------------------------------------------------------
@@ -1097,6 +1192,102 @@ class InvokeAgentRequest(BaseModel):
         default=False,
         description="Ask the agent how to run the call rather than for an answer to relay.",
     )
+
+
+class FloorUnavailable(Exception):
+    """The agent cannot take the floor right now (busy, or nothing to say).
+
+    Callers translate this however fits their context: invoke_agent as an
+    HTTP 409/400, the Level 1.5 autonomous path as a silent no-op that falls
+    back to the existing cue-only behavior.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def _take_floor_and_speak(
+    run: Dict[str, Any],
+    question: str,
+    speaker: str,
+    *,
+    coaching: bool = False,
+    warm_reply: Optional[str] = None,
+    source: str = "invoke",
+) -> Dict[str, Any]:
+    """Take the floor and speak, bypassing the wake name/addressee gate but
+    never the floor, governor, or duplicate guard.
+
+    This is the discipline Level 2 invitation established: the rep pressing
+    "Ask Tom" bypasses the wake name, not the safety rails. Shared by
+    invoke_agent (source="invoke") and the Level 1.5 autonomous interjection
+    path (source="autonomous") so both go through identical turn bookkeeping
+    and dispatch instead of two parallel implementations drifting apart.
+    """
+    if run.get("state") != AgentState.LISTENING:
+        # Busy, not broken. The caller can retry once the current turn lands.
+        raise FloorUnavailable(f"agent_is_{run.get('state')}")
+    if not question:
+        raise FloorUnavailable("no_question")
+
+    run["turn_counter"] = int(run.get("turn_counter", 0)) + 1
+    turn_id = run["turn_counter"]
+    run["active_turn_id"] = turn_id
+    run["state"] = AgentState.THINKING
+
+    previous_task = run.get("active_response_task")
+    if previous_task and not previous_task.done():
+        previous_task.cancel()
+
+    async def deliver() -> None:
+        try:
+            answer = warm_reply
+            if not answer:
+                ctx = run.get("user_context") or {}
+                history = run.get("history") or []
+                answer = await _generate_grounded_reply(
+                    analysis=TurnAnalysis(
+                        response_action="respond",
+                        intent="coaching" if coaching else "company_knowledge",
+                        resolved_query=question,
+                        corrections=[],
+                    ),
+                    transcript=question,
+                    speaker=speaker,
+                    bot_name=run.get("bot_name") or "Tom",
+                    company_name=ctx.get("company_name", "SpikedAI"),
+                    history_text="\n".join(
+                        f"{t.get('speaker', 'Participant')}: {t.get('text', '')}"
+                        for t in history[-12:]
+                    ),
+                    catalog=build_entity_catalog(ctx),
+                    auth_token=run.get("token") or "",
+                    client_id=run.get("client_id"),
+                    preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                    intel=run.get("intel"),
+                    kyc_id=run.get("kyc_id"),
+                    run=run,
+                    turn_id=turn_id,
+                )
+            if run.get("_streamed_turn_id") == turn_id:
+                # Already spoken chunk-by-chunk — see process_transcript_with_
+                # gemini's respond() for the same pattern and why.
+                return
+            if turn_id != run.get("active_turn_id"):
+                return
+            if not answer:
+                _release_floor(run)
+                return
+            await _dispatch_reply(run, answer, turn_id, source=source)
+        except asyncio.CancelledError:
+            logger.info("[%s] Cancelled superseded turn_id=%s", source, turn_id)
+        except Exception:
+            _release_floor(run)
+            logger.error("[%s] Failed turn_id=%s", source, turn_id, exc_info=True)
+
+    run["active_response_task"] = asyncio.create_task(deliver())
+    return {"accepted": True, "turn_id": turn_id, "warm": bool(warm_reply)}
 
 
 @app.post("/api/runs/{run_id}/invoke")
@@ -1129,72 +1320,28 @@ async def invoke_agent(run_id: str, payload: Optional[InvokeAgentRequest] = None
             raise HTTPException(status_code=400, detail="No question supplied and no fresh insight pending")
         question = insight.get("question") or ""
 
-    run["turn_counter"] = int(run.get("turn_counter", 0)) + 1
-    turn_id = run["turn_counter"]
-    run["active_turn_id"] = turn_id
-    run["state"] = AgentState.THINKING
-
-    previous_task = run.get("active_response_task")
-    if previous_task and not previous_task.done():
-        previous_task.cancel()
-
     # Accepting a pending insight verbatim is the fast path the prefetch exists
     # for: the answer is already composed, so this is a socket send.
     warm = insight.get("reply") if (insight_fresh and not payload.question and not payload.coaching) else None
     run["pending_insight"] = None
 
-    async def deliver() -> None:
-        try:
-            answer = warm
-            if not answer:
-                ctx = run.get("user_context") or {}
-                history = run.get("history") or []
-                answer = await _generate_grounded_reply(
-                    analysis=TurnAnalysis(
-                        response_action="respond",
-                        intent="coaching" if payload.coaching else "company_knowledge",
-                        resolved_query=question,
-                        corrections=[],
-                    ),
-                    transcript=question,
-                    speaker=insight.get("speaker") or "the rep",
-                    bot_name=run.get("bot_name") or "Tom",
-                    company_name=ctx.get("company_name", "SpikedAI"),
-                    history_text="\n".join(
-                        f"{t.get('speaker', 'Participant')}: {t.get('text', '')}"
-                        for t in history[-12:]
-                    ),
-                    catalog=build_entity_catalog(ctx),
-                    auth_token=run.get("token") or "",
-                    client_id=run.get("client_id"),
-                    preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-                    intel=run.get("intel"),
-                    kyc_id=run.get("kyc_id"),
-                    run=run,
-                    turn_id=turn_id,
-                )
-            if run.get("_streamed_turn_id") == turn_id:
-                # Already spoken chunk-by-chunk — see process_transcript_with_
-                # gemini's respond() for the same pattern and why.
-                return
-            if turn_id != run.get("active_turn_id"):
-                return
-            if not answer:
-                _release_floor(run)
-                return
-            await _dispatch_reply(run, answer, turn_id)
-        except asyncio.CancelledError:
-            logger.info("[Invoke] Cancelled superseded turn_id=%s", turn_id)
-        except Exception:
-            _release_floor(run)
-            logger.error("[Invoke] Failed turn_id=%s", turn_id, exc_info=True)
+    try:
+        result = await _take_floor_and_speak(
+            run,
+            question,
+            insight.get("speaker") or "the rep",
+            coaching=payload.coaching,
+            warm_reply=warm,
+            source="invoke",
+        )
+    except FloorUnavailable as exc:
+        raise HTTPException(status_code=409, detail=exc.reason)
 
-    run["active_response_task"] = asyncio.create_task(deliver())
     logger.info(
         "[Invoke] run_id=%s turn_id=%s warm=%s coaching=%s",
-        run_id, turn_id, bool(warm), payload.coaching,
+        run_id, result["turn_id"], result["warm"], payload.coaching,
     )
-    return {"accepted": True, "turn_id": turn_id, "warm": bool(warm)}
+    return result
 
 
 @app.get("/api/runs/{run_id}/credentials")
@@ -1332,6 +1479,7 @@ async def _deploy_live_avatar_bot(
     kyc_id: Optional[str] = None,
     bot_name: str = DEFAULT_BOT_NAME,
     avatar_id: Optional[str] = None,
+    autospeak_enabled: bool = False,
     request: Optional[Request] = None
 ) -> Dict[str, Any]:
     """Internal core method to deploy the LiveAvatar Bot into a meeting."""
@@ -1400,6 +1548,12 @@ async def _deploy_live_avatar_bot(
             # to give. Consumed by the invoke endpoint, expired by TTL.
             "pending_insight": None,
             "last_insight_at": None,
+            # Level 1.5: opt-in per run (see CreateBotWithLiveAvatarRequest).
+            # Off by default — the agent taking the floor with no human in the
+            # loop is the highest blast-radius behavior in the app so far.
+            "autospeak_enabled": autospeak_enabled,
+            "last_autospeak_at": None,
+            "autospeak_count": 0,
             "floor": FloorState(),
             "echo": EchoSuppressor(
                 similarity_threshold=AGENT_ECHO_SIMILARITY,
@@ -1573,6 +1727,7 @@ async def start_bot_endpoint(
         kyc_id = None
         bot_name = DEFAULT_BOT_NAME
         avatar_id = None
+        autospeak_enabled = False
 
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -1582,6 +1737,7 @@ async def start_bot_endpoint(
             kyc_id = body.get("kyc_id")
             bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = body.get("avatar_id")
+            autospeak_enabled = bool(body.get("autospeak_enabled", False))
             if not token:
                 token = body.get("token", "")
         else:
@@ -1591,6 +1747,7 @@ async def start_bot_endpoint(
             kyc_id = form.get("kyc_id")
             bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = form.get("avatar_id")
+            autospeak_enabled = str(form.get("autospeak_enabled", "")).strip().lower() in ("true", "1", "on")
             if not token:
                 token = form.get("token", "")
 
@@ -1604,6 +1761,7 @@ async def start_bot_endpoint(
             kyc_id=kyc_id,
             bot_name=bot_name,
             avatar_id=avatar_id,
+            autospeak_enabled=autospeak_enabled,
             request=request
         )
         return JSONResponse(status_code=200, content=result)
@@ -1632,6 +1790,7 @@ async def create_live_avatar_bot(
         kyc_id=payload.kyc_id,
         bot_name=payload.bot_name,
         avatar_id=payload.avatar_id,
+        autospeak_enabled=payload.autospeak_enabled,
         request=request
     )
 
@@ -1994,12 +2153,15 @@ def _push_insight(run: Dict[str, Any], speaker: str, topic: str) -> None:
     })
 
 
-async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int) -> bool:
+async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int, source: str = "addressed") -> bool:
     """Send a finished reply to the avatar and arm the speak watchdog.
 
-    Shared by the addressed-turn path and the invoke endpoint so an explicitly
-    requested turn still passes the duplicate guard and still registers echo
+    Shared by the addressed-turn path, the invoke endpoint, and the Level 1.5
+    autonomous path so every turn passes the same duplicate guard and echo
     suppression — invitation bypasses the wake name, not the safety rails.
+    `source` ("addressed" | "invoke" | "autonomous") rides along on the rep
+    socket's agent_spoke event only, purely for console display/audit — it
+    has no effect on gating.
     """
     governor: SpeechGovernor = run["governor"]
     bot_name = run.get("bot_name") or "Tom"
@@ -2022,7 +2184,7 @@ async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int) -> boo
     # Register before dispatch: the echo can return before the socket ack.
     run["echo"].note_bot_speech(answer, spoken_at)
     governor.note_reply(answer, spoken_at)
-    _push_rep(run, {"type": "agent_spoke", "text": answer, "turn_id": turn_id})
+    _push_rep(run, {"type": "agent_spoke", "text": answer, "turn_id": turn_id, "source": source})
 
     timing = run.setdefault("turn_timing", {}).setdefault(turn_id, {})
     timing["dispatched_at"] = spoken_at
@@ -2408,6 +2570,8 @@ def _consider_insight(
                     "created_at": time.monotonic(),
                 }
                 logger.info("[Insight] Warmed reply words=%d", len(reply.split()))
+                if run.get("autospeak_enabled"):
+                    await _consider_autospeak(run, speaker, transcript, reply, history_text)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2416,6 +2580,180 @@ def _consider_insight(
             logger.warning("[Insight] Prefetch failed", exc_info=True)
 
     asyncio.create_task(prefetch())
+
+
+async def _consider_autospeak(
+    run: Dict[str, Any],
+    speaker: str,
+    transcript: str,
+    warmed_reply: str,
+    history_text: str,
+) -> None:
+    """Level 1.5: decide whether to auto-accept the Level 1 insight just
+    warmed above, i.e. take the floor unprompted instead of only cueing.
+
+    Only ever called for a run that opted in (autospeak_enabled) and only
+    after the Level 1 heuristic + a successful RAG warm already passed —
+    this is an additional, stricter filter on top of that path, not a
+    replacement for it. Every check here fails closed: any doubt, and Tom
+    falls back to the existing cue-only behavior with `pending_insight`
+    left in place for the rep to accept manually.
+    """
+    bot_name = run.get("bot_name") or "Tom"
+    run_id = run.get("run_id")
+
+    if run.get("autospeak_count", 0) >= AGENT_AUTOSPEAK_MAX_PER_RUN:
+        logger.info("[Autospeak] Skipped run_id=%s reason=cap_reached", run_id)
+        return
+    last = run.get("last_autospeak_at")
+    now = time.monotonic()
+    if last is not None and now - last < AGENT_AUTOSPEAK_COOLDOWN_S:
+        logger.info("[Autospeak] Skipped run_id=%s reason=cooldown", run_id)
+        return
+    # Re-check floor/governor here, not just in _consider_insight's caller:
+    # the RAG warm above was an await, so state may have moved on since.
+    if run.get("state") != AgentState.LISTENING:
+        logger.info("[Autospeak] Skipped run_id=%s reason=agent_not_idle state=%s", run_id, run.get("state"))
+        return
+    governor: SpeechGovernor = run["governor"]
+    allowed, governor_reason = governor.allows_reply(time.monotonic())
+    if not allowed:
+        logger.info("[Autospeak] Skipped run_id=%s reason=governor:%s", run_id, governor_reason)
+        return
+
+    judgment = await _judge_interjection(
+        transcript=transcript,
+        history_text=history_text,
+        bot_name=bot_name,
+        preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+    )
+    logger.info(
+        "[Autospeak] Judged run_id=%s worth_interjecting=%s confidence=%.2f reason=%r",
+        run_id, judgment.worth_interjecting, judgment.confidence, judgment.reason,
+    )
+    _push_rep(run, {
+        "type": "autospeak_reasoning",
+        "worth_interjecting": judgment.worth_interjecting,
+        "confidence": judgment.confidence,
+        "reason": judgment.reason,
+    })
+    if not judgment.worth_interjecting or judgment.confidence < AGENT_AUTOSPEAK_MIN_CONFIDENCE:
+        logger.info("[Autospeak] Skipped run_id=%s reason=below_bar", run_id)
+        return
+    # Recheck floor/governor once more: the judgment call was itself an
+    # await, and this is the last moment before actually taking the floor.
+    if run.get("state") != AgentState.LISTENING:
+        logger.info("[Autospeak] Skipped run_id=%s reason=agent_not_idle_after_judgment state=%s", run_id, run.get("state"))
+        return
+    allowed, governor_reason = governor.allows_reply(time.monotonic())
+    if not allowed:
+        logger.info("[Autospeak] Skipped run_id=%s reason=governor_after_judgment:%s", run_id, governor_reason)
+        return
+
+    run["autospeak_count"] = run.get("autospeak_count", 0) + 1
+    run["last_autospeak_at"] = time.monotonic()
+    run["pending_insight"] = None  # being spoken now, not offered
+
+    logger.info(
+        "[Autospeak] Taking floor speaker=%s confidence=%.2f reason=%r count=%d",
+        speaker, judgment.confidence, judgment.reason, run["autospeak_count"],
+    )
+    try:
+        await _take_floor_and_speak(
+            run, transcript, speaker, coaching=False, warm_reply=warmed_reply, source="autonomous",
+        )
+    except FloorUnavailable:
+        # Lost the floor between the recheck above and here (no await in
+        # between today, but this keeps the function honest if that changes).
+        logger.info("[Autospeak] Floor unavailable at the last moment; staying silent")
+
+
+def _consider_autospeak_candidate(
+    run: Dict[str, Any],
+    speaker: str,
+    transcript: str,
+    history_snapshot: List[Dict[str, str]],
+) -> None:
+    """Level 1.5's own trigger — independent of Level 1's cue gate.
+
+    _consider_insight's heuristic (looks_like_followup + requires_company_
+    knowledge) is deliberately narrow: it decides what's worth showing the
+    rep a card for, and a keyword-list topic gate is the right amount of
+    conservative for that UX surface. But that gate also has real recall
+    gaps — a genuine technical question phrased in domain language that
+    doesn't happen to contain one of the hardcoded factual_terms (e.g. "how
+    does state transfer work when orchestrated using Kubernetes") never
+    reaches the KB at all, silently, whether or not it's question-shaped.
+
+    Level 1.5 never shows anything to the rep unless _judge_interjection
+    approves it, so it doesn't inherit that conservatism: this evaluates
+    every complete, non-addressed turn — question or statement, on a
+    recognized topic or not — and lets RAG's own "no relevant documents"
+    response be the real relevance filter. That's cheap on a miss (retrieval
+    only, no generation, no cognitive pipeline — see build_rag_context's
+    early return) and it means the only things standing between a good
+    moment and Tom staying silent are the cooldown, the cap, and the
+    judgment call — not a static keyword list. Shares _consider_insight's
+    cooldown clock, and may run alongside it for the same on-topic
+    question-shaped turn (two prefetches, not one) — an accepted duplication
+    now that a miss is cheap, in exchange for never structurally missing a
+    real moment the way the combined old gate did.
+    """
+    if not run.get("autospeak_enabled"):
+        return
+    if run.get("state") != AgentState.LISTENING:
+        return
+    if is_probably_incomplete(transcript):
+        return
+
+    ctx = run.get("user_context") or {}
+    catalog = build_entity_catalog(ctx)
+
+    now = time.monotonic()
+    last = run.get("last_insight_at")
+    if last is not None and now - last < AGENT_INSIGHT_COOLDOWN_S:
+        return
+    run["last_insight_at"] = now
+
+    logger.info("[Autospeak] Candidate turn speaker=%s text=%r", speaker, transcript[:80])
+
+    bot_name = run.get("bot_name") or "Tom"
+    history_text = "\n".join(
+        f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
+        for turn in history_snapshot[-12:]
+    )
+
+    async def prefetch_and_judge() -> None:
+        try:
+            reply = await _generate_grounded_reply(
+                analysis=TurnAnalysis(
+                    response_action="respond",
+                    intent="company_knowledge",
+                    resolved_query=transcript,
+                    corrections=[],
+                ),
+                transcript=transcript,
+                speaker=speaker,
+                bot_name=bot_name,
+                company_name=ctx.get("company_name", "SpikedAI"),
+                history_text=history_text,
+                catalog=catalog,
+                auth_token=run.get("token") or "",
+                client_id=run.get("client_id"),
+                preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                intel=run.get("intel"),
+                rag_timeout_s=AGENT_RAG_PREFETCH_TIMEOUT_S,
+                kyc_id=run.get("kyc_id"),
+            )
+            if not reply:
+                return
+            await _consider_autospeak(run, speaker, transcript, reply, history_text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("[Autospeak] Declarative prefetch failed", exc_info=True)
+
+    asyncio.create_task(prefetch_and_judge())
 
 
 def _finalize_turn(
@@ -2488,6 +2826,7 @@ def _finalize_turn(
     _push_heard(run, participant_name, transcript, decision.should_reply, decision.reason)
     if not decision.should_reply:
         _consider_insight(run, participant_name, transcript, history_snapshot)
+        _consider_autospeak_candidate(run, participant_name, transcript, history_snapshot)
         return
 
     allowed, governor_reason = governor.allows_reply(now)
