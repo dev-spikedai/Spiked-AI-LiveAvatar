@@ -82,8 +82,14 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
-# ap-northeast-1, not the API's own us-west-2 default: our RECALL_API_KEY is
-# region-bound to that workspace and 401s against any other region.
+# Defaults to ap-northeast-1 for local dev, where RECALL_API_KEY has
+# historically been region-bound to that workspace. This is NOT a safe
+# assumption for every deploy -- Recall API keys are region-bound, and a
+# 401 with "Invalid API token... might be for another Recall region" means
+# whichever RECALL_API_KEY is actually in play doesn't match this default.
+# The production Cloud Run deploy sets RECALL_BASE_URL explicitly in
+# cloudbuild.yaml instead of relying on this fallback -- keep the two in
+# sync if either the key or its region ever changes.
 RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://ap-northeast-1.recall.ai")
 RECALL_WEBHOOK_URL = os.getenv(
     "RECALL_WEBHOOK_URL", 
