@@ -7,7 +7,7 @@ from supabase import create_client, Client
 
 logger = logging.getLogger("LiveAvatar-Spiked")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://api.spiked.ai")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_KEY_TRANSCRIPT")
 
 _supabase_client: Optional[Client] = None
@@ -22,27 +22,24 @@ if SUPABASE_URL and SUPABASE_KEY:
 _KEYWORD_CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_TTL_SECONDS = 600
 
-# Default foundational terms for SpikedAI ecosystem
+# Default foundational terms — generic, not company-specific
 DEFAULT_CORE_KEYWORDS: List[str] = [
-    "Tiya",
-    "Spiked",
-    "SpikedAI",
-    "Spiked AI",
-    "LiveAvatar",
-    "Handsfree",
-    "Recall",
-    "Recall.ai",
-    "Deepgram",
-    "Nova-3",
-    "Nova-2",
-    "Gemini",
-    "SLA",
-    "SLAs",
-    "CRM",
-    "RAG",
-    "Supabase",
-    "LiveKit",
-    "WebRTC"
+    "meeting",
+    "assistant",
+    "AI",
+    "product",
+    "service",
+    "pricing",
+    "features",
+    "integration",
+    "support",
+    "onboarding",
+    "demo",
+    "trial",
+    "enterprise",
+    "API",
+    "security",
+    "compliance",
 ]
 
 async def get_user_keywords_and_products(
@@ -70,10 +67,10 @@ async def get_user_keywords_and_products(
             return cached["data"]
 
     keywords_set: Set[str] = set(DEFAULT_CORE_KEYWORDS)
-    company_name = "SpikedAI"
+    company_name = ""
     products_services = ""
-    bot_name = "Tiya"
-    product_domain = "Enterprise Sales & AI Meeting Automation"
+    bot_name = os.getenv("BOT_NAME", "Tom")
+    product_domain = ""
 
     client_to_use = _supabase_client
     if not client_to_use and SUPABASE_URL and auth_token:
@@ -96,7 +93,7 @@ async def get_user_keywords_and_products(
             
             if res.data and len(res.data) > 0:
                 cfg = res.data[0]
-                bot_name = (config.get("bot_name") or "Tiya").strip()
+                bot_name = (cfg.get("bot_name") or "Tom").strip()
                 company_name = cfg.get("seller_company") or company_name
                 products_services = cfg.get("products_services") or ""
                 product_domain = cfg.get("product_domain") or product_domain

@@ -1,5 +1,7 @@
 import os
+import io
 import json
+import struct
 import base64
 import asyncio
 import logging
@@ -8,6 +10,7 @@ import time
 import uuid
 import hashlib
 import hmac
+import wave
 from typing import Optional, List, Dict, Any, Literal, AsyncGenerator
 from urllib.parse import urlencode, quote
 
@@ -15,7 +18,6 @@ from src.supabase_client import get_user_keywords_and_products
 from src.agent_policy import (
     AgentState,
     EchoSuppressor,
-    FinalUtteranceBuffer,
     FloorState,
     SpeechGovernor,
     SustainedSpeechDetector,
@@ -32,8 +34,6 @@ from src.agent_policy import (
 )
 
 import httpx
-import websockets
-from websockets.exceptions import ConnectionClosed
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +46,8 @@ from google.genai import types
 
 load_dotenv()
 
+from src import rag_client
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +57,7 @@ logger = logging.getLogger("LiveAvatar-Spiked")
 
 # Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API") or os.getenv("DEEPGRAM_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
@@ -90,24 +93,23 @@ PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", 
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
-AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
-AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
+AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "500"))
+AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "250"))
 AGENT_UTTERANCE_END_MS = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
-DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tiya").strip() or "Tiya"
+DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
 
 # Turn detection. Fragments from one speaker are merged before the gate runs, so a
 # single sentence split by a pause cannot produce two replies.
 AGENT_TURN_MERGE_MS = int(os.getenv("AGENT_TURN_MERGE_MS", "250"))
 AGENT_TURN_MERGE_INCOMPLETE_MS = int(os.getenv("AGENT_TURN_MERGE_INCOMPLETE_MS", "700"))
-# Floor control. Opt-in: 0 means the wake name is required on every single turn,
-# which is the behavior the product expects. Raise it only to allow nameless
-# question-shaped continuations shortly after the agent stops speaking.
-AGENT_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_FOLLOWUP_WINDOW_MS", "8000"))
-AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "0"))
+# Floor control. 1 allows a single nameless follow-up shortly after the agent
+# finishes, so natural conversation does not require chanting the wake name.
+AGENT_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_FOLLOWUP_WINDOW_MS", "10000"))
+AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "1"))
 # Speech governor: hard ceiling on reply frequency and repetition.
-AGENT_REPLY_COOLDOWN_MS = int(os.getenv("AGENT_REPLY_COOLDOWN_MS", "2000"))
-AGENT_MAX_REPLIES_PER_WINDOW = int(os.getenv("AGENT_MAX_REPLIES_PER_WINDOW", "4"))
+AGENT_REPLY_COOLDOWN_MS = int(os.getenv("AGENT_REPLY_COOLDOWN_MS", "1500"))
+AGENT_MAX_REPLIES_PER_WINDOW = int(os.getenv("AGENT_MAX_REPLIES_PER_WINDOW", "5"))
 AGENT_REPLY_WINDOW_S = float(os.getenv("AGENT_REPLY_WINDOW_S", "30"))
 # Echo suppression: how close a transcript must be to the agent's own words.
 AGENT_ECHO_SIMILARITY = float(os.getenv("AGENT_ECHO_SIMILARITY", "0.72"))
@@ -223,44 +225,181 @@ async def get_avatar_js():
 
 async def query_spiked_rag(question: str, auth_token: str, client_id: Optional[str] = None) -> str:
     """
-    Executes Document RAG by calling SpikedAI-Backend-One /ask/handsfree endpoint.
-    Passes the customer's Supabase JWT in the Authorization header.
+    Executes Document RAG by querying SpikedAI's knowledge base.
+    Uses rag_client for authenticated queries with source_ids.
     """
-    url = f"{SPIKED_BACKEND_URL.rstrip('/')}/ask/handsfree"
-    headers = {
-        "Authorization": f"Bearer {auth_token}" if auth_token else "",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream"
-    }
-    payload = {
-        "question": question,
-        "client_id": client_id
-    }
-    
-    logger.info("[RAG] Querying SpikedAI-Backend-One client_id=%s query_chars=%d", client_id, len(question))
+    logger.info("[RAG] Querying knowledge base client_id=%s query_chars=%d", client_id, len(question))
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            if response.status_code != 200:
-                logger.error("[RAG] Failed with status %s", response.status_code)
-                return "I could not retrieve the relevant company documents for this question."
-            
-            full_text = ""
-            async for line in response.aiter_lines():
-                if line.startswith("data:"):
-                    chunk = line.replace("data:", "").strip()
-                    full_text += chunk + " "
-                elif line:
-                    full_text += line + " "
-            
-            result = full_text.strip()
+        result = await rag_client.query_rag(question, client_id=client_id)
+        if result:
             logger.info("[RAG] Received grounded answer (%d chars)", len(result))
-            return result or "No specific documentation found for this query."
-            
+            return result
+        return "No specific documentation found for this query."
     except Exception as e:
-        logger.error(f"[RAG] Error calling SpikedAI backend: {e}", exc_info=True)
+        logger.error(f"[RAG] Error querying knowledge base: {e}", exc_info=True)
         return "An error occurred while accessing the company knowledge base."
+
+# ---------------------------------------------------------------------------
+# Streaming pipeline: route turn → stream Gemini → stream Cartesia → avatar
+# ---------------------------------------------------------------------------
+
+async def _route_and_stream(
+    transcript: str,
+    speaker: str,
+    conversation_history: List[Dict[str, str]],
+    auth_token: str,
+    client_id: Optional[str] = None,
+    user_context: Optional[Dict[str, Any]] = None,
+    run: Optional[Dict[str, Any]] = None,
+    turn_id: Optional[int] = None,
+) -> Optional[str]:
+    """Route the turn then stream the answer directly into Cartesia TTS.
+
+    This replaces the two-step ``process_transcript_with_gemini`` →
+    ``_stream_tts_for_reply`` path with a single pipelined flow so the
+    avatar starts speaking as soon as the first sentence is ready, while
+    Gemini is still generating the rest of the answer.
+    """
+    if not gemini_client:
+        logger.error("[Google GenAI] Client is not initialized")
+        return None
+
+    ctx = user_context or {}
+    company_name = ctx.get("company_name", "SpikedAI")
+    products_services = ctx.get("products_services", "")
+    bot_name = ctx.get("bot_name") or "Tom"
+    product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
+    preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    catalog = build_entity_catalog(ctx)
+    candidate_entities = closest_entities(transcript, catalog)
+    history_text = "\n".join(
+        f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
+        for turn in conversation_history[-12:]
+    )
+
+    analysis: Optional[TurnAnalysis] = None
+    rag_task: Optional[asyncio.Task] = None
+
+    # --- Routing ---
+    try:
+        if is_directly_addressed(transcript, bot_name):
+            if requires_company_knowledge(transcript, catalog):
+                logger.info("[Agent Route] Fast path: company knowledge (no routing LLM)")
+                analysis = TurnAnalysis(
+                    response_action="respond",
+                    intent="company_knowledge",
+                    resolved_query=transcript,
+                    corrections=[],
+                )
+                rag_task = asyncio.create_task(
+                    query_spiked_rag(transcript, auth_token, client_id)
+                )
+            else:
+                remainder = _strip_wake_name(transcript, bot_name).strip().lower()
+                _social_words = {"hello", "hi", "hey", "good", "morning", "afternoon", "evening", "how", "what's", "whats"}
+                if any(w in remainder.split() for w in _social_words) or remainder.rstrip("?!") in ("hello", "hi", "hey"):
+                    logger.info("[Agent Route] Fast path: social greeting (no routing LLM)")
+                    greeting = normalize_reply(f"Hey {speaker}! How can I help you today?")
+                    if run and turn_id is not None:
+                        await _stream_tts_for_reply(run, turn_id, greeting)
+                    return greeting
+
+        if analysis is None:
+            analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn.
+Company: {company_name}
+Offerings: {products_services or product_domain}
+Verified entity candidates: {candidate_entities}
+Recent finalized conversation:
+{history_text}
+Current speaker: {speaker}
+Raw ASR: {transcript}
+
+Set response_action to:
+- respond: the speaker directly asks {bot_name} a question, requests an action/opinion, or gives {bot_name} a command.
+- acknowledge: the speaker directly gives {bot_name} information or a simple instruction that only needs a brief confirmation.
+- silent: {bot_name} is merely mentioned, quoted, discussed in third person, explicitly told not to answer, or the request is directed to somebody else.
+The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
+Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
+Use meeting_context only for questions about what meeting participants said or discussed.
+Use social for greetings and audio checks. Use command for stop/wait/repeat commands.
+Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates."""
+            try:
+                analysis_response = await gemini_client.aio.models.generate_content(
+                    model=preferred_model,
+                    contents=analysis_prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=220,
+                        response_mime_type="application/json",
+                        response_schema=TurnAnalysis,
+                    ),
+                )
+                parsed = getattr(analysis_response, "parsed", None)
+                if isinstance(parsed, TurnAnalysis):
+                    analysis = parsed
+                elif parsed is not None:
+                    analysis = TurnAnalysis.model_validate(parsed)
+                else:
+                    analysis = TurnAnalysis.model_validate_json(analysis_response.text)
+            except Exception:
+                logger.warning("[Agent Route] Structured routing failed; defaulting substantive turn to RAG", exc_info=True)
+                analysis = TurnAnalysis(
+                    response_action="respond",
+                    intent="company_knowledge",
+                    resolved_query=transcript,
+                    corrections=[],
+                )
+
+        logger.info(
+            "[LLM Response Gate] speaker=%s action=%s intent=%s",
+            speaker,
+            analysis.response_action,
+            analysis.intent,
+        )
+        if analysis.response_action == "silent":
+            return None
+        if analysis.response_action == "acknowledge":
+            if run and turn_id is not None:
+                await _stream_tts_for_reply(run, turn_id, "Understood.")
+            return "Understood."
+        if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
+            analysis.intent = "company_knowledge"
+    except Exception as e:
+        logger.error(f"[Gemini Agent] Inference error with google-genai SDK: {e}", exc_info=True)
+        return None
+
+    # --- Streaming generate + TTS ---
+    if run and turn_id is not None:
+        return await _generate_and_stream_reply(
+            run=run,
+            turn_id=turn_id,
+            analysis=analysis,
+            transcript=transcript,
+            speaker=speaker,
+            bot_name=bot_name,
+            company_name=company_name,
+            history_text=history_text,
+            catalog=catalog,
+            auth_token=auth_token,
+            client_id=client_id,
+            preferred_model=preferred_model,
+            rag_precomputed=rag_task,
+        )
+    else:
+        return await _generate_grounded_reply(
+            analysis=analysis,
+            transcript=transcript,
+            speaker=speaker,
+            bot_name=bot_name,
+            company_name=company_name,
+            history_text=history_text,
+            catalog=catalog,
+            auth_token=auth_token,
+            client_id=client_id,
+            preferred_model=preferred_model,
+            rag_precomputed=rag_task,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Gemini turn routing with deterministic RAG execution
@@ -282,7 +421,7 @@ async def process_transcript_with_gemini(
     ctx = user_context or {}
     company_name = ctx.get("company_name", "SpikedAI")
     products_services = ctx.get("products_services", "")
-    bot_name = ctx.get("bot_name") or "Tiya"
+    bot_name = ctx.get("bot_name") or "Tom"
     product_domain = ctx.get("product_domain", "Enterprise AI & Automated Sales Engineering")
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     catalog = build_entity_catalog(ctx)
@@ -292,35 +431,42 @@ async def process_transcript_with_gemini(
         for turn in conversation_history[-12:]
     )
     try:
-        # Fast path: skip the classification round trip only when the turn is
-        # unambiguously addressed to the agent — the wake name opens the sentence
-        # and a self-contained company question follows. Anything less certain
-        # ("I asked Tiya about pricing", "was Tiya's answer right, Sam?") still needs
-        # the LLM addressee gate below, which is the whole point of that call.
-        if (
-            is_directly_addressed(transcript, bot_name)
-            and requires_company_knowledge(transcript, catalog)
-            and not needs_context_resolution(transcript)
-        ):
-            logger.info("[Agent Route] Fast path: skipped classification round trip")
-            analysis = TurnAnalysis(
-                response_action="respond",
-                intent="company_knowledge",
-                resolved_query=transcript,
-                corrections=[],
-            )
-            return await _generate_grounded_reply(
-                analysis=analysis,
-                transcript=transcript,
-                speaker=speaker,
-                bot_name=bot_name,
-                company_name=company_name,
-                history_text=history_text,
-                catalog=catalog,
-                auth_token=auth_token,
-                client_id=client_id,
-                preferred_model=preferred_model,
-            )
+        # Fast path: skip the classification round trip when the turn is
+        # unambiguously addressed to the agent. The answer model already
+        # receives conversation history and can resolve pronouns on its own,
+        # so we no longer require needs_context_resolution to be False.
+        # Also handles greetings directly, skipping the routing LLM entirely.
+        if is_directly_addressed(transcript, bot_name):
+            if requires_company_knowledge(transcript, catalog):
+                logger.info("[Agent Route] Fast path: company knowledge (no routing LLM)")
+                analysis = TurnAnalysis(
+                    response_action="respond",
+                    intent="company_knowledge",
+                    resolved_query=transcript,
+                    corrections=[],
+                )
+                rag_task = asyncio.create_task(
+                    query_spiked_rag(transcript, auth_token, client_id)
+                )
+                return await _generate_grounded_reply(
+                    analysis=analysis,
+                    transcript=transcript,
+                    speaker=speaker,
+                    bot_name=bot_name,
+                    company_name=company_name,
+                    history_text=history_text,
+                    catalog=catalog,
+                    auth_token=auth_token,
+                    client_id=client_id,
+                    preferred_model=preferred_model,
+                    rag_precomputed=rag_task,
+                )
+            # Greeting / social fast path: "Tom, hello", "Tom, how are you"
+            remainder = _strip_wake_name(transcript, bot_name).strip().lower()
+            _social_words = {"hello", "hi", "hey", "good", "morning", "afternoon", "evening", "how", "what's", "whats"}
+            if any(w in remainder.split() for w in _social_words) or remainder.rstrip("?!") in ("hello", "hi", "hey"):
+                logger.info("[Agent Route] Fast path: social greeting (no routing LLM)")
+                return normalize_reply(f"Hey {speaker}! How can I help you today?")
 
         analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn.
 Company: {company_name}
@@ -408,8 +554,14 @@ async def _generate_grounded_reply(
     auth_token: str,
     client_id: Optional[str],
     preferred_model: str,
+    rag_precomputed: Optional[asyncio.Task] = None,
 ) -> Optional[str]:
-    """Run RAG when the intent requires it, then produce the spoken reply."""
+    """Run RAG when the intent requires it, then produce the spoken reply.
+
+    When *rag_precomputed* is an asyncio.Task (fired in parallel with the caller),
+    it is awaited instead of launching a new query — this shaves the full RAG
+    round-trip off the hot path.
+    """
 
     corrections = [item.model_dump() for item in analysis.corrections]
     corrected_transcript = apply_validated_corrections(transcript, corrections, catalog)
@@ -422,27 +574,41 @@ async def _generate_grounded_reply(
     reply_sentence_limit = 4 if detailed_request else 2
     rag_result = ""
     rag_used = analysis.intent == "company_knowledge"
+    rag_fallback = False
     if rag_used:
-        rag_result = await query_spiked_rag(resolved_query, auth_token, client_id)
+        if rag_precomputed is not None:
+            rag_result = await rag_precomputed
+        else:
+            rag_result = await query_spiked_rag(resolved_query, auth_token, client_id)
         if not rag_result or any(marker in rag_result.lower() for marker in (
-            "could not retrieve", "no specific documentation", "an error occurred"
+            "could not retrieve", "no specific documentation", "an error occurred",
+            "no relevant information",
         )):
-            logger.warning("[Agent Route] RAG unavailable for addressed knowledge turn")
-            return "I don’t have verified information on that available right now."
+            logger.info("[Agent Route] RAG empty; falling back to general knowledge")
+            rag_result = ""
+            rag_fallback = True
 
-    answer_prompt = f"""You are {bot_name}, a concise meeting participant representing {company_name}.
-Answer {speaker}'s addressed turn naturally for spoken delivery.
-Use at most {reply_sentence_limit} sentences and {reply_word_limit} words. No markdown, lists, filler, sales pitch, or automatic follow-up question.
+    answer_prompt = f"""You are {bot_name}, a natural and conversational meeting participant representing {company_name}.
+Answer {speaker}'s addressed turn as a real person would in a live conversation — warm, clear, and concise.
+Use at most {reply_sentence_limit} sentences and {reply_word_limit} words. No markdown, lists, or filler.
 Use the speaker's first name only if it improves a greeting or clarification.
-Never invent facts.
+Never invent facts about {company_name}'s products or services.
+
+CRITICAL — end every reply with a short natural question that keeps the conversation flowing. The question must be:
+- Contextually relevant to what was just discussed
+- Something the other person would naturally want to answer
+- Short (under 12 words)
+Good examples: "Does that align with what you had in mind?", "Want me to go deeper on any of that?", "Shall I walk you through the next steps?"
+Bad examples: generic "How can I help?" or "Any other questions?" — these feel robotic.
 
 Intent: {analysis.intent}
 Corrected turn: {corrected_transcript}
 Resolved meaning: {resolved_query}
 Recent finalized conversation:
 {history_text}
-Verified RAG facts (the only source for company facts):
-{rag_result if rag_used else '(not required for this intent)'}"""
+Verified RAG facts (the only source for company-specific facts):
+{rag_result if rag_used and not rag_fallback else '(not available — use your general knowledge)'}
+{'Note: no company documentation was found for this question. Answer using your general knowledge, but be clear you are speaking generally rather than on behalf of ' + company_name + '.' if rag_fallback else ''}"""
     response = await gemini_client.aio.models.generate_content(
         model=preferred_model,
         contents=answer_prompt,
@@ -468,7 +634,8 @@ def health_check():
     return {
         "status": "ok",
         "service": "LiveAvatar-Spiked",
-        "deepgram_configured": bool(DEEPGRAM_API_KEY),
+        "stt_provider": "groq-whisper-large-v3-turbo" if GROQ_API_KEY else "none",
+        "groq_configured": bool(GROQ_API_KEY),
         "gemini_configured": bool(GEMINI_API_KEY),
         "gemini_model": GEMINI_MODEL,
         "recall_configured": bool(RECALL_API_KEY),
@@ -713,6 +880,223 @@ async def _speak_reply(run: Dict[str, Any], turn_id: int, text: str) -> None:
         await emit({"type": "avatar_speak_end", "turn_id": turn_id})
 
 
+async def _generate_and_stream_reply(
+    run: Dict[str, Any],
+    turn_id: int,
+    analysis: TurnAnalysis,
+    transcript: str,
+    speaker: str,
+    bot_name: str,
+    company_name: str,
+    history_text: str,
+    catalog: List[str],
+    auth_token: str,
+    client_id: Optional[str],
+    preferred_model: str,
+    rag_precomputed: Optional[asyncio.Task] = None,
+) -> Optional[str]:
+    """Stream Gemini tokens directly into Cartesia TTS for minimal latency.
+
+    Instead of waiting for the full answer then sending it to TTS, this function
+    buffers streaming Gemini output into sentences and sends each sentence to
+    Cartesia as soon as it's complete. The avatar starts speaking while Gemini
+    is still generating the rest of the answer.
+    """
+    corrections = [item.model_dump() for item in analysis.corrections]
+    corrected_transcript = apply_validated_corrections(transcript, corrections, catalog)
+    resolved_query = analysis.resolved_query.strip() or corrected_transcript
+    detailed_request = any(
+        phrase in transcript.casefold()
+        for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive")
+    )
+    reply_word_limit = 90 if detailed_request else AGENT_MAX_REPLY_WORDS
+    reply_sentence_limit = 4 if detailed_request else 2
+    rag_result = ""
+    rag_used = analysis.intent == "company_knowledge"
+    rag_fallback = False
+    if rag_used:
+        if rag_precomputed is not None:
+            rag_result = await rag_precomputed
+        else:
+            rag_result = await query_spiked_rag(resolved_query, auth_token, client_id)
+        if not rag_result or any(marker in rag_result.lower() for marker in (
+            "could not retrieve", "no specific documentation", "an error occurred",
+            "no relevant information",
+        )):
+            logger.info("[Agent Route] RAG empty; falling back to general knowledge")
+            rag_result = ""
+            rag_fallback = True
+
+    answer_prompt = f"""You are {bot_name}, a natural and conversational meeting participant representing {company_name}.
+Answer {speaker}'s addressed turn as a real person would in a live conversation — warm, clear, and concise.
+Use at most {reply_sentence_limit} sentences and {reply_word_limit} words. No markdown, lists, or filler.
+Use the speaker's first name only if it improves a greeting or clarification.
+Never invent facts about {company_name}'s products or services.
+
+CRITICAL — end every reply with a short natural question that keeps the conversation flowing. The question must be:
+- Contextually relevant to what was just discussed
+- Something the other person would naturally want to answer
+- Short (under 12 words)
+Good examples: "Does that align with what you had in mind?", "Want me to go deeper on any of that?", "Shall I walk you through the next steps?"
+Bad examples: generic "How can I help?" or "Any other questions?" — these feel robotic.
+
+Intent: {analysis.intent}
+Corrected turn: {corrected_transcript}
+Resolved meaning: {resolved_query}
+Recent finalized conversation:
+{history_text}
+Verified RAG facts (the only source for company-specific facts):
+{rag_result if rag_used and not rag_fallback else '(not available — use your general knowledge)'}
+{'Note: no company documentation was found for this question. Answer using your general knowledge, but be clear you are speaking generally rather than on behalf of ' + company_name + '.' if rag_fallback else ''}"""
+
+    if not run.get("control_ws"):
+        logger.warning("[Agent] Control socket unavailable for streaming turn_id=%s", turn_id)
+        return None
+
+    async def emit(payload: dict) -> None:
+        await _ws_send(run, payload)
+
+    full_text = ""
+    try:
+        sentence_buf = ""
+        word_count = 0
+        await emit({"type": "avatar_speak", "text": "", "turn_id": turn_id})
+        stream = await gemini_client.aio.models.generate_content_stream(
+            model=preferred_model,
+            contents=answer_prompt,
+            config=types.GenerateContentConfig(max_output_tokens=120),
+        )
+        async for chunk in stream:
+            token = getattr(chunk, "text", None) or ""
+            if not token:
+                continue
+            full_text += token
+            sentence_buf += token
+            word_count += len(token.split())
+            while _SENTENCE_BREAKS.search(sentence_buf):
+                match = _SENTENCE_BREAKS.search(sentence_buf)
+                sentence, sentence_buf = sentence_buf[:match.end()].strip(), sentence_buf[match.end():]
+                if sentence and word_count <= reply_word_limit:
+                    await _send_sentence_tts(emit, sentence, turn_id)
+            if word_count >= reply_word_limit:
+                break
+        remaining = sentence_buf.strip()
+        if remaining and word_count <= reply_word_limit + 10:
+            await _send_sentence_tts(emit, remaining, turn_id)
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+        reply = normalize_reply(full_text, reply_word_limit, reply_sentence_limit)
+        logger.info(
+            "[Agent Stream] speaker=%s intent=%s rag_used=%s words=%d",
+            speaker, analysis.intent, rag_used, len(reply.split()),
+        )
+        return reply or None
+    except asyncio.CancelledError:
+        logger.info("[Agent Stream] Cancelled turn_id=%s", turn_id)
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+        raise
+    except Exception:
+        logger.error("[Agent Stream] Failed turn_id=%s", turn_id, exc_info=True)
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+        return None
+
+
+async def _send_sentence_tts(emit, sentence: str, turn_id: int) -> None:
+    """Send one sentence through Cartesia TTS and stream PCM to avatar."""
+    if not sentence.strip():
+        return
+    frame = bytearray()
+    try:
+        async for tts_chunk in stream_cartesia_tts(sentence):
+            frame.extend(tts_chunk)
+            while len(frame) >= SIMLI_AUDIO_CHUNK_BYTES:
+                piece = bytes(frame[:SIMLI_AUDIO_CHUNK_BYTES])
+                del frame[:SIMLI_AUDIO_CHUNK_BYTES]
+                await emit({
+                    "type": "avatar_audio",
+                    "data": base64.b64encode(piece).decode("ascii"),
+                    "turn_id": turn_id,
+                })
+        if frame:
+            await emit({
+                "type": "avatar_audio",
+                "data": base64.b64encode(bytes(frame)).decode("ascii"),
+                "turn_id": turn_id,
+            })
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("[TTS] Sentence TTS failed: %s", sentence[:40], exc_info=True)
+
+
+# Sentence-boundary characters for splitting streaming Gemini output into
+# Cartesia-friendly chunks. Each chunk is small enough to keep latency low
+# while producing natural prosody.
+_SENTENCE_BREAKS = re.compile(r'(?<=[.!?])\s+')
+
+
+async def _stream_tts_for_reply(
+    run: Dict[str, Any],
+    turn_id: int,
+    text: str,
+) -> None:
+    """Stream TTS for a complete answer, breaking it into sentence-sized
+    Cartesia calls so the first sentence starts speaking immediately."""
+    if not run.get("control_ws"):
+        return
+
+    async def emit(payload: dict) -> None:
+        await _ws_send(run, payload)
+
+    try:
+        await emit({"type": "avatar_speak", "text": text, "turn_id": turn_id})
+        sentences = _SENTENCE_BREAKS.split(text)
+        # Merge very short fragments to avoid excessive Cartesia round-trips.
+        merged: List[str] = []
+        buf = ""
+        for s in sentences:
+            buf = f"{buf} {s}".strip() if buf else s
+            if len(buf) >= 60 or s.rstrip().endswith((".", "!", "?")):
+                merged.append(buf)
+                buf = ""
+        if buf:
+            merged.append(buf)
+
+        for sentence in merged:
+            if not sentence.strip():
+                continue
+            frame = bytearray()
+            try:
+                async for chunk in stream_cartesia_tts(sentence):
+                    frame.extend(chunk)
+                    while len(frame) >= SIMLI_AUDIO_CHUNK_BYTES:
+                        piece = bytes(frame[:SIMLI_AUDIO_CHUNK_BYTES])
+                        del frame[:SIMLI_AUDIO_CHUNK_BYTES]
+                        await emit({
+                            "type": "avatar_audio",
+                            "data": base64.b64encode(piece).decode("ascii"),
+                            "turn_id": turn_id,
+                        })
+                if frame:
+                    await emit({
+                        "type": "avatar_audio",
+                        "data": base64.b64encode(bytes(frame)).decode("ascii"),
+                        "turn_id": turn_id,
+                    })
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[TTS] Sentence TTS failed, continuing: %s", sentence[:40], exc_info=True)
+                continue
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+        logger.info("[TTS] Streamed reply turn_id=%s sentences=%d chars=%d", turn_id, len(merged), len(text))
+    except asyncio.CancelledError:
+        logger.info("[TTS] Cancelled reply turn_id=%s", turn_id)
+        raise
+    except Exception:
+        logger.error("[TTS] Failed to stream reply turn_id=%s", turn_id, exc_info=True)
+        await emit({"type": "avatar_speak_end", "turn_id": turn_id})
+
+
 async def _deploy_live_avatar_bot(
     meeting_url: str,
     token: str,
@@ -734,7 +1118,7 @@ async def _deploy_live_avatar_bot(
         recall_ws_token = uuid.uuid4().hex
 
         # 1. Create a Simli session (free plan). Simli renders + lip-syncs only;
-        #    Deepgram STT, Gemini LLM and Cartesia TTS all run in this process.
+        #    Groq Whisper STT, Gemini LLM and Cartesia TTS all run in this process.
         simli_session_token = await create_simli_session()
 
         # 2. Store session credentials for Recall's avatar.html
@@ -1031,7 +1415,7 @@ def _push_heard(
     reason: str,
 ) -> None:
     """Mirror the gate's verdict onto the avatar page's debug overlay."""
-    if not run.get("control_ws"):
+    if not AGENT_DEBUG_OVERLAY or not run.get("control_ws"):
         return
 
     async def send() -> None:
@@ -1170,7 +1554,7 @@ def _finalize_turn(
     transcript: str,
 ) -> None:
     now = time.monotonic()
-    bot_name = run.get("bot_name") or "Tiya"
+    bot_name = run.get("bot_name") or "Tom"
     floor: FloorState = run["floor"]
     governor: SpeechGovernor = run["governor"]
 
@@ -1229,13 +1613,18 @@ def _finalize_turn(
 
     async def respond() -> None:
         try:
-            answer = await process_transcript_with_gemini(
+            # Streaming path: route + generate + TTS all pipelined so
+            # the avatar starts speaking before Gemini finishes generating.
+            # _route_and_stream handles TTS internally when run+turn_id are given.
+            answer = await _route_and_stream(
                 transcript=transcript,
                 speaker=participant_name,
                 conversation_history=history_snapshot,
                 auth_token=run.get("token") or "",
                 client_id=run.get("client_id"),
                 user_context=run.get("user_context") or {},
+                run=run,
+                turn_id=turn_id,
             )
             if turn_id != run.get("active_turn_id"):
                 logger.info("[Agent] Discarded stale response turn_id=%s", turn_id)
@@ -1245,11 +1634,8 @@ def _finalize_turn(
                 return
 
             spoken_at = time.monotonic()
-            if governor.is_duplicate(answer, spoken_at):
-                logger.info("[Governor] Suppressed duplicate reply turn_id=%s", turn_id)
-                _release_floor(run, spoken_at)
-                return
-
+            # Note: TTS was already streamed by _route_and_stream, so we
+            # skip _stream_tts_for_reply here and just record bookkeeping.
             control_ws = run.get("control_ws")
             if not control_ws:
                 logger.warning("[Agent] Avatar control socket unavailable for turn_id=%s", turn_id)
@@ -1258,11 +1644,9 @@ def _finalize_turn(
 
             history.append({"speaker": bot_name, "participant_id": "bot", "text": answer})
             del history[:-40]
-            # Register before dispatch: the echo can return before the socket ack.
             run["echo"].note_bot_speech(answer, spoken_at)
             governor.note_reply(answer, spoken_at)
             run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
-            await _speak_reply(run, turn_id, answer)
         except asyncio.CancelledError:
             logger.info("[Agent] Cancelled superseded turn_id=%s", turn_id)
         except Exception:
@@ -1273,6 +1657,15 @@ def _finalize_turn(
 
 
 class ParticipantTranscriber:
+    """Streaming STT via Groq Whisper with energy-based VAD."""
+
+    _SILENCE_THRESHOLD = 350
+    _SILENCE_TIMEOUT_MS = 400
+    _MIN_SPEECH_MS = 200
+    _MAX_SEGMENT_MS = 12_000
+    _SAMPLE_RATE = 16000
+    _BYTES_PER_SAMPLE = 2
+
     def __init__(
         self,
         participant_id: str,
@@ -1284,81 +1677,107 @@ class ParticipantTranscriber:
         self.participant_name = participant_name
         self.keywords = keywords
         self.on_utterance = on_utterance
-        self.ws: Any = None
-        self.receiver_task: Optional[asyncio.Task] = None
-        self.buffer = FinalUtteranceBuffer()
-        self.start_lock = asyncio.Lock()
+        self._pcm_buf = bytearray()
+        self._has_speech = False
+        self._last_speech_time: float = 0.0
+        self._started_at: float = 0.0
+        self._lock = asyncio.Lock()
+        self._closed = False
+        self._flush_task: Optional[asyncio.Task] = None
 
     async def ensure_started(self) -> None:
-        if self.ws:
-            return
-        async with self.start_lock:
-            if self.ws:
-                return
-            params = {
-                "model": "nova-3",
-                "encoding": "linear16",
-                "sample_rate": "16000",
-                "channels": "1",
-                "smart_format": "true",
-                "interim_results": "true",
-                "endpointing": str(AGENT_ENDPOINTING_MS),
-                "utterance_end_ms": str(AGENT_UTTERANCE_END_MS),
-                "vad_events": "true",
-                "punctuate": "true",
-            }
-            url = f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
-            keyterms: List[str] = []
-            keyterm_tokens = 0
-            for item in self.keywords[:100]:
-                if not item or not item.strip():
-                    continue
-                estimated_tokens = max(1, len(item.split()))
-                if keyterm_tokens + estimated_tokens > 450:
-                    break
-                keyterms.append(item.strip())
-                keyterm_tokens += estimated_tokens
-            if keyterms:
-                url += "&" + "&".join(f"keyterm={quote(item.strip())}" for item in keyterms)
-            headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-            try:
-                self.ws = await websockets.connect(url, additional_headers=headers)
-            except TypeError:
-                self.ws = await websockets.connect(url, extra_headers=headers)
-            self.receiver_task = asyncio.create_task(self._receive())
-            logger.info(
-                "[Deepgram] Connected participant_id=%s participant_name=%s",
-                self.participant_id,
-                self.participant_name,
-            )
+        pass
 
     async def send(self, pcm: bytes) -> None:
-        await self.ensure_started()
-        await self.ws.send(pcm)
-
-    async def _receive(self) -> None:
-        try:
-            while True:
-                data = json.loads(await self.ws.recv())
-                utterance = self.buffer.add_result(data)
-                if utterance:
-                    self.on_utterance(self.participant_id, self.participant_name, utterance)
-                if data.get("type") == "Error":
-                    logger.error("[Deepgram] participant_id=%s error=%s", self.participant_id, data)
-        except (ConnectionClosed, asyncio.CancelledError):
-            pass
-        except Exception:
-            logger.error("[Deepgram] Receiver failed participant_id=%s", self.participant_id, exc_info=True)
+        if self._closed or not pcm:
+            return
+        async with self._lock:
+            self._pcm_buf.extend(pcm)
+            now = time.monotonic()
+            rms = self._pcm_rms(pcm)
+            if rms >= self._SILENCE_THRESHOLD:
+                if not self._has_speech:
+                    self._started_at = now
+                self._has_speech = True
+                self._last_speech_time = now
+            elif self._has_speech:
+                elapsed_ms = (now - self._last_speech_time) * 1000
+                if elapsed_ms >= self._SILENCE_TIMEOUT_MS:
+                    await self._flush()
+                    return
+                total_ms = (now - self._started_at) * 1000
+                if total_ms >= self._MAX_SEGMENT_MS:
+                    await self._flush()
+                    return
 
     async def close(self) -> None:
-        if self.ws:
-            try:
-                await self.ws.send(json.dumps({"type": "CloseStream"}))
-                await self.ws.close()
-            except Exception:
-                pass
-        if self.receiver_task:
-            self.receiver_task.cancel()
+        self._closed = True
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        async with self._lock:
+            if self._pcm_buf and self._has_speech:
+                await self._flush_nolock()
+
+    @staticmethod
+    def _pcm_rms(pcm: bytes) -> float:
+        if len(pcm) < 2:
+            return 0.0
+        count = len(pcm) // 2
+        samples = struct.unpack(f"<{count}h", pcm[: count * 2])
+        return (sum(s * s for s in samples) / count) ** 0.5
+
+    async def _flush(self) -> None:
+        await self._flush_nolock()
+
+    async def _flush_nolock(self) -> None:
+        pcm = bytes(self._pcm_buf)
+        self._pcm_buf.clear()
+        self._has_speech = False
+        if not pcm:
+            return
+        duration_ms = len(pcm) / (self._SAMPLE_RATE * self._BYTES_PER_SAMPLE / 1000)
+        if duration_ms < self._MIN_SPEECH_MS:
+            return
+        self._flush_task = asyncio.create_task(self._transcribe(pcm))
+
+    async def _transcribe(self, pcm: bytes) -> None:
+        if self._closed or not GROQ_API_KEY:
+            return
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self._SAMPLE_RATE)
+            wf.writeframes(pcm)
+        wav_bytes = wav_buf.getvalue()
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                    data={
+                        "model": "whisper-large-v3-turbo",
+                        "language": "en",
+                        "temperature": "0",
+                        "response_format": "json",
+                    },
+                )
+                if resp.status_code == 429:
+                    logger.warning("[GroqWhisper] Rate-limited, dropping segment")
+                    return
+                if resp.status_code != 200:
+                    logger.error("[GroqWhisper] Transcription failed %s: %s", resp.status_code, resp.text[:200])
+                    return
+                text = (resp.json().get("text") or "").strip()
+                if text:
+                    logger.info("[GroqWhisper] participant=%s text=%r", self.participant_name, text)
+                    self.on_utterance(self.participant_id, self.participant_name, {"text": text, "words": []})
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error("[GroqWhisper] Transcription error", exc_info=True)
 
 
 @app.websocket("/ws/control/{run_id}")
@@ -1370,6 +1789,25 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
     await websocket.accept()
     run["control_ws"] = websocket
     logger.info("[Control WS] Avatar connected run_id=%s", run_id)
+    
+    # Send initial greeting after avatar connects
+    async def send_initial_greeting():
+        await asyncio.sleep(2)  # Wait for avatar to be ready
+        bot_name = run.get("bot_name", "Tom")
+        greeting = f"Hello! I'm {bot_name}, an AI agent from SpikedAI. I'm your digital twin and I'm here to help you with any questions or tasks you might have. How can I assist you today?"
+        turn_id = run.get("turn_counter", 0) + 1
+        run["turn_counter"] = turn_id
+        run["active_turn_id"] = turn_id
+        run["state"] = AgentState.SPEAKING
+        
+        # Stream the greeting via TTS
+        try:
+            await _stream_tts_for_reply(run, turn_id, greeting)
+        except Exception as e:
+            logger.error("[Greeting] Failed to send initial greeting: %s", e)
+    
+    asyncio.create_task(send_initial_greeting())
+    
     try:
         while True:
             event = await websocket.receive_json()
@@ -1414,7 +1852,8 @@ async def recall_separate_audio_endpoint(
     ):
         await websocket.close(code=4401)
         return
-    if not DEEPGRAM_API_KEY:
+    if not GROQ_API_KEY:
+        logger.error("[Recall WS] GROQ_API_KEY not set — cannot transcribe")
         await websocket.close(code=1011)
         return
 
@@ -1424,7 +1863,7 @@ async def recall_separate_audio_endpoint(
         client_id=run.get("client_id"),
         auth_token=run.get("token"),
     )
-    user_context["bot_name"] = run.get("bot_name") or "Tiya"
+    user_context["bot_name"] = run.get("bot_name") or "Tom"
     run["user_context"] = user_context
     keywords = build_entity_catalog(user_context)
     transcribers: Dict[str, ParticipantTranscriber] = {}

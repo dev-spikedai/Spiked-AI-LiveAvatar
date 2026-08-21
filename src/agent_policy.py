@@ -101,7 +101,7 @@ def detect_invocation(text: str, bot_name: str) -> InvocationDecision:
                 index += 1
         return collapsed
 
-    configured = (bot_name or "Tiya").strip()
+    configured = (bot_name or "Tom").strip()
     configured_words = normalized_words(configured) or ["tom"]
     aliases = {tuple(configured_words)}
     compact_name = "".join(configured_words)
@@ -208,7 +208,7 @@ _ANAPHORA = frozenset({
 def is_directly_addressed(text: str, bot_name: str) -> bool:
     """True when the turn opens by naming the agent, then asks something.
 
-    "Tiya, what is your pricing?" is unambiguous. "I asked Tiya about pricing" puts
+    "Tom, what is your pricing?" is unambiguous. "I asked Tom about pricing" puts
     the name mid-sentence and is a third-person mention, so it must not qualify —
     resolving that correctly needs the LLM addressee gate, not a regex.
     """
@@ -226,7 +226,7 @@ def is_directly_addressed(text: str, bot_name: str) -> bool:
     if not remainder:
         return False
     # A trailing "?" is the strongest signal. Otherwise only a direct imperative
-    # counts: "Tiya is great at pricing" opens with the name and reads as
+    # counts: "Tom is great at pricing" opens with the name and reads as
     # question-shaped to a looser check, but it is a statement about her.
     # Anything else falls through to the LLM gate, which costs latency, not
     # correctness.
@@ -238,6 +238,11 @@ def needs_context_resolution(text: str) -> bool:
 
     A self-contained question can go straight to retrieval, skipping a full
     model round trip. Anything referring back to prior turns cannot.
+
+    NOTE: the fast path in live_avatar.py no longer calls this for the
+    company-knowledge route — the answer model receives conversation history
+    and can resolve pronouns on its own, saving one LLM round trip per turn.
+    This function is still used by callers that need strict anaphora gating.
     """
 
     words = re.sub(r"[^a-z0-9' ]+", " ", (text or "").casefold()).split()
