@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ./src ./src
 COPY ./public ./public
+# src/core/persona.py reads this at import; without it the service cannot start.
+COPY ./prompts ./prompts
 
 EXPOSE 8080
 

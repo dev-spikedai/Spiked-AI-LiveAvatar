@@ -47,7 +47,7 @@ from src.call_intelligence import CallIntelligence
 from src.providers import registry as provider_registry
 from src.providers.base import RunContext, TurnContext, VideoProvider, VideoSession
 
-from src.core import protocol, speech
+from src.core import persona, protocol, speech
 from src.core.asr import (
     AGENT_ENDPOINTING_MS,
     AGENT_UTTERANCE_END_MS,
@@ -1017,12 +1017,10 @@ async def _generate_grounded_reply(
         # an ... avatar" here previously read as background about someone
         # else, not an instruction for who is answering, and produced replies
         # like "Tom would explain..." instead of Tom actually answering.
-        persona_hint = (
-            f" (You are {bot_name}, a Solution Architect avatar, not the pitch person — "
-            f"answer as {bot_name}, first person, under {reply_word_limit} words, "
-            f"end with a relevant question.)"
+        persona_hint = persona.block(
+            "retrieval_hint", bot_name=bot_name, reply_word_limit=reply_word_limit
         )
-        shaped_query = f"{resolved_query}{persona_hint}"
+        shaped_query = f"{resolved_query} {persona_hint}"
 
         stream_enabled = run is not None and turn_id is not None
         # Kick off the filler line as a background task (not awaited here) so
@@ -1153,9 +1151,7 @@ Your next_question should be the question you think {speaker} should ask the roo
     else:
         task_block = f"""Answer {speaker}'s addressed turn."""
 
-    answer_prompt = f"""You are {bot_name}, an American Solution Architect representing {company_name} in this meeting.
-You are the technical authority supporting the sales rep. You are not the salesperson, and you never pitch.
-You are concise, conversational, and technically credible. Never invent facts.
+    answer_prompt = f"""{persona.block("identity", bot_name=bot_name, company_name=company_name)}
 {f'{chr(10)}Who is speaking: {dossier}' if dossier else ''}{f'{chr(10)}Aim the answer at what this person is accountable for. A finance stakeholder and an engineering stakeholder need the same fact framed differently.' if dossier else ''}
 {task_block}
 
@@ -1235,14 +1231,14 @@ async def _judge_interjection(
     right now". Runs only for turns that already cleared the cheap heuristic,
     so the extra call is bounded, not per-sentence.
     """
-    judgment_prompt = f"""You are judging whether {bot_name}, a Solution Architect silently sitting in on this sales call, should interrupt the conversation right now with unsolicited input — nobody asked him anything.
+    judgment_prompt = f"""{persona.block("interjection_framing", bot_name=bot_name)}
 
 Recent finalized conversation:
 {history_text}
 
 The moment in question: {transcript}
 
-{bot_name} has a warmed, accurate answer ready. Set worth_interjecting to true ONLY if staying silent would let something real go wrong: a wrong technical assumption is being stated as fact, a decision-blocking gap is being glossed over, or a genuine risk/compliance issue is going unmentioned. Do NOT set it true just because the knowledge base happens to cover the topic, or because the answer would be a nice-to-have addition — a real solution architect lets most things pass without comment. When in doubt, false.
+{persona.block("interjection_bar", bot_name=bot_name)}
 
 confidence should reflect how clearly this crosses that bar, not how confident you are in the answer's factual accuracy.
 reason: one short clause, for an internal audit log a sales rep will read."""
@@ -1640,6 +1636,20 @@ async def _deploy_live_avatar_bot(
             tts=pick_provider(tts_provider, overrides.get("tts_provider"), DEFAULT_TTS_PROVIDER),
             answer=pick_provider(answer_engine, overrides.get("answer_engine"), DEFAULT_ANSWER_ENGINE),
         )
+        # Only the vendor-brain path needs a persona string, and only that path
+        # pays for the lookup it requires.
+        vendor_persona = None
+        if provider_set.is_delegated:
+            company = await get_user_keywords_and_products(
+                user_id=user_id, client_id=client_id, auth_token=token
+            )
+            vendor_persona = persona.block(
+                "vendor_system_prompt",
+                bot_name=bot_name,
+                company_name=company.get("company_name", "SpikedAI"),
+                reply_word_limit=AGENT_MAX_REPLY_WORDS,
+            )
+
         video_session = await provider_set.video.create_session(RunContext(
             run_id=run_id,
             bot_name=bot_name,
@@ -1647,6 +1657,7 @@ async def _deploy_live_avatar_bot(
             user_id=user_id,
             auth_token=token,
             avatar_id=avatar_id,
+            persona_prompt=vendor_persona,
         ))
         avatar_session = video_session.credentials
 
