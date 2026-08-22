@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import logging
+import random
 import re
 import sys
 import time
@@ -40,6 +41,21 @@ from src.agent_policy import (
 
 from src.call_intelligence import CallIntelligence
 
+# Listening moved to the core: it is the same in every provider configuration,
+# because the agent hears the meeting through Recall, never through the avatar.
+# Re-exported here so existing references keep resolving during the migration.
+from src.providers import registry as provider_registry
+from src.providers.base import RunContext, VideoProvider, VideoSession
+
+from src.core import protocol
+from src.core.asr import (
+    AGENT_ENDPOINTING_MS,
+    AGENT_UTTERANCE_END_MS,
+    DEEPGRAM_API_KEY,
+    DEEPGRAM_MIN_UTTERANCE_END_MS,
+    ParticipantTranscriber,
+)
+
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -76,7 +92,7 @@ logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handle
 logger = logging.getLogger("LiveAvatar-Spiked")
 
 # Environment variables
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API") or os.getenv("DEEPGRAM_API_KEY", "")
+# (DEEPGRAM_API_KEY and the Deepgram tuning constants now live in src/core/asr.py)
 GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
@@ -109,22 +125,25 @@ PUBLIC_BASE_URL = os.getenv(
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
 AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
-AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
-# Deepgram rejects the whole connection with HTTP 400 when utterance_end_ms is
-# below 1000, which manifests as an agent that hears nothing at all rather than
-# as a config error. Clamped rather than trusted: a tuning value must not be
-# able to silently deafen the bot.
-DEEPGRAM_MIN_UTTERANCE_END_MS = 1000
-_requested_utterance_end_ms = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
-AGENT_UTTERANCE_END_MS = max(_requested_utterance_end_ms, DEEPGRAM_MIN_UTTERANCE_END_MS)
-if _requested_utterance_end_ms < DEEPGRAM_MIN_UTTERANCE_END_MS:
-    logger.warning(
-        "[Deepgram] AGENT_UTTERANCE_END_MS=%d is below the API minimum; using %d",
-        _requested_utterance_end_ms,
-        AGENT_UTTERANCE_END_MS,
-    )
+# Fallbacks only. A run that names its providers explicitly (or resolves them
+# from per-client config) ignores these entirely -- see registry.resolve.
+DEFAULT_VIDEO_PROVIDER = os.getenv("DEFAULT_VIDEO_PROVIDER", "liveavatar")
+DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER") or None
+DEFAULT_ANSWER_ENGINE = os.getenv("DEFAULT_ANSWER_ENGINE", "spiked")
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
 DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
+# Spoken while the RAG call is in flight, on the company_knowledge path only
+# (see _generate_grounded_reply): masks the ~1-2s network+retrieval+generation
+# gap between "Tom decides to answer" and "the answer is actually ready"
+# instead of leaving dead air. Short on purpose -- roughly the low end of
+# real RAG latency, not padding meant to run the clock out. Several variants
+# so back-to-back company_knowledge turns don't say the identical line twice.
+COMPANY_KNOWLEDGE_FILLER_PHRASES = [
+    "Yeah, let me check the docs real quick.",
+    "Good question, one sec, pulling that up.",
+    "Let me check on that real quick.",
+    "One sec, let me pull that up.",
+]
 # Retrieval budget on the live speak path. Nobody is waiting on a prefetch, so
 # that path passes AGENT_RAG_PREFETCH_TIMEOUT_S instead.
 AGENT_RAG_TIMEOUT_S = float(os.getenv("AGENT_RAG_TIMEOUT_S", "12"))
@@ -283,6 +302,9 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
     autospeak_enabled: bool = Field(default=False, description="Level 1.5: let the agent take the floor unprompted for high-value moments, capped per run")
+    video_provider: str = Field(default=DEFAULT_VIDEO_PROVIDER, description="Face: liveavatar | anam | simli")
+    tts_provider: Optional[str] = Field(default=DEFAULT_TTS_PROVIDER, description="Voice; required only for video providers that just lip-sync")
+    answer_engine: str = Field(default=DEFAULT_ANSWER_ENGINE, description="Brain: spiked | anam_native")
 
 
 class TranscriptCorrection(BaseModel):
@@ -377,6 +399,23 @@ async def get_avatar_js():
     if os.path.exists(js_path):
         return FileResponse(js_path)
     raise HTTPException(status_code=404, detail="avatar.js not found")
+
+
+@app.get("/providers/{module_name}")
+async def get_provider_module(module_name: str):
+    """Serve one provider's browser half.
+
+    avatar.js imports whatever `browser_module` from /credentials names, so this
+    route is the frontend end of the provider seam. The name is constrained to a
+    bare .js filename: it comes back from a URL the page was handed, and a path
+    like ../../.env would otherwise be served happily.
+    """
+    if not re.fullmatch(r"[a-z0-9_-]+\.js", module_name):
+        raise HTTPException(status_code=404, detail="Not found")
+    js_path = os.path.join(public_dir, "providers", module_name)
+    if os.path.exists(js_path):
+        return FileResponse(js_path, media_type="application/javascript")
+    raise HTTPException(status_code=404, detail=f"provider module {module_name} not found")
 
 # ---------------------------------------------------------------------------
 # RAG Helper: Query SpikedAI-Backend-One
@@ -570,10 +609,6 @@ async def query_spiked_rag(
                 ttfb, first_chunk_at if first_chunk_at is not None else -1, backend_total, playback_wait_s, total, len(result),
             )
 
-        # TEMPORARY (see TEMP_WIRING.md): the live Groq stream is currently
-        # failing platform-wide. When it yields one of its short error strings,
-        # fall back to the backend's cognitive (background) answer for the same
-        # question — same retrieval context, healthier model, just slower.
         lowered = result.lower()
         live_failed = lowered.startswith("error:") or any(m in lowered for m in BACKEND_STREAM_ERROR_MARKERS)
         if live_failed and AGENT_COGNITIVE_FALLBACK and cognitive_key:
@@ -944,8 +979,21 @@ async def _generate_grounded_reply(
         shaped_query = f"{resolved_query}{persona_hint}"
 
         stream_enabled = run is not None and turn_id is not None
+        # Kick off the filler line as a background task (not awaited here) so
+        # it starts speaking immediately while query_spiked_rag below runs
+        # concurrently -- masks the RAG round trip's latency instead of
+        # leaving dead air between "Tom decides to answer" and the answer
+        # actually being ready. _make_streaming_sentence_handler's first real
+        # dispatch awaits this task so the filler's audio and the real
+        # answer's audio never overlap.
+        filler_task = (
+            asyncio.create_task(_speak_chunk(
+                run, turn_id, f"{turn_id}-filler", random.choice(COMPANY_KNOWLEDGE_FILLER_PHRASES),
+            ))
+            if stream_enabled else None
+        )
         on_sentence, stream_state = (
-            _make_streaming_sentence_handler(run, turn_id, reply_word_limit)
+            _make_streaming_sentence_handler(run, turn_id, reply_word_limit, filler_task=filler_task)
             if stream_enabled else (None, None)
         )
         rag_result = await query_spiked_rag(
@@ -953,6 +1001,13 @@ async def _generate_grounded_reply(
             kyc_id=kyc_id, source_ids_task=source_ids_task, on_sentence=on_sentence,
         )
         source_ids_task = None  # consumed; a retry below must not double-await it
+        if filler_task is not None and not filler_task.done():
+            # RAG resolved (or degraded/errored) before the filler finished
+            # talking -- e.g. a cache hit. Let the filler finish playing
+            # rather than cutting it off mid-sentence; whatever comes next
+            # (a real chunk, or the degraded-answer fallback below) already
+            # waits for turn liveness before speaking, same as normal.
+            await filler_task
 
         if stream_enabled and stream_state["dispatched"]:
             # Already spoken chunk-by-chunk as it streamed in — the degraded/
@@ -1352,15 +1407,35 @@ async def invoke_agent(run_id: str, payload: Optional[InvokeAgentRequest] = None
 
 @app.get("/api/runs/{run_id}/credentials")
 async def get_run_credentials(run_id: str, token: Optional[str] = Query(None)):
-    """Provides LiveKit room credentials to avatar.html when loaded by Recall."""
+    """Tells avatar.html which provider it is rendering, and how to connect.
+
+    `browser_module` is the whole plug-and-play mechanism on the frontend: the
+    page imports whatever this names rather than being compiled against one
+    vendor's SDK. `credentials` stays provider-namespaced -- a shared shape
+    would only be the union of every vendor's fields wearing a disguise.
+    """
     run = _ACTIVE_RUNS.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found or expired")
-    return {
+
+    session: Optional[VideoSession] = run.get("video_session")
+    providers: Optional[provider_registry.ProviderSet] = run.get("providers")
+    payload: Dict[str, Any] = {
+        "protocol_version": protocol.PROTOCOL_VERSION,
         "session_id": run.get("session_id"),
+        # Legacy top-level LiveKit keys, still read by the current avatar.js.
         "livekit_url": run.get("livekit_url"),
         "livekit_token": run.get("livekit_token"),
     }
+    if session is not None and providers is not None:
+        payload.update({
+            "provider": session.provider,
+            "browser_module": providers.video.browser_module,
+            "accepts": providers.video.accepts,
+            "delegated": providers.is_delegated,
+            **session.credentials,
+        })
+    return payload
 
 @app.post("/create-live-avatar")
 async def create_avatar(payload: CreateLiveAvatarRequest):
@@ -1446,33 +1521,29 @@ async def create_avatar(payload: CreateLiveAvatarRequest):
             "session_token": session_token
         }
 
-async def _keep_avatar_session_alive(run_id: str, session_id: str) -> None:
-    """Ping LiveAvatar's keep-alive endpoint for the life of the run.
+async def _keep_avatar_session_alive(
+    run_id: str, provider: VideoProvider, session: VideoSession
+) -> None:
+    """Ping the provider's keep-alive for the life of the run.
 
-    LiveAvatar auto-closes sessions that see no join/interaction for a while;
-    Tom stays silent unless addressed, so without this a quiet stretch in a
-    meeting kills the avatar session out from under an otherwise-healthy run.
+    Provider-specific by delegation: LiveAvatar auto-closes sessions that see no
+    join/interaction for a while, and Tom stays silent unless addressed, so
+    without this a quiet stretch in a meeting kills the avatar session out from
+    under an otherwise-healthy run. Vendors that bound the session at creation
+    time report keepalive_interval_s == 0 and never reach here.
     """
-    la_headers = {"X-API-KEY": LIVEAVATAR_API_KEY, "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            while True:
-                await asyncio.sleep(LIVEAVATAR_KEEPALIVE_INTERVAL_S)
-                if run_id not in _ACTIVE_RUNS:
-                    return
-                try:
-                    resp = await client.post(
-                        f"{LIVEAVATAR_BASE_URL}/v1/sessions/keep-alive",
-                        headers=la_headers,
-                        json={"session_id": session_id},
-                    )
-                    if resp.status_code not in (200, 201):
-                        logger.warning(
-                            "[LiveAvatar] keep-alive for session %s -> %s: %s",
-                            session_id, resp.status_code, resp.text,
-                        )
-                except Exception:
-                    logger.warning("[LiveAvatar] keep-alive request failed for session %s", session_id, exc_info=True)
+        while True:
+            await asyncio.sleep(provider.keepalive_interval_s)
+            if run_id not in _ACTIVE_RUNS:
+                return
+            try:
+                await provider.keepalive(session)
+            except Exception:
+                logger.warning(
+                    "[%s] keep-alive request failed for session %s",
+                    provider.name, session.session_id, exc_info=True,
+                )
     except asyncio.CancelledError:
         raise
 
@@ -1486,9 +1557,16 @@ async def _deploy_live_avatar_bot(
     bot_name: str = DEFAULT_BOT_NAME,
     avatar_id: Optional[str] = None,
     autospeak_enabled: bool = False,
+    video_provider: str = DEFAULT_VIDEO_PROVIDER,
+    tts_provider: Optional[str] = DEFAULT_TTS_PROVIDER,
+    answer_engine: str = DEFAULT_ANSWER_ENGINE,
     request: Optional[Request] = None
 ) -> Dict[str, Any]:
-    """Internal core method to deploy the LiveAvatar Bot into a meeting."""
+    """Internal core method to deploy the avatar bot into a meeting.
+
+    The provider triple is per-run, not per-deploy: one service can drive a
+    LiveAvatar meeting and an Anam meeting concurrently.
+    """
     try:
         if not RECALL_API_KEY:
             raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
@@ -1499,15 +1577,24 @@ async def _deploy_live_avatar_bot(
         run_id = f"run_{uuid.uuid4().hex}"
         recall_ws_token = uuid.uuid4().hex
 
-        # 1. Create LiveAvatar FULL Session ($0.20/min, includes TTS) with user context
-        avatar_session = await create_avatar(CreateLiveAvatarRequest(
-            avatar_id=avatar_id,
-            mode="FULL",
-            user_id=user_id,
+        # 1. Resolve which providers this run uses, then open the video session.
+        # Resolution validates the combination up front (see registry.resolve):
+        # an audio-only face with no voice, or a mismatched brain, fails here
+        # rather than becoming a silent avatar halfway through a meeting.
+        provider_set = provider_registry.resolve(
+            video=video_provider,
+            tts=tts_provider,
+            answer=answer_engine,
+        )
+        video_session = await provider_set.video.create_session(RunContext(
+            run_id=run_id,
+            bot_name=bot_name,
             client_id=client_id,
-            token=token,
-            bot_name=bot_name
+            user_id=user_id,
+            auth_token=token,
+            avatar_id=avatar_id,
         ))
+        avatar_session = video_session.credentials
 
         # 2. Store session credentials for Recall's avatar.html
         _ACTIVE_RUNS[run_id] = {
@@ -1517,9 +1604,14 @@ async def _deploy_live_avatar_bot(
             "client_id": client_id,
             "kyc_id": kyc_id,
             "token": token,
-            "session_id": avatar_session.get("session_id"),
+            "session_id": video_session.session_id,
+            # Kept for the LiveAvatar page, which reads them directly. Other
+            # providers simply have no such keys; the page gets the whole
+            # credentials blob from /credentials instead.
             "livekit_url": avatar_session.get("livekit_url"),
             "livekit_token": avatar_session.get("livekit_token"),
+            "providers": provider_set,
+            "video_session": video_session,
             "bot_name": bot_name,
             "recall_ws_token": recall_ws_token,
             "state": AgentState.LISTENING,
@@ -1579,10 +1671,12 @@ async def _deploy_live_avatar_bot(
         intel.start()
         _ACTIVE_RUNS[run_id]["intel"] = intel
 
-        session_id = avatar_session.get("session_id")
-        if session_id:
+        # Only providers that actually need pinging get a task. Simli bounds the
+        # session with maxIdleTime and Anam with maxSessionLengthSeconds, so for
+        # those keepalive_interval_s is 0 and nothing is started at all.
+        if provider_set.video.keepalive_interval_s > 0:
             _ACTIVE_RUNS[run_id]["keepalive_task"] = asyncio.create_task(
-                _keep_avatar_session_alive(run_id, session_id)
+                _keep_avatar_session_alive(run_id, provider_set.video, video_session)
             )
 
         # Warm the source-id cache now instead of paying for it on the first
@@ -1734,6 +1828,9 @@ async def start_bot_endpoint(
         bot_name = DEFAULT_BOT_NAME
         avatar_id = None
         autospeak_enabled = False
+        video_provider = DEFAULT_VIDEO_PROVIDER
+        tts_provider = DEFAULT_TTS_PROVIDER
+        answer_engine = DEFAULT_ANSWER_ENGINE
 
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -1744,6 +1841,9 @@ async def start_bot_endpoint(
             bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = body.get("avatar_id")
             autospeak_enabled = bool(body.get("autospeak_enabled", False))
+            video_provider = body.get("video_provider") or DEFAULT_VIDEO_PROVIDER
+            tts_provider = body.get("tts_provider") or DEFAULT_TTS_PROVIDER
+            answer_engine = body.get("answer_engine") or DEFAULT_ANSWER_ENGINE
             if not token:
                 token = body.get("token", "")
         else:
@@ -1754,6 +1854,9 @@ async def start_bot_endpoint(
             bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = form.get("avatar_id")
             autospeak_enabled = str(form.get("autospeak_enabled", "")).strip().lower() in ("true", "1", "on")
+            video_provider = form.get("video_provider") or DEFAULT_VIDEO_PROVIDER
+            tts_provider = form.get("tts_provider") or DEFAULT_TTS_PROVIDER
+            answer_engine = form.get("answer_engine") or DEFAULT_ANSWER_ENGINE
             if not token:
                 token = form.get("token", "")
 
@@ -1768,6 +1871,9 @@ async def start_bot_endpoint(
             bot_name=bot_name,
             avatar_id=avatar_id,
             autospeak_enabled=autospeak_enabled,
+            video_provider=video_provider,
+            tts_provider=tts_provider,
+            answer_engine=answer_engine,
             request=request
         )
         return JSONResponse(status_code=200, content=result)
@@ -1797,6 +1903,9 @@ async def create_live_avatar_bot(
         bot_name=payload.bot_name,
         avatar_id=payload.avatar_id,
         autospeak_enabled=payload.autospeak_enabled,
+        video_provider=payload.video_provider,
+        tts_provider=payload.tts_provider,
+        answer_engine=payload.answer_engine,
         request=request
     )
 
@@ -1837,6 +1946,27 @@ async def _leave_recall_call(bot_id: Optional[str]) -> Optional[int]:
         return resp.status_code
     except Exception:
         logger.error("[Teardown] Failed to evict Recall bot %s", bot_id, exc_info=True)
+        return None
+
+
+async def _close_video_session(run: Dict[str, Any]) -> Optional[int]:
+    """Release the run's video session through whichever provider owns it.
+
+    Falls back to the direct LiveAvatar stop for runs created before the
+    provider layer existed, so a rolling deploy cannot strand a live session
+    (which on LiveAvatar means blocking every subsequent start with
+    `4032 Session concurrency limit reached`).
+    """
+    providers: Optional[provider_registry.ProviderSet] = run.get("providers")
+    session: Optional[VideoSession] = run.get("video_session")
+    if providers is None or session is None:
+        return await _stop_avatar_session(run.get("session_id"))
+    try:
+        await providers.video.close(session)
+        logger.info("[Teardown] %s session closed run_id=%s", providers.video.name, run.get("run_id"))
+        return 200
+    except Exception:
+        logger.error("[Teardown] Failed to close %s session", providers.video.name, exc_info=True)
         return None
 
 
@@ -1882,7 +2012,7 @@ async def _teardown_run(run_id: str) -> Dict[str, Any]:
 
     recall_status, avatar_status = await asyncio.gather(
         _leave_recall_call(run.get("bot_id")),
-        _stop_avatar_session(run.get("session_id")),
+        _close_video_session(run),
     )
 
     _ACTIVE_RUNS.pop(run_id, None)
@@ -2250,6 +2380,7 @@ async def _speak_chunk(run: Dict[str, Any], turn_id: int, chunk_id: str, text: s
 
 def _make_streaming_sentence_handler(
     run: Dict[str, Any], turn_id: int, reply_word_limit: int,
+    filler_task: "Optional[asyncio.Task[bool]]" = None,
 ) -> "tuple[Callable[[str], Awaitable[None]], Dict[str, Any]]":
     """Build the on_sentence callback query_spiked_rag calls per sentence.
 
@@ -2266,6 +2397,16 @@ def _make_streaming_sentence_handler(
       boundary instead of a raw word-count slice — so a long answer still
       ends on a complete thought, just decided incrementally instead of
       after the fact.
+
+    filler_task, when given, is the in-flight _speak_chunk() call for the
+    latency-masking filler line (see _generate_grounded_reply) — started
+    concurrently with the RAG call, not before it. The first real sentence
+    awaits it before dispatching, so the filler's own playback (~1-2s) never
+    overlaps the real answer's audio even though the RAG round trip that
+    produced this sentence ran the whole time the filler was talking.
+    Awaiting an already-finished task is a no-op, so a slow filler vs. a
+    fast RAG response (or the reverse) both resolve correctly without any
+    extra bookkeeping here.
 
     Returns (callback, state) — state accumulates what was actually spoken
     (state["spoken_parts"]) and whether anything was dispatched
@@ -2322,6 +2463,18 @@ def _make_streaming_sentence_handler(
         if state["cumulative_words"] and state["cumulative_words"] + sentence_words > backstop_words:
             state["aborted"] = True  # budget hit; stop, same as the non-streaming backstop
             return
+        if filler_task is not None and not state["dispatched"]:
+            # First real sentence: wait for the filler's own playback to
+            # finish so the two never overlap. The RAG round trip that
+            # produced this sentence already ran concurrently with that
+            # wait -- this is not extra latency on top, just sequencing.
+            filler_still_live = await filler_task
+            if not filler_still_live:
+                # Barge-in (or turn superseded) during the filler itself --
+                # don't speak the real answer on top of an interruption
+                # that already happened.
+                state["aborted"] = True
+                return
         state["chunk_n"] += 1
         chunk_id = f"{turn_id}-{state['chunk_n']}"
         state["dispatched"] = True
@@ -2901,140 +3054,8 @@ def _finalize_turn(
     run["active_response_task"] = asyncio.create_task(respond())
 
 
-class ParticipantTranscriber:
-    def __init__(
-        self,
-        participant_id: str,
-        participant_name: str,
-        keywords: List[str],
-        on_utterance: Any,
-    ):
-        self.participant_id = participant_id
-        self.participant_name = participant_name
-        self.keywords = keywords
-        self.on_utterance = on_utterance
-        self.ws: Any = None
-        self.receiver_task: Optional[asyncio.Task] = None
-        self.buffer = FinalUtteranceBuffer()
-        self.start_lock = asyncio.Lock()
-        # Wall-clock time the last Results message carrying actual words arrived
-        # (interim or final) — the closest proxy we have to "when this person
-        # stopped talking," since we have no independent timestamp for that.
-        # Diffing this against the flush-triggering message's own arrival time
-        # isolates Deepgram's own endpointing/utterance_end wait from our own
-        # merge_pause (already logged separately in _ingest_utterance).
-        self._last_words_at: Optional[float] = None
-
-    async def ensure_started(self) -> None:
-        if self.ws:
-            return
-        async with self.start_lock:
-            if self.ws:
-                return
-            params = {
-                "model": "nova-3",
-                "encoding": "linear16",
-                "sample_rate": "16000",
-                "channels": "1",
-                "smart_format": "true",
-                "interim_results": "true",
-                "endpointing": str(AGENT_ENDPOINTING_MS),
-                "utterance_end_ms": str(AGENT_UTTERANCE_END_MS),
-                "vad_events": "true",
-                "punctuate": "true",
-            }
-            url = f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
-            keyterms: List[str] = []
-            keyterm_tokens = 0
-            for item in self.keywords[:100]:
-                if not item or not item.strip():
-                    continue
-                estimated_tokens = max(1, len(item.split()))
-                if keyterm_tokens + estimated_tokens > 450:
-                    break
-                keyterms.append(item.strip())
-                keyterm_tokens += estimated_tokens
-            if keyterms:
-                url += "&" + "&".join(f"keyterm={quote(item.strip())}" for item in keyterms)
-            headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-            try:
-                try:
-                    self.ws = await websockets.connect(url, additional_headers=headers)
-                except TypeError:
-                    self.ws = await websockets.connect(url, extra_headers=headers)
-            except websockets.exceptions.InvalidStatus as exc:
-                # Deepgram puts the actual reason in the response body. Without
-                # logging it, a rejected query parameter looks identical to an
-                # agent that simply never hears anybody.
-                detail = ""
-                try:
-                    detail = exc.response.body.decode()[:300]
-                except Exception:
-                    pass
-                logger.error(
-                    "[Deepgram] Handshake rejected status=%s detail=%s params=%s",
-                    exc.response.status_code, detail, params,
-                )
-                raise
-            self.receiver_task = asyncio.create_task(self._receive())
-            logger.info(
-                "[Deepgram] Connected participant_id=%s participant_name=%s",
-                self.participant_id,
-                self.participant_name,
-            )
-
-    async def send(self, pcm: bytes) -> None:
-        await self.ensure_started()
-        await self.ws.send(pcm)
-
-    async def _receive(self) -> None:
-        try:
-            while True:
-                now = time.monotonic()
-                data = json.loads(await self.ws.recv())
-                msg_type = data.get("type")
-
-                has_words = False
-                is_speech_final = False
-                if msg_type == "Results":
-                    alternatives = data.get("channel", {}).get("alternatives", [])
-                    has_words = bool(alternatives and (alternatives[0].get("transcript") or "").strip())
-                    is_speech_final = bool(data.get("speech_final"))
-
-                utterance = self.buffer.add_result(data)
-                if utterance:
-                    # Flush triggered by this message (speech_final Results, or an
-                    # UtteranceEnd with no words of its own). If speech_final fired
-                    # on a content-bearing message, this gap is ~0 — the fast path
-                    # working as intended. A large gap means it fell back to
-                    # utterance_end_ms (floored at Deepgram's 1000ms API minimum).
-                    if self._last_words_at is not None:
-                        logger.info(
-                            "[TIMING] deepgram_finalize_wait=%.2fs trigger=%s participant_id=%s "
-                            "(last words heard -> Deepgram signaled utterance done)",
-                            now - self._last_words_at, msg_type, self.participant_id,
-                        )
-                    self._last_words_at = None
-                    self.on_utterance(self.participant_id, self.participant_name, utterance)
-                elif has_words:
-                    self._last_words_at = now
-
-                if msg_type == "Error":
-                    logger.error("[Deepgram] participant_id=%s error=%s", self.participant_id, data)
-        except (ConnectionClosed, asyncio.CancelledError):
-            pass
-        except Exception:
-            logger.error("[Deepgram] Receiver failed participant_id=%s", self.participant_id, exc_info=True)
-
-    async def close(self) -> None:
-        if self.ws:
-            try:
-                await self.ws.send(json.dumps({"type": "CloseStream"}))
-                await self.ws.close()
-            except Exception:
-                pass
-        if self.receiver_task:
-            self.receiver_task.cancel()
+# ParticipantTranscriber moved to src/core/asr.py (imported at the top of
+# this module). Listening is identical under every video provider.
 
 
 @app.websocket("/ws/control/{run_id}")

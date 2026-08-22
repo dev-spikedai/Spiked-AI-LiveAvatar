@@ -1,5 +1,19 @@
 // LiveAvatar-Spiked: public/avatar.js
-// Handles LiveAvatar playback and backend control. Meeting audio goes directly from Recall to the backend.
+//
+// The provider-agnostic half of the avatar page. It owns everything that is
+// the same no matter which vendor is rendering the face: credentials, the
+// control socket, the overlays, and the protocol.
+//
+// It owns nothing vendor-specific. The backend tells it which ES module to
+// import (`browser_module` from /credentials) and that module implements the
+// transport. Adding a provider means adding a file under /providers, not
+// editing this one.
+//
+// Meeting audio never reaches this page in any configuration -- Recall streams
+// it to the backend, which owns listening and turn-taking. Every provider
+// module is therefore output-only.
+
+const PROTOCOL_VERSION = 1;
 
 (async function () {
   const statusDot = document.getElementById("status-dot");
@@ -79,193 +93,151 @@
     heardOverlay.classList.add("visible");
   }
 
-  function clearHeard() {
-    if (!debugEnabled) return;
-    heardLines.replaceChildren();
-    heardOverlay.classList.remove("visible");
+  // Providers whose SDKs ship as UMD globals rather than ES modules. Loading
+  // it here rather than from a <script> tag in avatar.html means a page running
+  // Simli never downloads LiveKit, and vice versa.
+  const loadedScripts = new Map();
+  function loadScript(src) {
+    if (loadedScripts.has(src)) return loadedScripts.get(src);
+    const promise = new Promise((resolve, reject) => {
+      const el = document.createElement("script");
+      el.src = src;
+      el.onload = () => resolve();
+      el.onerror = () => reject(new Error(`Failed to load ${src}`));
+      document.head.appendChild(el);
+    });
+    loadedScripts.set(src, promise);
+    return promise;
   }
 
   try {
     const params = new URLSearchParams(window.location.search);
     const runId = params.get("run") || "default";
-    let sessionId = params.get("session_id") || "";
-    let livekitUrl = params.get("livekit_url") || "";
-    let livekitToken = params.get("livekit_token") || "";
 
     updateStatus("Fetching session credentials...");
+    const res = await fetch(`/api/runs/${runId}/credentials`);
+    if (!res.ok) throw new Error(`Failed to load credentials: ${res.status}`);
+    const credentials = await res.json();
 
-    // 1. If credentials are not in URL query params, fetch them from backend
-    if (!livekitUrl || !livekitToken) {
-      const res = await fetch(`/api/runs/${runId}/credentials`);
-      if (!res.ok) throw new Error(`Failed to load credentials: ${res.status}`);
-      const data = await res.json();
-      sessionId = data.session_id;
-      livekitUrl = data.livekit_url;
-      livekitToken = data.livekit_token;
+    if (credentials.protocol_version && credentials.protocol_version !== PROTOCOL_VERSION) {
+      // A cached avatar.js against a redeployed backend is otherwise
+      // indistinguishable from an avatar that simply never speaks.
+      console.warn(
+        `[avatar.js] Protocol mismatch: page speaks v${PROTOCOL_VERSION}, ` +
+        `backend speaks v${credentials.protocol_version}`
+      );
     }
 
-    updateStatus("Connecting to LiveKit WebRTC...");
+    // The provider seam. Default keeps pre-refactor pages working against a
+    // backend that has not been told which provider a run uses.
+    const moduleUrl = credentials.browser_module || "/providers/liveavatar.js";
+    console.log(`[avatar.js] Loading provider module: ${moduleUrl}`);
+    const provider = await import(moduleUrl);
 
-    // 2. Connect to LiveAvatar LiveKit Room
-    const room = new LivekitClient.Room({
-      adaptiveStream: true,
-      dynacast: true,
-    });
-
-    room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
-      console.log(`[LiveKit] Track subscribed: ${track.kind}`);
-      if (track.kind === "video") {
-        track.attach(videoEl);
-        videoEl.play().catch(console.warn);
-        updateStatus("Avatar Video Rendering", "active");
-      }
-      if (track.kind === "audio") {
-        const audioEl = track.attach();
-        audioEl.autoplay = true;
-        document.body.appendChild(audioEl);
-        console.log("[LiveKit] Avatar audio track attached to DOM");
-      }
-    });
-
-    let currentTurnId = null;
-    // Sentence-by-sentence dispatch: the backend sends one avatar_speak per
-    // sentence, each carrying a chunk_id, and waits for that exact chunk's
-    // speak_ended before sending the next — so audio never overlaps or
-    // races. speakEventTurns maps the LiveKit event_id HeyGen echoes back to
-    // {turnId, chunkId} so the ended/started notification round-trips with
-    // enough identity for the backend to know which chunk just finished.
-    const speakEventTurns = new Map();
-    let controlWs = null;
-    function sendControlState(type, turnId = currentTurnId, chunkId = null) {
-      if (turnId === null || turnId === undefined) return;
-      if (controlWs && controlWs.readyState === WebSocket.OPEN) {
-        const message = { type, turn_id: turnId };
-        if (chunkId !== null && chunkId !== undefined) message.chunk_id = chunkId;
-        controlWs.send(JSON.stringify(message));
-      }
-    }
-    const decoder = new TextDecoder();
-    room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
-      try {
-        if (topic && topic !== "agent-response") return;
-        const decoded = JSON.parse(decoder.decode(payload));
-        const eventType = decoded.event_type || decoded.type;
-        const eventInfo = speakEventTurns.get(decoded.source_event_id) ?? { turnId: currentTurnId, chunkId: null };
-        console.log(`[LiveKit DataReceived] topic=${topic}:`, decoded);
-
-        if (eventType === "avatar.speak_started") {
-          sendControlState("avatar_speak_started", eventInfo.turnId, eventInfo.chunkId);
-          updateStatus("Avatar Speaking", "active");
-        } else if (eventType === "avatar.speak_ended") {
-          sendControlState("avatar_speak_ended", eventInfo.turnId, eventInfo.chunkId);
-          if (decoded.source_event_id) speakEventTurns.delete(decoded.source_event_id);
-          updateStatus("Listening...", "active");
-          clearHeard();
-        }
-      } catch {
-        console.log(`[LiveKit DataReceived] topic=${topic} (raw)`);
-      }
-    });
-
-    let reconnecting = false;
-    room.on(LivekitClient.RoomEvent.Disconnected, async (reason) => {
-      console.warn(`[LiveKit] Room disconnected: ${reason}`);
-      if (reconnecting) return;
-      reconnecting = true;
-      updateStatus("Disconnected — reconnecting...", "error");
-      // The LiveAvatar session itself may have closed server-side (idle
-      // timeout, crash, etc.), so re-fetch fresh credentials rather than
-      // just re-dialing the stale ones.
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        await new Promise((r) => setTimeout(r, Math.min(2000 * attempt, 10000)));
-        try {
-          const res = await fetch(`/api/runs/${runId}/credentials`);
-          if (!res.ok) throw new Error(`credentials ${res.status}`);
-          const data = await res.json();
-          sessionId = data.session_id;
-          await room.connect(data.livekit_url, data.livekit_token);
-          console.log("[LiveKit] Reconnected to room successfully");
-          updateStatus("Live Avatar Connected", "active");
-          reconnecting = false;
-          return;
-        } catch (err) {
-          console.warn(`[LiveKit] Reconnect attempt ${attempt} failed:`, err);
-        }
-      }
-      updateStatus("Connection lost — refresh to rejoin", "error");
-      reconnecting = false;
-    });
-
-    await room.connect(livekitUrl, livekitToken);
-    console.log("[LiveKit] Connected to room successfully");
-    updateStatus("Live Avatar Connected", "active");
-
-    // Allow autoplay for audio
-    room.startAudio().catch(() => {
-      document.addEventListener("click", () => room.startAudio(), { once: true });
-    });
-
-    // LiveAvatar is output-only. Recall and the backend own listening and turn-taking.
-    const encoder = new TextEncoder();
-    function sendLiveAvatarCommand(eventType, payload = {}) {
-      const event = {
-        event_id: crypto.randomUUID(),
-        event_type: eventType,
-        session_id: sessionId,
-        source_event_id: null,
-        ...payload,
-        payload,
-      };
-      console.log(`[LiveKit] Publishing command: ${eventType}`, event);
-      room.localParticipant.publishData(encoder.encode(JSON.stringify(event)), {
-        reliable: true,
-        topic: "agent-control",
-      });
-      return event.event_id;
-    }
-
-    sendLiveAvatarCommand("avatar.stop_listening");
-    console.log("[avatar.js] Sent avatar.stop_listening command");
-
-    // 3. Open control-only WebSocket to LiveAvatar-Spiked Backend.
+    // --- control socket -----------------------------------------------------
     const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${wsProtocol}//${location.host}/ws/control/${encodeURIComponent(runId)}`;
-    console.log(`[WS] Connecting to backend: ${wsUrl}`);
-    controlWs = new WebSocket(wsUrl);
+    const controlWs = new WebSocket(wsUrl);
+
+    let currentTurnId = null;
+
+    // Fields are copied explicitly rather than spread: an `undefined` turn_id
+    // arriving via spread would clobber the currentTurnId fallback, and a null
+    // chunk_id would make a single-shot reply look like a streamed chunk to the
+    // backend — which changes whether the floor is released.
+    function sendControl(type, extra = {}) {
+      if (controlWs.readyState !== WebSocket.OPEN) return;
+      const turnId = extra.turn_id ?? currentTurnId;
+      if (turnId === null || turnId === undefined) return;
+      const message = { type, turn_id: turnId };
+      if (extra.chunk_id !== null && extra.chunk_id !== undefined) message.chunk_id = extra.chunk_id;
+      if (extra.text !== undefined) message.text = extra.text;
+      if (extra.interrupted !== undefined) message.interrupted = extra.interrupted;
+      controlWs.send(JSON.stringify(message));
+    }
+
+    // UI lifecycle hooks. Status text and the debug overlay belong to the page,
+    // not to any vendor, but only the provider knows when speech actually
+    // started or stopped — so the provider reports, the shell renders.
+    function onSpeakStarted() {
+      updateStatus("Avatar Speaking", "active");
+    }
+    function onSpeakEnded() {
+      updateStatus("Listening...", "active");
+      if (!debugEnabled) return;
+      heardLines.replaceChildren();
+      heardOverlay.classList.remove("visible");
+    }
+
+    const handle = await provider.connect({
+      credentials,
+      runId,
+      videoEl,
+      setStatus: updateStatus,
+      sendControl,
+      loadScript,
+      onSpeakStarted,
+      onSpeakEnded,
+    });
 
     controlWs.onopen = () => {
       console.log("[WS] Control connection established");
       updateStatus("Listening...", "active");
     };
 
-    // 4. Receive avatar commands from the backend.
     controlWs.onmessage = (event) => {
+      let data;
       try {
-        const data = JSON.parse(event.data);
-        console.log("[WS] Received message from backend:", data);
-        
-        if (data.type === "heard") {
-          renderHeard(data);
-          return;
-        }
+        data = JSON.parse(event.data);
+      } catch (err) {
+        console.error("[WS] Unparseable message:", err);
+        return;
+      }
 
-        if (data.type === "avatar_speak" && data.text) {
-          console.log(`[avatar.js] >>> Publishing avatar.speak_text (chunk ${data.chunk_id}): "${data.text}"`);
-          currentTurnId = data.turn_id;
-          const eventId = sendLiveAvatarCommand("avatar.speak_text", { text: data.text });
-          speakEventTurns.set(eventId, { turnId: data.turn_id, chunkId: data.chunk_id ?? null });
-          updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
-        } else if (data.type === "avatar_interrupt") {
-          console.log("[avatar.js] >>> Received avatar_interrupt command from backend");
-          sendLiveAvatarCommand("avatar.interrupt");
-          sendControlState("avatar_speak_interrupted");
-          updateStatus("Listening...", "active");
-        } else if (data.type === "agent_muted" && data.muted_until_epoch_ms) {
-          console.log(`[avatar.js] >>> Muted for ${data.seconds}s`);
-          startMuteOverlay(data.muted_until_epoch_ms, data.seconds || 0);
-        } else if (data.type === "agent_unmuted") {
-          console.log("[avatar.js] >>> Unmuted");
-          stopMuteOverlay();
+      try {
+        switch (data.type) {
+          case "heard":
+            renderHeard(data);
+            break;
+
+          case "avatar_speak":
+            currentTurnId = data.turn_id;
+            handle.speak({ text: data.text, turnId: data.turn_id, chunkId: data.chunk_id ?? null });
+            if (data.text) {
+              updateStatus(`Avatar Speaking: "${data.text.slice(0, 30)}..."`, "active");
+            }
+            break;
+
+          case "avatar_audio":
+            handle.audio?.({ data: data.data, turnId: data.turn_id });
+            break;
+
+          case "avatar_speak_end":
+            handle.speakEnd?.({ turnId: data.turn_id });
+            break;
+
+          case "avatar_user_message":
+            // Delegated mode: the vendor's own brain answers this.
+            currentTurnId = data.turn_id;
+            handle.userMessage?.({ text: data.text, turnId: data.turn_id });
+            break;
+
+          case "avatar_interrupt":
+            handle.interrupt?.();
+            sendControl("avatar_speak_interrupted");
+            updateStatus("Listening...", "active");
+            break;
+
+          case "agent_muted":
+            if (data.muted_until_epoch_ms) startMuteOverlay(data.muted_until_epoch_ms, data.seconds || 0);
+            break;
+
+          case "agent_unmuted":
+            stopMuteOverlay();
+            break;
+
+          default:
+            console.log("[WS] Unhandled message type:", data.type);
         }
       } catch (err) {
         console.error("Error processing WS message:", err);
@@ -281,7 +253,6 @@
       console.log("[WS] Control connection closed");
       updateStatus("Control Stream Closed", "pending");
     };
-
   } catch (err) {
     console.error("Initialization error:", err);
     updateStatus(`Error: ${err.message}`, "error");

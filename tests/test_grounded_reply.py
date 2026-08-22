@@ -80,6 +80,27 @@ class FakeControlWs:
                 event.set()
 
 
+def _speaks(run):
+    """Every avatar_speak the run sent, filler included."""
+    return [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+
+
+def _answer_speaks(run):
+    """Only the chunks carrying the actual answer.
+
+    The company_knowledge path speaks a filler line ("let me check the docs")
+    while the RAG call is still in flight, so the raw send list always leads
+    with one extra chunk that is not part of the answer. It is identified by
+    its chunk_id rather than by position, so a test that cares about answer
+    content stays honest if the filler ever moves or stops firing.
+    """
+    return [m for m in _speaks(run) if not str(m.get("chunk_id", "")).endswith("-filler")]
+
+
+def _filler_speaks(run):
+    return [m for m in _speaks(run) if str(m.get("chunk_id", "")).endswith("-filler")]
+
+
 def _streaming_run(**overrides):
     run = {
         "run_id": "r1",
@@ -118,7 +139,12 @@ def test_company_knowledge_streams_sentence_by_sentence(monkeypatch):
 
     reply = _run_reply(run=run, turn_id=1)
 
-    speak_messages = [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+    # The filler goes out first and is not part of the answer; everything
+    # after it is.
+    assert _speaks(run)[0]["chunk_id"] == "1-filler"
+    assert _speaks(run)[0]["text"] in live_avatar.COMPANY_KNOWLEDGE_FILLER_PHRASES
+
+    speak_messages = _answer_speaks(run)
     assert len(speak_messages) == 2
     assert speak_messages[0]["text"] == "We hold SOC 2 Type II certification."
     assert speak_messages[1]["text"] == "Our last audit closed in March."
@@ -132,6 +158,30 @@ def test_company_knowledge_streams_sentence_by_sentence(monkeypatch):
     # happened as a side effect of streaming.
     assert run["history"][-1] == {"speaker": "Tom", "participant_id": "bot", "text": reply}
     assert run["state"] == live_avatar.AgentState.LISTENING  # floor released
+
+
+def test_filler_precedes_the_answer_and_is_not_part_of_it(monkeypatch):
+    """The latency-masking filler is spoken once, before any real chunk, and
+    leaves no trace in the reply, the history, or the echo suppressor's view
+    of what the bot said."""
+    _install_model(monkeypatch, [])
+    run = _streaming_run()
+
+    async def streaming_rag(question, *args, on_sentence=None, **kwargs):
+        await on_sentence("We hold SOC 2 Type II certification.")
+        return "We hold SOC 2 Type II certification."
+
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", streaming_rag)
+
+    reply = _run_reply(run=run, turn_id=1)
+
+    sent = _speaks(run)
+    assert len(_filler_speaks(run)) == 1, "exactly one filler per turn"
+    assert sent[0]["chunk_id"] == "1-filler", "filler leads, never interleaves"
+    assert sent[0]["turn_id"] == 1, "filler rides the turn it is masking"
+    # What the meeting hears is the filler; what the transcript records is not.
+    assert reply == "We hold SOC 2 Type II certification."
+    assert run["history"][-1]["text"] == reply
 
 
 def test_streaming_never_speaks_a_raw_degraded_first_sentence(monkeypatch):
@@ -150,7 +200,12 @@ def test_streaming_never_speaks_a_raw_degraded_first_sentence(monkeypatch):
 
     reply = _run_reply(run=run, turn_id=1)
 
-    assert run["control_ws"].sent == []
+    # The filler has already been committed to by the time the backend's
+    # failure is visible — that is the cost of masking latency, and it is
+    # harmless ("let me check the docs" then an apology). What must not
+    # happen is the degraded text itself reaching the avatar.
+    assert _answer_speaks(run) == []
+    assert len(_filler_speaks(run)) == 1
     assert "_streamed_turn_id" not in run
     assert "don" in reply.lower()  # the standard apology fallback
 
@@ -175,10 +230,13 @@ def test_streaming_stops_at_the_word_backstop_on_a_sentence_boundary(monkeypatch
 
     reply = _run_reply(run=run, turn_id=1)
 
-    speak_messages = [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+    speak_messages = _answer_speaks(run)
     assert len(speak_messages) == 1
     assert speak_messages[0]["text"] == first
     assert reply == first
+    # The filler is spoken outside the word budget — it is latency masking,
+    # not part of the answer, so it must not eat into the backstop.
+    assert len(_filler_speaks(run)) == 1
 
 
 def test_streaming_stops_when_the_turn_is_superseded_mid_answer(monkeypatch):
@@ -198,7 +256,7 @@ def test_streaming_stops_when_the_turn_is_superseded_mid_answer(monkeypatch):
 
     _run_reply(run=run, turn_id=1)
 
-    speak_messages = [m for m in run["control_ws"].sent if m.get("type") == "avatar_speak"]
+    speak_messages = _answer_speaks(run)
     assert len(speak_messages) == 1
     assert speak_messages[0]["text"] == "First sentence spoken normally."
 

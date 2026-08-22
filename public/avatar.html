@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SpikedAI Live Avatar</title>
-  <!-- LiveKit Client SDK for WebRTC rendering -->
-  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <!-- Vendor SDKs are loaded on demand by the provider module the backend
+       names, so a Simli page never downloads LiveKit and vice versa. -->
   <style>
     * {
       box-sizing: border-box;
@@ -209,6 +209,7 @@
     </div>
   </div>
 
-  <script src="/avatar.js"></script>
+  <!-- type=module: avatar.js dynamically imports its provider. -->
+  <script type="module" src="/avatar.js"></script>
 </body>
 </html>
