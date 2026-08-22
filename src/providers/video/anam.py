@@ -1,24 +1,4 @@
-"""Anam -- face, optionally voice, optionally brain.
-
-Two configurations, one adapter, distinguished by a single field:
-
-  driven  llmId = "CUSTOMER_CLIENT_V1"  -> Anam's own LLM is off. We stream our
-          answer in with talk commands. This is the drop-in replacement for
-          LiveAvatar FULL and the launch configuration.
-
-  native  llmId = <a real model UUID>   -> Anam composes the reply itself from
-          systemPrompt. We still gate the turn and hand over the transcript via
-          sendUserMessage(); see src/providers/answer/anam_native.py.
-
-Both set disableInputAudio: the avatar page never hears the meeting in any
-configuration. Recall -> backend -> Deepgram owns listening, which is what keeps
-the turn gate intact even when the vendor owns the answer.
-
-Anam also supports audio passthrough (PCM16/16k, same as Simli) via
-enableAudioPassthrough. Not used here: passthrough imposes an ~800ms buffer
-before render that text mode does not pay, so text is the better default while
-Anam is doing its own TTS. `accepts` is the only line that would change.
-"""
+"""Anam. Driven or native, switched by llmId. See docs/PROVIDER_REFACTOR_PLAN.md §5."""
 
 import logging
 import os
@@ -29,7 +9,7 @@ from fastapi import HTTPException
 
 from src.providers.base import RunContext, VideoProvider, VideoSession
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 ANAM_API_KEY = os.getenv("ANAM_API_KEY", "")
 ANAM_BASE_URL = os.getenv("ANAM_API_URL", "https://api.anam.ai")
@@ -38,9 +18,7 @@ ANAM_VOICE_ID = os.getenv("ANAM_VOICE_ID", "")
 ANAM_AVATAR_MODEL = os.getenv("ANAM_AVATAR_MODEL", "cara-4-latest")
 ANAM_REGION = os.getenv("ANAM_REGION", "us")
 ANAM_MAX_SESSION_SECONDS = int(os.getenv("ANAM_MAX_SESSION_SECONDS", "1800"))
-# The documented sentinel that turns Anam's built-in brain off and hands all
-# conversation logic to the client. Not a UUID, and not optional in driven
-# mode -- with a real llmId Anam will answer on its own and talk over the gate.
+# Sentinel that turns Anam's brain off; a real llmId makes it answer on its own.
 ANAM_CLIENT_DRIVEN_LLM_ID = "CUSTOMER_CLIENT_V1"
 # Only consulted in native mode.
 ANAM_NATIVE_LLM_ID = os.getenv("ANAM_NATIVE_LLM_ID", "")
@@ -54,8 +32,6 @@ class AnamVideoProvider(VideoProvider):
     keepalive_interval_s = 0.0
 
     def __init__(self, native: bool = False, llm_id: Optional[str] = None):
-        #: native=True hands the brain to Anam. The paired AnswerEngine must be
-        #: the delegated one; the registry refuses the mismatched combination.
         self.native = native
         self.llm_id = llm_id or (ANAM_NATIVE_LLM_ID if native else ANAM_CLIENT_DRIVEN_LLM_ID)
 
@@ -76,17 +52,14 @@ class AnamVideoProvider(VideoProvider):
             "avatarId": avatar_id,
             "avatarModel": ANAM_AVATAR_MODEL,
             "llmId": self.llm_id,
-            # skipGreeting matters in both modes: an avatar that introduces
-            # itself on join has spoken in the meeting without passing the turn
-            # gate, which is exactly the thing the gate exists to prevent.
+            # A greeting on join is speech that never passed the turn gate.
             "skipGreeting": True,
             "maxSessionLengthSeconds": ANAM_MAX_SESSION_SECONDS,
         }
         if ANAM_VOICE_ID:
             persona_config["voiceId"] = ANAM_VOICE_ID
         if self.native:
-            # The only lever on what a native-mode reply says or how long it
-            # runs -- compose_reply and AGENT_MAX_REPLY_WORDS do not apply.
+            # Only lever on native replies; AGENT_MAX_REPLY_WORDS does not apply.
             persona_config["systemPrompt"] = ctx.persona_prompt or ""
 
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -121,12 +94,8 @@ class AnamVideoProvider(VideoProvider):
             session_id=None,  # Anam's session identity is the token itself
             credentials={
                 "anam_session_token": token,
-                # The browser half needs to know which mode it is in: driven
-                # renders talk streams, native forwards transcripts instead.
                 "anam_mode": "native" if self.native else "driven",
-                # Never let the page open a mic. Meeting audio reaches the agent
-                # through Recall, and a second listener would double-hear the
-                # room and answer outside the gate.
+                # A page mic would be a second listener answering outside the gate.
                 "anam_disable_input_audio": True,
             },
         )

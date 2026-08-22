@@ -1,12 +1,7 @@
-"""Deepgram streaming ASR -- one socket per meeting participant.
+"""Deepgram streaming ASR, one socket per participant.
 
-Provider-agnostic by construction: the agent hears the meeting through Recall,
-never through the avatar. Whichever video vendor is rendering the face, this is
-the only thing that listens, which is why it lives in the core rather than
-behind the provider seam.
-
-The Deepgram tuning constants live here rather than in the service module
-because the API minimum below is a property of Deepgram, not of the agent.
+Core, not a provider: the agent hears the meeting through Recall, never
+through the avatar, so this is identical under every video vendor.
 """
 
 import asyncio
@@ -22,15 +17,13 @@ from websockets.exceptions import ConnectionClosed
 
 from src.agent_policy import FinalUtteranceBuffer
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API") or os.getenv("DEEPGRAM_API_KEY", "")
 AGENT_ENDPOINTING_MS = int(os.getenv("AGENT_ENDPOINTING_MS", "300"))
 
-# Deepgram rejects the whole connection with HTTP 400 when utterance_end_ms is
-# below 1000, which manifests as an agent that hears nothing at all rather than
-# as a config error. Clamped rather than trusted: a tuning value must not be
-# able to silently deafen the bot.
+# Below 1000 Deepgram rejects the connection with a 400, which looks exactly
+# like an agent that hears nobody. Clamped so tuning cannot deafen the bot.
 DEEPGRAM_MIN_UTTERANCE_END_MS = 1000
 _requested_utterance_end_ms = int(os.getenv("AGENT_UTTERANCE_END_MS", "1000"))
 AGENT_UTTERANCE_END_MS = max(_requested_utterance_end_ms, DEEPGRAM_MIN_UTTERANCE_END_MS)
@@ -58,12 +51,7 @@ class ParticipantTranscriber:
         self.receiver_task: Optional[asyncio.Task] = None
         self.buffer = FinalUtteranceBuffer()
         self.start_lock = asyncio.Lock()
-        # Wall-clock time the last Results message carrying actual words arrived
-        # (interim or final) — the closest proxy we have to "when this person
-        # stopped talking," since we have no independent timestamp for that.
-        # Diffing this against the flush-triggering message's own arrival time
-        # isolates Deepgram's own endpointing/utterance_end wait from our own
-        # merge_pause (already logged separately in _ingest_utterance).
+        # Proxy for "when this person stopped talking"; no timestamp exists.
         self._last_words_at: Optional[float] = None
 
     async def ensure_started(self) -> None:
@@ -104,9 +92,8 @@ class ParticipantTranscriber:
                 except TypeError:
                     self.ws = await websockets.connect(url, extra_headers=headers)
             except websockets.exceptions.InvalidStatus as exc:
-                # Deepgram puts the actual reason in the response body. Without
-                # logging it, a rejected query parameter looks identical to an
-                # agent that simply never hears anybody.
+                # The reason is only in the body; without it a rejected param
+                # looks like an agent that never hears anybody.
                 detail = ""
                 try:
                     detail = exc.response.body.decode()[:300]
@@ -136,19 +123,14 @@ class ParticipantTranscriber:
                 msg_type = data.get("type")
 
                 has_words = False
-                is_speech_final = False
                 if msg_type == "Results":
                     alternatives = data.get("channel", {}).get("alternatives", [])
                     has_words = bool(alternatives and (alternatives[0].get("transcript") or "").strip())
-                    is_speech_final = bool(data.get("speech_final"))
 
                 utterance = self.buffer.add_result(data)
                 if utterance:
-                    # Flush triggered by this message (speech_final Results, or an
-                    # UtteranceEnd with no words of its own). If speech_final fired
-                    # on a content-bearing message, this gap is ~0 — the fast path
-                    # working as intended. A large gap means it fell back to
-                    # utterance_end_ms (floored at Deepgram's 1000ms API minimum).
+                    # ~0 means speech_final fired (fast path); a large gap means
+                    # it fell back to utterance_end_ms.
                     if self._last_words_at is not None:
                         logger.info(
                             "[TIMING] deepgram_finalize_wait=%.2fs trigger=%s participant_id=%s "

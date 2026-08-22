@@ -1,19 +1,11 @@
-"""The Spiked backend as an answer engine -- /ask streaming retrieval.
-
-This is a thin adapter, not a move. The retrieval path in live_avatar.py
-(source_id resolution, the per-run cache, the cognitive fallback, the degraded-
-answer markers) is still entangled with the turn pipeline, and pulling it out
-wholesale is step 2 work that has not happened yet. Wrapping it now costs one
-lazy import and gets the interface real, which is what unblocks every other
-provider.
-"""
+"""Spiked /ask as an answer engine. Wraps live_avatar.query_spiked_rag for now."""
 
 import logging
 from typing import AsyncIterator
 
 from src.providers.base import AnswerEngine, TurnContext
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 
 class SpikedAnswerEngine(AnswerEngine):
@@ -21,17 +13,10 @@ class SpikedAnswerEngine(AnswerEngine):
     mode = "stream"
 
     async def stream_answer(self, ctx: TurnContext) -> AsyncIterator[str]:
-        """Yield the backend's answer one complete sentence at a time.
-
-        query_spiked_rag already emits sentence callbacks; this turns that
-        push interface into the pull interface the executor wants, via a
-        queue, so the caller controls pacing rather than the retrieval code.
-        """
+        """Turn query_spiked_rag's sentence callbacks into a pull interface."""
         import asyncio
 
-        # Imported here, not at module scope: live_avatar imports the registry,
-        # and the registry imports this module. Delete once the retrieval code
-        # moves to src/core (plan step 2) and the cycle goes away with it.
+        # Lazy: live_avatar -> registry -> this module would cycle.
         from src import live_avatar
 
         queue: "asyncio.Queue[object]" = asyncio.Queue()
@@ -62,7 +47,6 @@ class SpikedAnswerEngine(AnswerEngine):
                     return
                 yield item  # type: ignore[misc]
         finally:
-            # A consumer that stops early (barge-in, word backstop) must not
-            # leave retrieval running and writing into a queue nobody reads.
+            # Early exit (barge-in, backstop) must not leave retrieval running.
             if not task.done():
                 task.cancel()

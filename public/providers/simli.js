@@ -1,14 +1,5 @@
-// Simli — browser half. Ported from the `simli` branch.
-//
-// Transport: Simli's p2p WebRTC endpoint. The same socket carries signalling
-// (JSON offer/answer, then bare string state words) and the audio feed (binary
-// PCM16@16kHz frames). No SDK; plain RTCPeerConnection.
-//
-// This provider only lip-syncs. It has no voice of its own, so the backend
-// pairs it with a TtsProvider and sends PCM rather than text — the
-// `accepts: "audio"` half of the contract.
-//
-//   connect(ctx) -> { speak, audio, speakEnd, interrupt }
+// Simli browser half. p2p WebRTC; one socket carries both signalling and
+// binary PCM16@16k frames. Lip-sync only. See docs/CONTROL_PROTOCOL.md.
 
 export const name = "simli";
 export const accepts = "audio";
@@ -22,8 +13,7 @@ export async function connect({
   const base = (credentials.simli_base_url || "https://api.simli.ai").trim().replace(/\/+$/, "");
   const wsUrl = `${base.replace(/^http/, "ws")}/compose/webrtc/p2p?session_token=${encodeURIComponent(sessionToken)}`;
 
-  // Simli publishes audio on its own track rather than muxing it into the
-  // video element, so the page needs a second sink for it.
+  // Simli publishes audio on a separate track, so it needs its own sink.
   let audioEl = document.getElementById("avatar-audio");
   if (!audioEl) {
     audioEl = document.createElement("audio");
@@ -69,9 +59,7 @@ export async function connect({
             setStatus("Avatar Video Rendering", "active");
           } else if (evt.track.kind === "audio") {
             audioEl.srcObject = stream;
-            // Autoplay is routinely blocked until the tab sees a gesture. In a
-            // Recall browser there is no user to click, hence the retry loop as
-            // well as the listeners.
+            // No user to click in a Recall browser, hence the retry loop.
             audioEl.play().catch(() => {
               const resume = () => audioEl.play().catch(() => {});
               document.addEventListener("click", resume, { once: true });
@@ -136,9 +124,7 @@ export async function connect({
 
   function sendAudio(pcm) {
     if (simliWs.readyState !== WebSocket.OPEN) return;
-    // Frames that arrive before START are held, not dropped: the backend starts
-    // synthesizing as soon as it has an answer and does not wait for the
-    // WebRTC handshake.
+    // Held, not dropped: synthesis starts before the handshake completes.
     if (!simliStarted) {
       preStartAudioQueue.push(pcm);
       return;
@@ -147,10 +133,9 @@ export async function connect({
   }
 
   return {
-    // Text mode's "an utterance begins". Simli speaks nothing from this; the
-    // audio frames that follow are the actual speech.
-    speak({ turnId }) {
-      sendControl("avatar_speak_started", { turn_id: turnId });
+    // Marks the utterance start; the frames that follow are the speech.
+    speak({ turnId, chunkId }) {
+      sendControl("avatar_speak_started", { turn_id: turnId, chunk_id: chunkId });
       onSpeakStarted();
     },
     audio({ data }) {
@@ -160,13 +145,12 @@ export async function connect({
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       sendAudio(bytes.buffer);
     },
-    speakEnd({ turnId }) {
-      sendControl("avatar_speak_ended", { turn_id: turnId });
+    speakEnd({ turnId, chunkId }) {
+      sendControl("avatar_speak_ended", { turn_id: turnId, chunk_id: chunkId });
       onSpeakEnded();
     },
     interrupt() {
-      // SKIP discards whatever Simli still has buffered; without it the avatar
-      // keeps talking through a barge-in for as long as the queue is deep.
+      // SKIP discards Simli's buffer, or it talks through the barge-in.
       if (simliWs.readyState === WebSocket.OPEN) simliWs.send("SKIP");
       preStartAudioQueue.length = 0;
     },

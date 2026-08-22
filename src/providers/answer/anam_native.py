@@ -1,12 +1,4 @@
-"""Anam's own persona LLM as the answer engine.
-
-The turn gate still runs: agent_policy decides the turn happens, and only then
-is the transcript handed over. What is given up is control of the *content* --
-compose_reply, normalize_reply and AGENT_MAX_REPLY_WORDS never run, so the only
-levers on what comes back are the persona's systemPrompt and directorNotes.
-That is a real trade, not an implementation gap; see
-docs/PROVIDER_REFACTOR_PLAN.md §8.
-"""
+"""Anam's persona LLM as the answer engine. Gate stays ours, content does not."""
 
 import asyncio
 import logging
@@ -15,11 +7,9 @@ from typing import Any, Dict, Optional
 from src.core import protocol
 from src.providers.base import AnswerEngine, DelegatedResult, TurnContext, VideoSession
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
-# How long to wait for the vendor to finish speaking before giving up on the
-# turn. Generous: this covers Anam's own LLM latency plus the whole spoken
-# reply, not just a network round trip.
+# Covers Anam's LLM latency plus the whole spoken reply, not just a round trip.
 ANAM_NATIVE_TURN_TIMEOUT_S = 45.0
 
 

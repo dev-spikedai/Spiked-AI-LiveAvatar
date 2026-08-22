@@ -47,7 +47,7 @@ from src.call_intelligence import CallIntelligence
 from src.providers import registry as provider_registry
 from src.providers.base import RunContext, VideoProvider, VideoSession
 
-from src.core import protocol
+from src.core import protocol, speech
 from src.core.asr import (
     AGENT_ENDPOINTING_MS,
     AGENT_UTTERANCE_END_MS,
@@ -89,7 +89,7 @@ _console_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 _console_handler.setLevel(logging.INFO)
 
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 # Environment variables
 # (DEEPGRAM_API_KEY and the Deepgram tuning constants now live in src/core/asr.py)
@@ -1234,7 +1234,7 @@ reason: one short clause, for an internal audit log a sales rep will read."""
 def health_check():
     return {
         "status": "ok",
-        "service": "LiveAvatar-Spiked",
+        "service": "SpikedMeetingAgent",
         "deepgram_configured": bool(DEEPGRAM_API_KEY),
         "gemini_configured": bool(GEMINI_API_KEY),
         "gemini_model": GEMINI_MODEL,
@@ -1949,27 +1949,6 @@ async def _leave_recall_call(bot_id: Optional[str]) -> Optional[int]:
         return None
 
 
-async def _close_video_session(run: Dict[str, Any]) -> Optional[int]:
-    """Release the run's video session through whichever provider owns it.
-
-    Falls back to the direct LiveAvatar stop for runs created before the
-    provider layer existed, so a rolling deploy cannot strand a live session
-    (which on LiveAvatar means blocking every subsequent start with
-    `4032 Session concurrency limit reached`).
-    """
-    providers: Optional[provider_registry.ProviderSet] = run.get("providers")
-    session: Optional[VideoSession] = run.get("video_session")
-    if providers is None or session is None:
-        return await _stop_avatar_session(run.get("session_id"))
-    try:
-        await providers.video.close(session)
-        logger.info("[Teardown] %s session closed run_id=%s", providers.video.name, run.get("run_id"))
-        return 200
-    except Exception:
-        logger.error("[Teardown] Failed to close %s session", providers.video.name, exc_info=True)
-        return None
-
-
 async def _teardown_run(run_id: str) -> Dict[str, Any]:
     """Release every resource a run holds, then evict it from the registry.
 
@@ -2010,9 +1989,18 @@ async def _teardown_run(run_id: str) -> Dict[str, Any]:
             pass
     run["rep_sockets"] = set()
 
+    # Fall back to the direct stop for runs created before the provider layer,
+    # so a rolling deploy cannot strand a session (`4032` on LiveAvatar).
+    providers = run.get("providers")
+    video_session = run.get("video_session")
+    close_video = (
+        providers.video.close(video_session)
+        if providers is not None and video_session is not None
+        else _stop_avatar_session(run.get("session_id"))
+    )
     recall_status, avatar_status = await asyncio.gather(
         _leave_recall_call(run.get("bot_id")),
-        _close_video_session(run),
+        close_video,
     )
 
     _ACTIVE_RUNS.pop(run_id, None)
@@ -2331,7 +2319,7 @@ async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int, source
             turn_id, spoken_at - finalized_at,
         )
 
-    await control_ws.send_json({"type": "avatar_speak", "text": answer, "turn_id": turn_id})
+    await speech.emit_speech(run, turn_id, None, answer)
     run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
     return True
 
@@ -2367,7 +2355,7 @@ async def _speak_chunk(run: Dict[str, Any], turn_id: int, chunk_id: str, text: s
     timing = run.setdefault("turn_timing", {}).setdefault(turn_id, {})
     timing.setdefault("dispatched_at", time.monotonic())
     try:
-        await control_ws.send_json({"type": "avatar_speak", "text": text, "turn_id": turn_id, "chunk_id": chunk_id})
+        await speech.emit_speech(run, turn_id, chunk_id, text)
         timeout = estimate_speech_seconds(text) + 5.0
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
@@ -3119,6 +3107,23 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
                 watchdog = run.get("watchdog_task")
                 if watchdog and not watchdog.done():
                     watchdog.cancel()
+            elif event_type == "avatar_vendor_reply":
+                # Delegated mode: the vendor composed and spoke. Register it as
+                # bot speech or the agent hears itself through Deepgram.
+                spoken = (event.get("text") or "").strip()
+                if spoken:
+                    now = time.monotonic()
+                    run["echo"].note_bot_speech(spoken, now)
+                    run["governor"].note_reply(spoken, now)
+                    history = run.setdefault("history", [])
+                    history.append({
+                        "speaker": run.get("bot_name") or "Tom",
+                        "participant_id": "bot",
+                        "text": spoken,
+                    })
+                    del history[:-40]
+                    _push_rep(run, {"type": "agent_spoke", "text": spoken, "turn_id": turn_id, "source": "delegated"})
+                    speech.resolve_vendor_reply(run, turn_id, spoken)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:

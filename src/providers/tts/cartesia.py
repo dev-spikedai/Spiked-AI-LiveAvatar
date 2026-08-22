@@ -1,9 +1,4 @@
-"""Cartesia TTS. Ported from the `simli` branch.
-
-Pinned to raw pcm_s16le @ 16kHz because that is what both Simli's WebRTC
-endpoint and Anam's audio-passthrough mode consume, so nothing is resampled
-anywhere between synthesis and the avatar's lips.
-"""
+"""Cartesia TTS. Pinned to raw pcm_s16le @ 16kHz so nothing resamples."""
 
 import logging
 import os
@@ -14,7 +9,7 @@ import httpx
 from src.core.protocol import AudioFormat
 from src.providers.base import TtsProvider
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 CARTESIA_BASE_URL = os.getenv("CARTESIA_BASE_URL", "https://api.cartesia.ai")
@@ -29,12 +24,7 @@ class CartesiaTtsProvider(TtsProvider):
     audio_format = AudioFormat(sample_rate=CARTESIA_SAMPLE_RATE, channels=1, encoding="pcm_s16le")
 
     async def stream(self, text: str) -> AsyncIterator[bytes]:
-        """Synthesize `text` and yield raw PCM as it arrives.
-
-        One POST per utterance against /tts/bytes, with the PCM streamed back
-        as the response body -- yielded straight through rather than buffered,
-        so the avatar starts moving before synthesis has finished.
-        """
+        """Yield raw PCM as it arrives; one POST per utterance."""
         if not CARTESIA_API_KEY:
             raise RuntimeError("CARTESIA_API_KEY is not configured")
 

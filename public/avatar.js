@@ -1,4 +1,4 @@
-// LiveAvatar-Spiked: public/avatar.js
+// SpikedMeetingAgent: public/avatar.js
 //
 // The provider-agnostic half of the avatar page. It owns everything that is
 // the same no matter which vendor is rendering the face: credentials, the
@@ -93,23 +93,6 @@ const PROTOCOL_VERSION = 1;
     heardOverlay.classList.add("visible");
   }
 
-  // Providers whose SDKs ship as UMD globals rather than ES modules. Loading
-  // it here rather than from a <script> tag in avatar.html means a page running
-  // Simli never downloads LiveKit, and vice versa.
-  const loadedScripts = new Map();
-  function loadScript(src) {
-    if (loadedScripts.has(src)) return loadedScripts.get(src);
-    const promise = new Promise((resolve, reject) => {
-      const el = document.createElement("script");
-      el.src = src;
-      el.onload = () => resolve();
-      el.onerror = () => reject(new Error(`Failed to load ${src}`));
-      document.head.appendChild(el);
-    });
-    loadedScripts.set(src, promise);
-    return promise;
-  }
-
   try {
     const params = new URLSearchParams(window.location.search);
     const runId = params.get("run") || "default";
@@ -120,16 +103,14 @@ const PROTOCOL_VERSION = 1;
     const credentials = await res.json();
 
     if (credentials.protocol_version && credentials.protocol_version !== PROTOCOL_VERSION) {
-      // A cached avatar.js against a redeployed backend is otherwise
-      // indistinguishable from an avatar that simply never speaks.
+      // A stale cached page otherwise just never speaks.
       console.warn(
         `[avatar.js] Protocol mismatch: page speaks v${PROTOCOL_VERSION}, ` +
         `backend speaks v${credentials.protocol_version}`
       );
     }
 
-    // The provider seam. Default keeps pre-refactor pages working against a
-    // backend that has not been told which provider a run uses.
+    // Default keeps pre-refactor pages working mid-deploy.
     const moduleUrl = credentials.browser_module || "/providers/liveavatar.js";
     console.log(`[avatar.js] Loading provider module: ${moduleUrl}`);
     const provider = await import(moduleUrl);
@@ -141,10 +122,8 @@ const PROTOCOL_VERSION = 1;
 
     let currentTurnId = null;
 
-    // Fields are copied explicitly rather than spread: an `undefined` turn_id
-    // arriving via spread would clobber the currentTurnId fallback, and a null
-    // chunk_id would make a single-shot reply look like a streamed chunk to the
-    // backend — which changes whether the floor is released.
+    // Copied explicitly, not spread: an undefined turn_id would clobber the
+    // fallback and a null chunk_id would fake a streamed chunk.
     function sendControl(type, extra = {}) {
       if (controlWs.readyState !== WebSocket.OPEN) return;
       const turnId = extra.turn_id ?? currentTurnId;
@@ -156,9 +135,7 @@ const PROTOCOL_VERSION = 1;
       controlWs.send(JSON.stringify(message));
     }
 
-    // UI lifecycle hooks. Status text and the debug overlay belong to the page,
-    // not to any vendor, but only the provider knows when speech actually
-    // started or stopped — so the provider reports, the shell renders.
+    // Provider reports speech lifecycle; the shell renders it.
     function onSpeakStarted() {
       updateStatus("Avatar Speaking", "active");
     }
@@ -175,7 +152,6 @@ const PROTOCOL_VERSION = 1;
       videoEl,
       setStatus: updateStatus,
       sendControl,
-      loadScript,
       onSpeakStarted,
       onSpeakEnded,
     });
@@ -213,7 +189,7 @@ const PROTOCOL_VERSION = 1;
             break;
 
           case "avatar_speak_end":
-            handle.speakEnd?.({ turnId: data.turn_id });
+            handle.speakEnd?.({ turnId: data.turn_id, chunkId: data.chunk_id ?? null });
             break;
 
           case "avatar_user_message":

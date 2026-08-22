@@ -1,13 +1,4 @@
-"""Simli -- face only. Ported from the `simli` branch.
-
-Simli renders and lip-syncs; it has no voice and no brain, so it is only ever
-usable paired with a TtsProvider. That makes it the honest test of the
-`accepts == "audio"` path: if the abstraction leaks anywhere, the provider that
-can do nothing but lip-sync is where it shows.
-
-Kept as a reference adapter rather than a shipping one -- see
-docs/PROVIDER_REFACTOR_PLAN.md §1.
-"""
+"""Simli. Face only, so always paired with a TtsProvider. Reference adapter."""
 
 import logging
 import os
@@ -18,16 +9,14 @@ from fastapi import HTTPException
 from src.core.protocol import PCM16_16K_MONO
 from src.providers.base import RunContext, VideoProvider, VideoSession
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 SIMLI_API_KEY = os.getenv("SIMLI_API_KEY", "")
 SIMLI_FACE_ID = os.getenv("SIMLI_FACE_ID", "")
 SIMLI_BASE_URL = os.getenv("SIMLI_API_URL", "https://api.simli.ai")
 SIMLI_MAX_SESSION_SECONDS = int(os.getenv("SIMLI_MAX_SESSION_SECONDS", "1800"))
 SIMLI_MAX_IDLE_SECONDS = int(os.getenv("SIMLI_MAX_IDLE_SECONDS", "300"))
-# Frame size for the PCM sent over the control socket. 6000 bytes at
-# 16kHz/16-bit mono is ~187ms of audio -- small enough that barge-in cuts off
-# promptly, large enough not to drown the socket in tiny messages.
+# ~187ms of PCM16@16k per frame.
 SIMLI_AUDIO_CHUNK_BYTES = int(os.getenv("SIMLI_AUDIO_CHUNK_BYTES", "6000"))
 
 
@@ -36,8 +25,7 @@ class SimliVideoProvider(VideoProvider):
     accepts = "audio"
     browser_module = "/providers/simli.js"
     audio_format = PCM16_16K_MONO
-    # Simli holds the session open itself via maxIdleTime on the token, so
-    # there is nothing to ping.
+    # Bounded by maxIdleTime on the token; nothing to ping.
     keepalive_interval_s = 0.0
 
     chunk_bytes = SIMLI_AUDIO_CHUNK_BYTES
@@ -69,8 +57,7 @@ class SimliVideoProvider(VideoProvider):
 
         data = resp.json()
         token = data.get("session_token") if isinstance(data, dict) else None
-        # Simli returns the literal strings "FAIL"/"FAIL TOKEN" with a 200 on
-        # some failures, so a status check alone is not enough to trust this.
+        # Simli can return "FAIL"/"FAIL TOKEN" with a 200.
         if not token or not isinstance(token, str) or token in ("FAIL TOKEN", "FAIL"):
             logger.error("[Simli] token response invalid: %s", data)
             raise HTTPException(status_code=500, detail="Simli session token creation failed")

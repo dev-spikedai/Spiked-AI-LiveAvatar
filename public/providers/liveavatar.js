@@ -1,25 +1,30 @@
-// LiveAvatar (HeyGen) — browser half.
-//
-// Transport: a LiveKit room. Commands go out as data-channel messages on the
-// "agent-control" topic; HeyGen echoes speak start/end back on the same channel
-// with the event_id we sent, which is the only identity the backend gets to
-// correlate a finished chunk with the sentence it dispatched.
-//
-// Implements the provider contract consumed by avatar.js:
-//   connect(ctx) -> { speak, interrupt }
-// No audio()/speakEnd(): this provider accepts text and does its own TTS.
+// LiveAvatar (HeyGen) browser half. LiveKit room; commands on the
+// "agent-control" topic, echoes correlated by event_id. Text in, so no
+// audio()/speakEnd(). See docs/CONTROL_PROTOCOL.md.
 
 const LIVEKIT_CDN = "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js";
 
 export const name = "liveavatar";
 export const accepts = "text";
 
+// UMD global, not an ES module, so it cannot be imported. Loaded here rather
+// than from avatar.html so a Simli page never downloads it.
+function loadLiveKit() {
+  return new Promise((resolve, reject) => {
+    if (window.LivekitClient) return resolve(window.LivekitClient);
+    const el = document.createElement("script");
+    el.src = LIVEKIT_CDN;
+    el.onload = () => resolve(window.LivekitClient);
+    el.onerror = () => reject(new Error("LiveKit SDK failed to load"));
+    document.head.appendChild(el);
+  });
+}
+
 export async function connect({
-  credentials, runId, videoEl, setStatus, sendControl, loadScript,
+  credentials, runId, videoEl, setStatus, sendControl,
   onSpeakStarted, onSpeakEnded,
 }) {
-  await loadScript(LIVEKIT_CDN);
-  const LivekitClient = window.LivekitClient;
+  const LivekitClient = await loadLiveKit();
   if (!LivekitClient) throw new Error("LiveKit SDK failed to load");
 
   let sessionId = credentials.session_id;
@@ -46,12 +51,8 @@ export async function connect({
     }
   });
 
-  // Sentence-by-sentence dispatch: the backend sends one avatar_speak per
-  // sentence, each carrying a chunk_id, and waits for that exact chunk's
-  // speak_ended before sending the next — so audio never overlaps or races.
-  // speakEventTurns maps the event_id HeyGen echoes back to {turnId, chunkId}
-  // so the round trip carries enough identity for the backend to know which
-  // chunk just finished.
+  // Maps the event_id HeyGen echoes back to {turnId, chunkId} so the backend
+  // knows which sentence finished.
   const speakEventTurns = new Map();
 
   const decoder = new TextDecoder();
@@ -60,9 +61,8 @@ export async function connect({
       if (topic && topic !== "agent-response") return;
       const decoded = JSON.parse(decoder.decode(payload));
       const eventType = decoded.event_type || decoded.type;
-      // Fall back to the current turn with no chunk: HeyGen does not always
-      // echo a source_event_id, and dropping those events would strand the
-      // dispatch loop waiting on a chunk that already finished playing.
+      // HeyGen does not always echo source_event_id; dropping those would
+      // strand the dispatch loop.
       const eventInfo =
         speakEventTurns.get(decoded.source_event_id) ?? { turnId: undefined, chunkId: null };
       console.log(`[LiveKit DataReceived] topic=${topic}:`, decoded);
@@ -86,9 +86,7 @@ export async function connect({
     if (reconnecting) return;
     reconnecting = true;
     setStatus("Disconnected — reconnecting...", "error");
-    // The LiveAvatar session itself may have closed server-side (idle timeout,
-    // crash, etc.), so re-fetch fresh credentials rather than re-dialing stale
-    // ones — a retry loop against a dead session never succeeds.
+    // Re-fetch credentials: retrying a dead session never succeeds.
     for (let attempt = 1; attempt <= 5; attempt++) {
       await new Promise((r) => setTimeout(r, Math.min(2000 * attempt, 10000)));
       try {
@@ -135,8 +133,7 @@ export async function connect({
     return event.event_id;
   }
 
-  // Output-only. Recall and the backend own listening and turn-taking; letting
-  // HeyGen listen would give the meeting a second, ungated agent.
+  // Output-only; a listening HeyGen would be a second, ungated agent.
   sendLiveAvatarCommand("avatar.stop_listening");
 
   return {

@@ -1,9 +1,7 @@
-"""Name -> adapter, and the rules about which combinations are legal.
+"""Name -> adapter, and which combinations are legal.
 
-Every invalid combination is rejected here, at /start, rather than discovered
-on the first turn. The failure mode this exists to prevent is specific: an
-audio-only video provider with no TTS does not raise anything, it just produces
-an avatar that moves its lips in silence for the length of a meeting.
+Invalid combinations are rejected at /start, not on the first turn: an
+audio-only provider with no TTS raises nothing, it just mouths silence.
 """
 
 from dataclasses import dataclass
@@ -18,9 +16,7 @@ from src.providers.video.anam import AnamVideoProvider
 from src.providers.video.liveavatar import LiveAvatarVideoProvider
 from src.providers.video.simli import SimliVideoProvider
 
-# anam_native is constructed by the executor (it needs the run's socket), so it
-# is registered as a marker name rather than a zero-arg class -- see
-# ProviderSet.answer_name.
+# Constructed by the executor (needs the run's socket), so it is a marker name.
 ANAM_NATIVE = "anam_native"
 
 VIDEO_PROVIDERS: Dict[str, Type[VideoProvider]] = {
@@ -42,7 +38,7 @@ ANSWER_ENGINES: Dict[str, Type[AnswerEngine]] = {
 
 @dataclass
 class ProviderSet:
-    """The three adapters a run was launched with. Resolved once, never re-read."""
+    """The three adapters a run was launched with. Resolved once."""
 
     video: VideoProvider
     answer_name: str
@@ -97,8 +93,6 @@ def resolve(
         if want is not None and (want.sample_rate, want.channels, want.encoding) != (
             got.sample_rate, got.channels, got.encoding
         ):
-            # Caught here rather than shipping resampled-sounding audio, or
-            # silence, into a live meeting.
             raise HTTPException(
                 400,
                 f"audio format mismatch: '{video}' wants {want}, '{tts}' produces {got}",

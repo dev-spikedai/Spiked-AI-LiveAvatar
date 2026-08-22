@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 # Meeting-bot backend only. Stealth/hot-mic sessions are registered on a
 # different service and are out of scope for the avatar.

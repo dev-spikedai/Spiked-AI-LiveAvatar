@@ -1,11 +1,4 @@
-"""LiveAvatar (HeyGen) -- the incumbent. Text in, face and voice out.
-
-FULL mode ($0.20/min) bundles STT/LLM/TTS and accepts `avatar.speak_text`.
-LITE mode ($0.10/min) is visual-only and wants PCM instead. Only FULL is
-wired here: LITE is a one-line `accepts` change plus pairing with a
-TtsProvider, but nothing has needed it yet and an untested second mode is
-worse than an absent one.
-"""
+"""LiveAvatar (HeyGen). Text in, face and voice out. FULL mode only."""
 
 import logging
 import os
@@ -16,7 +9,7 @@ from fastapi import HTTPException
 
 from src.providers.base import RunContext, VideoProvider, VideoSession
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
@@ -57,10 +50,8 @@ class LiveAvatarVideoProvider(VideoProvider):
             "is_sandbox": self.is_sandbox,
         }
         if self.mode == "FULL":
-            # The application owns knowledge retrieval and response generation.
-            # PUSH_TO_TALK keeps HeyGen's built-in LLM from answering on its own;
-            # an empty persona avoids giving it a second identity that could
-            # greet or reply outside the meeting turn gate.
+            # PUSH_TO_TALK + empty persona: stops HeyGen's own LLM answering
+            # outside the turn gate.
             token_payload["interactivity_type"] = "PUSH_TO_TALK"
             token_payload["avatar_persona"] = {}
 
@@ -122,14 +113,8 @@ class LiveAvatarVideoProvider(VideoProvider):
                 )
 
     async def close(self, session: VideoSession) -> None:
-        """Release the session so the concurrency slot is freed.
-
-        LiveAvatar allows one concurrent session per key, so a session that
-        outlives its meeting does not merely bill — it blocks every subsequent
-        start with `4032 Session concurrency limit reached`. This is the single
-        most important half of teardown, and the reason close() exists on the
-        interface at all rather than being left to each vendor's idle timeout.
-        """
+        """One concurrent session per key: a leaked session blocks every later
+        start with `4032 Session concurrency limit reached`."""
         if not session.session_id or not LIVEAVATAR_API_KEY:
             return
         try:

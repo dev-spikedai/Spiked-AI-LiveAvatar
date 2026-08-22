@@ -5,7 +5,7 @@ import logging
 from typing import List, Dict, Any, Optional, Set
 from supabase import create_client, Client
 
-logger = logging.getLogger("LiveAvatar-Spiked")
+logger = logging.getLogger("SpikedMeetingAgent")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://api.spiked.ai")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_KEY_TRANSCRIPT")
