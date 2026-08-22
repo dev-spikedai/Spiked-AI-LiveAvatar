@@ -152,3 +152,44 @@ async def get_user_keywords_and_products(
     
     logger.info(f"[Supabase] Loaded {len(all_keywords)} boosted keywords for user={user_id}")
     return result_data
+
+
+# Per-client provider overrides. Cached alongside the keyword config because it
+# changes on the same timescale (rarely) and is read on the /start path.
+_PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
+PROVIDER_TABLE = os.getenv("SUPABASE_PROVIDER_TABLE", "client_provider_configs")
+
+
+async def get_client_providers(client_id: Optional[str]) -> Dict[str, Optional[str]]:
+    """Return {video_provider, tts_provider, answer_engine} for a client.
+
+    Missing keys mean "no override" -- the caller falls back to whatever the
+    request or the env default says. Never raises: a provider lookup failing
+    must not stop a meeting from starting.
+    """
+    empty: Dict[str, Optional[str]] = {}
+    if not client_id or not _supabase_client:
+        return empty
+
+    now = time.time()
+    cached = _PROVIDER_CACHE.get(client_id)
+    if cached and now - cached.get("cached_at", 0) < _CACHE_TTL_SECONDS:
+        return cached["data"]
+
+    try:
+        res = await asyncio.to_thread(
+            lambda: _supabase_client.table(PROVIDER_TABLE)
+            .select("video_provider,tts_provider,answer_engine")
+            .eq("client_id", client_id)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [None])[0] or {}
+        data = {k: v for k, v in row.items() if v}
+    except Exception as exc:
+        # An absent table is the normal case until someone configures one.
+        logger.info("[Supabase] No provider overrides for client_id=%s (%s)", client_id, exc)
+        data = empty
+
+    _PROVIDER_CACHE[client_id] = {"cached_at": now, "data": data}
+    return data

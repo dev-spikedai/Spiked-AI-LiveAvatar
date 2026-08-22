@@ -283,69 +283,59 @@ Each phase leaves `main` deployable and behaviourally identical.
 
 ---
 
-## 9. Status — what is wired on `refactor/providers`
+## 9. Status
 
-Test suite: **98 passed** (78 pre-existing, 4 updated for the filler feature,
-16 new). Every step below left it green.
+Test suite: **120 passed**. Every step below left it green.
 
 ### Done
 
-- **Step 1 — protocol frozen.** `src/core/protocol.py`, `PROTOCOL_VERSION = 1`.
-  Constructors verified to emit dicts byte-identical to the literals they
-  replaced. Two messages added for delegated mode: `avatar_user_message`
-  (out) and `avatar_vendor_reply` (in).
-- **Step 3 — provider layer.** `src/providers/base.py` (`VideoProvider`,
-  `TtsProvider`, `AnswerEngine`, `RunContext`, `TurnContext`, `VideoSession`,
-  `DelegatedResult`), `src/providers/registry.py` with resolve-time validation.
-- **Step 4 — Simli + Cartesia ported** from the `simli` branch, both halves.
-- **Step 5 — Anam adapter built**, driven and native modes, both halves.
-- **Browser seam.** `public/avatar.js` is now a provider-agnostic shell that
-  dynamically imports `browser_module` from `/credentials`; the three vendor
-  modules live in `public/providers/`. Vendor SDKs load on demand, so a Simli
-  page never downloads LiveKit. New route `GET /providers/{module}.js`,
-  filename-constrained.
-- **Per-run selection (step 7, backend half).** `video_provider`,
-  `tts_provider`, `answer_engine` accepted on `/start` (JSON and form) and
-  `/create-live-avatar-bot`, resolved once per run into `run["providers"]`.
-  Keepalive and teardown both go through the interface now.
+- **Protocol frozen** — `src/core/protocol.py`, v1, documented in
+  `docs/CONTROL_PROTOCOL.md`.
+- **Provider layer** — `base.py`, `registry.py` with resolve-time validation,
+  adapters for liveavatar / anam (driven + native) / simli / cartesia, each
+  with a browser half under `public/providers/`.
+- **Speech dispatch** — `src/core/speech.py`. Text providers get
+  `avatar_speak`; lip-sync-only providers get synthesized PCM as `avatar_audio`
+  frames closed by `avatar_speak_end`. `tts_provider` is real.
+- **Answer engine on the live path** — `_generate_grounded_reply` now calls
+  `providers.answer.answer(TurnContext, on_sentence)`. `answer_engine` is real.
+- **Delegated turns** — `speech.delegate_turn` sends `avatar_user_message`;
+  `avatar_vendor_reply` comes back into `EchoSuppressor`, the governor and
+  history. Native Anam can run a turn.
+- **Per-run + per-client selection** — explicit request field, then
+  `client_provider_configs` in Supabase, then env default (`pick_provider`).
+- **Core extraction (partial)** — `core/asr.py` (Deepgram),
+  `core/floor.py` (floor state, speech dispatch, notification fan-out),
+  `core/runs.py` (registry + teardown), `core/speech.py`, `core/protocol.py`.
+  `live_avatar.py` 3306 → ~2790 lines.
 
-### Partial
+### Deliberately removed
 
-- **Step 2 — core extraction.** Only `ParticipantTranscriber` and the Deepgram
-  constants moved (`src/core/asr.py`). `live_avatar.py` is 3306 → ~3190 lines.
-  Recall/meeting, the run registry, and floor/watchdog/echo are **not** moved.
-  There is no `core/turn.py` and no `TurnExecutor` — the speak path still runs
-  through `_dispatch_reply` / `_speak_chunk` in `live_avatar.py`.
+`_stop_avatar_session` and the "runs created before the provider layer"
+fallbacks. `_ACTIVE_RUNS` is process-local, so a rolling deploy never hands an
+old run to a new process — those branches were unreachable.
 
-### Not started
+### Not done
 
-- **`TurnExecutor`.** Without it the `AnswerEngine` interface is defined but not
-  on the live path: `_generate_grounded_reply` still calls `query_spiked_rag`
-  directly. `SpikedAnswerEngine` wraps it and is registered, but nothing calls
-  the wrapper yet, and `AnamNativeAnswerEngine` is not constructed anywhere.
-  **This is the next piece of real work** — until it lands, `answer_engine` is
-  accepted at `/start` and then ignored.
-- **Step 6 — native-mode echo wiring.** The protocol carries
-  `avatar_vendor_reply` and anam.js emits it, but no handler feeds it to
-  `EchoSuppressor`. Native mode is not safe to run until that exists.
-- **Per-client provider config** (the Supabase lookup in §6). Only explicit
-  request fields and env defaults resolve today.
-- **Step 8.** `live_avatar.py` is not yet a shim.
+- **`live_avatar.py` → shim (step 8).** Blocked on a real trade, not effort:
+  the remaining groups (retrieval, Gemini reply generation, turn-taking) form a
+  cycle, and 21 tests monkeypatch `live_avatar.query_spiked_rag` plus ~20 more
+  patch `_generate_grounded_reply` / `_take_floor_and_speak` / `_judge_interjection`
+  on that module. Moving them silently disconnects those patches — the tests keep
+  passing while testing nothing. Doing this properly means moving the code and
+  re-pointing every patch target in the same change.
+- **`agent_policy.py`** is 711 lines and untouched by this refactor.
 
 ### Untested against live vendors
 
-Everything Anam is written from the published API and **has never been run
-against a real session**: the session-token call, `CUSTOMER_CLIENT_V1`, the
-talk-stream chunking, `sendUserMessage`, and the `@anam-ai/js-sdk` import.
-The SDK's exact export shape (`createClient`, `AnamEvent`,
-`streamToVideoAndAudioElements`, `interruptPersona`) needs checking against the
-installed version before the first live run. Simli/Cartesia are ports of code
+Everything Anam is written from the published API and **has never run against a
+real session**. The SDK check already corrected three wrong assumptions
+(`streamToVideoElement` not `streamToVideoAndAudioElements`; message role
+`"persona"` not `"assistant"`; no documented interrupt API), which is a fair
+indication of how much a live run will find. Simli/Cartesia are ports of code
 that ran on the `simli` branch, but not in this shell.
 
-One known design gap in `anam.js` driven mode: Anam has no per-chunk
-"finished playing" event, so a chunk is acknowledged when it is accepted into
-the talk stream rather than when it has been heard. The backend's
-sentence-by-sentence pacing therefore runs open-loop against Anam — sentences
-are handed over as fast as they are produced and Anam queues them. This is
-fine for correctness (Anam does not overlap its own audio) but means barge-in
-mid-answer cuts less precisely than it does on LiveAvatar.
+Known behavioural gap: Anam has no per-chunk "finished playing" event, so
+driven mode acks a sentence when Anam accepts it, not when it has been heard.
+Sentence pacing runs open-loop there and barge-in cuts less precisely than on
+LiveAvatar.

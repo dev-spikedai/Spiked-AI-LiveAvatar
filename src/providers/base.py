@@ -37,6 +37,10 @@ class TurnContext:
     auth_token: Optional[str] = None
     intent: str = "company_knowledge"
     reply_word_limit: int = 45
+    kyc_id: Optional[str] = None
+    source_ids: Optional[List[str]] = None
+    source_ids_task: Optional[Any] = None
+    timeout_s: float = 12.0
 
 
 @dataclass
@@ -46,12 +50,6 @@ class VideoSession:
     provider: str
     credentials: Dict[str, Any]
     session_id: Optional[str] = None
-
-
-@dataclass
-class DelegatedResult:
-    spoken_text: str
-    interrupted: bool = False
 
 
 class VideoProvider(ABC):
@@ -95,13 +93,10 @@ class AnswerEngine(ABC):
 
     name: str
 
-    # "stream"    -> yields sentences, core keeps pacing/backstop/barge-in.
-    # "delegated" -> vendor composes and speaks; core still owns the floor.
-    mode: Literal["stream", "delegated"] = "stream"
+    @abstractmethod
+    async def answer(self, ctx: TurnContext, on_sentence: Optional[Any] = None) -> str:
+        """Return the full answer, calling on_sentence per complete sentence.
 
-    def stream_answer(self, ctx: TurnContext) -> AsyncIterator[str]:
-        raise NotImplementedError
-
-    async def delegate_turn(self, ctx: TurnContext, session: VideoSession) -> DelegatedResult:
-        # Takes the session because in this mode brain and face are one vendor.
-        raise NotImplementedError
+        Push, not a generator: the caller speaks sentences as they land but
+        still needs the whole text afterwards for the degraded-answer check.
+        """

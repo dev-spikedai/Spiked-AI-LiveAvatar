@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal, Callable, Awaitable
 from urllib.parse import urlencode, quote
 
-from src.supabase_client import get_user_keywords_and_products
+from src.supabase_client import get_client_providers, get_user_keywords_and_products
 from src.agent_policy import (
     AgentState,
     EchoSuppressor,
@@ -45,7 +45,7 @@ from src.call_intelligence import CallIntelligence
 # because the agent hears the meeting through Recall, never through the avatar.
 # Re-exported here so existing references keep resolving during the migration.
 from src.providers import registry as provider_registry
-from src.providers.base import RunContext, VideoProvider, VideoSession
+from src.providers.base import RunContext, TurnContext, VideoProvider, VideoSession
 
 from src.core import protocol, speech
 from src.core.asr import (
@@ -124,12 +124,13 @@ PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", 
     "https://spiked-ai-liveavatar-409019309412.us-central1.run.app"
 )
-AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
 # Fallbacks only. A run that names its providers explicitly (or resolves them
 # from per-client config) ignores these entirely -- see registry.resolve.
 DEFAULT_VIDEO_PROVIDER = os.getenv("DEFAULT_VIDEO_PROVIDER", "liveavatar")
 DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER") or None
 DEFAULT_ANSWER_ENGINE = os.getenv("DEFAULT_ANSWER_ENGINE", "spiked")
+# Covers the vendor LLM plus the whole spoken reply, not just a round trip.
+DELEGATED_TURN_TIMEOUT_S = float(os.getenv("DELEGATED_TURN_TIMEOUT_S", "45"))
 AGENT_MAX_REPLY_WORDS = int(os.getenv("AGENT_MAX_REPLY_WORDS", "45"))
 DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
 # Spoken while the RAG call is in flight, on the company_knowledge path only
@@ -223,7 +224,6 @@ AGENT_MIN_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_MIN_FOLLOWUP_WINDOW_MS", "30
 # to say (last_reply_seconds * this factor), so a long answer buys the
 # listener proportionally more think-time than a short one instead of racing
 # the same flat clock regardless of what was just said. 0 keeps it flat.
-AGENT_FOLLOWUP_WINDOW_REPLY_SCALE = float(os.getenv("AGENT_FOLLOWUP_WINDOW_REPLY_SCALE", "0.5"))
 # Speech governor: hard ceiling on reply frequency and repetition.
 AGENT_REPLY_COOLDOWN_MS = int(os.getenv("AGENT_REPLY_COOLDOWN_MS", "2000"))
 AGENT_MAX_REPLIES_PER_WINDOW = int(os.getenv("AGENT_MAX_REPLIES_PER_WINDOW", "4"))
@@ -261,7 +261,6 @@ app.add_middleware(
 )
 
 # In-memory session and run registry
-_ACTIVE_RUNS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
 # Helper: Extract User ID from Supabase JWT
@@ -302,9 +301,9 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
     autospeak_enabled: bool = Field(default=False, description="Level 1.5: let the agent take the floor unprompted for high-value moments, capped per run")
-    video_provider: str = Field(default=DEFAULT_VIDEO_PROVIDER, description="Face: liveavatar | anam | simli")
-    tts_provider: Optional[str] = Field(default=DEFAULT_TTS_PROVIDER, description="Voice; required only for video providers that just lip-sync")
-    answer_engine: str = Field(default=DEFAULT_ANSWER_ENGINE, description="Brain: spiked | anam_native")
+    video_provider: Optional[str] = Field(default=None, description="Face: liveavatar | anam | simli")
+    tts_provider: Optional[str] = Field(default=None, description="Voice; required only for video providers that just lip-sync")
+    answer_engine: Optional[str] = Field(default=None, description="Brain: spiked | anam_native")
 
 
 class TranscriptCorrection(BaseModel):
@@ -885,6 +884,40 @@ Neither answer nor next_question may restate or re-ask anything Recent finalized
         return None
 
 
+async def _run_answer_engine(
+    providers, question, auth_token, client_id, source_ids, timeout_s, kyc_id,
+    source_ids_task, on_sentence, run, turn_id, speaker, bot_name, company_name,
+    history_text, catalog, intent, reply_word_limit,
+) -> str:
+    """Retrieve through the run's answer engine, or directly when a run has none."""
+    if providers is None or providers.answer is None:
+        return await query_spiked_rag(
+            question, auth_token, client_id, source_ids=source_ids, timeout_s=timeout_s,
+            kyc_id=kyc_id, source_ids_task=source_ids_task, on_sentence=on_sentence,
+        )
+    return await providers.answer.answer(
+        TurnContext(
+            run_id=(run or {}).get("run_id", ""),
+            turn_id=turn_id or 0,
+            question=question,
+            speaker=speaker,
+            bot_name=bot_name,
+            company_name=company_name,
+            history_text=history_text,
+            catalog=catalog,
+            client_id=client_id,
+            auth_token=auth_token,
+            intent=intent,
+            reply_word_limit=reply_word_limit,
+            kyc_id=kyc_id,
+            source_ids=source_ids,
+            source_ids_task=source_ids_task,
+            timeout_s=timeout_s,
+        ),
+        on_sentence=on_sentence,
+    )
+
+
 async def _generate_grounded_reply(
     analysis: TurnAnalysis,
     transcript: str,
@@ -921,6 +954,19 @@ async def _generate_grounded_reply(
     corrections = [item.model_dump() for item in analysis.corrections]
     corrected_transcript = apply_validated_corrections(transcript, corrections, catalog)
     resolved_query = analysis.resolved_query.strip() or corrected_transcript
+
+    providers = run.get("providers") if run is not None else None
+    if providers is not None and providers.is_delegated and turn_id is not None:
+        # The vendor's own LLM composes and speaks. History, echo and governor
+        # bookkeeping happen in the control socket's avatar_vendor_reply
+        # handler, as soon as the text arrives -- waiting until here would let
+        # the bot's own audio return through Deepgram unrecognised.
+        spoken = await speech.delegate_turn(
+            run, turn_id, resolved_query, DELEGATED_TURN_TIMEOUT_S
+        )
+        run["_streamed_turn_id"] = turn_id
+        _release_floor(run, reply_text=spoken or "")
+        return spoken
     detailed_request = any(
         phrase in transcript.casefold()
         for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive")
@@ -996,9 +1042,10 @@ async def _generate_grounded_reply(
             _make_streaming_sentence_handler(run, turn_id, reply_word_limit, filler_task=filler_task)
             if stream_enabled else (None, None)
         )
-        rag_result = await query_spiked_rag(
-            shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s,
-            kyc_id=kyc_id, source_ids_task=source_ids_task, on_sentence=on_sentence,
+        rag_result = await _run_answer_engine(
+            providers, shaped_query, auth_token, client_id, source_ids, rag_timeout_s,
+            kyc_id, source_ids_task, on_sentence, run, turn_id, speaker, bot_name,
+            company_name, history_text, catalog, analysis.intent, reply_word_limit,
         )
         source_ids_task = None  # consumed; a retry below must not double-await it
         if filler_task is not None and not filler_task.done():
@@ -1032,9 +1079,10 @@ async def _generate_grounded_reply(
                 _make_streaming_sentence_handler(run, turn_id, reply_word_limit)
                 if stream_enabled else (None, None)
             )
-            rag_result = await query_spiked_rag(
-                shaped_query, auth_token, client_id, source_ids=source_ids, timeout_s=rag_timeout_s,
-                kyc_id=kyc_id, on_sentence=retry_on_sentence,
+            rag_result = await _run_answer_engine(
+                providers, shaped_query, auth_token, client_id, source_ids, rag_timeout_s,
+                kyc_id, None, retry_on_sentence, run, turn_id, speaker, bot_name,
+                company_name, history_text, catalog, analysis.intent, reply_word_limit,
             )
             if stream_enabled and retry_state["dispatched"]:
                 spoken_text = " ".join(retry_state["spoken_parts"])
@@ -1548,6 +1596,11 @@ async def _keep_avatar_session_alive(
         raise
 
 
+def pick_provider(explicit: Optional[str], override: Optional[str], default: Optional[str]) -> Optional[str]:
+    """Explicit request field, then per-client config, then env default."""
+    return explicit or override or default
+
+
 async def _deploy_live_avatar_bot(
     meeting_url: str,
     token: str,
@@ -1557,9 +1610,9 @@ async def _deploy_live_avatar_bot(
     bot_name: str = DEFAULT_BOT_NAME,
     avatar_id: Optional[str] = None,
     autospeak_enabled: bool = False,
-    video_provider: str = DEFAULT_VIDEO_PROVIDER,
-    tts_provider: Optional[str] = DEFAULT_TTS_PROVIDER,
-    answer_engine: str = DEFAULT_ANSWER_ENGINE,
+    video_provider: Optional[str] = None,
+    tts_provider: Optional[str] = None,
+    answer_engine: Optional[str] = None,
     request: Optional[Request] = None
 ) -> Dict[str, Any]:
     """Internal core method to deploy the avatar bot into a meeting.
@@ -1581,10 +1634,11 @@ async def _deploy_live_avatar_bot(
         # Resolution validates the combination up front (see registry.resolve):
         # an audio-only face with no voice, or a mismatched brain, fails here
         # rather than becoming a silent avatar halfway through a meeting.
+        overrides = await get_client_providers(client_id)
         provider_set = provider_registry.resolve(
-            video=video_provider,
-            tts=tts_provider,
-            answer=answer_engine,
+            video=pick_provider(video_provider, overrides.get("video_provider"), DEFAULT_VIDEO_PROVIDER),
+            tts=pick_provider(tts_provider, overrides.get("tts_provider"), DEFAULT_TTS_PROVIDER),
+            answer=pick_provider(answer_engine, overrides.get("answer_engine"), DEFAULT_ANSWER_ENGINE),
         )
         video_session = await provider_set.video.create_session(RunContext(
             run_id=run_id,
@@ -1828,9 +1882,9 @@ async def start_bot_endpoint(
         bot_name = DEFAULT_BOT_NAME
         avatar_id = None
         autospeak_enabled = False
-        video_provider = DEFAULT_VIDEO_PROVIDER
-        tts_provider = DEFAULT_TTS_PROVIDER
-        answer_engine = DEFAULT_ANSWER_ENGINE
+        video_provider = None
+        tts_provider = None
+        answer_engine = None
 
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -1841,9 +1895,9 @@ async def start_bot_endpoint(
             bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = body.get("avatar_id")
             autospeak_enabled = bool(body.get("autospeak_enabled", False))
-            video_provider = body.get("video_provider") or DEFAULT_VIDEO_PROVIDER
-            tts_provider = body.get("tts_provider") or DEFAULT_TTS_PROVIDER
-            answer_engine = body.get("answer_engine") or DEFAULT_ANSWER_ENGINE
+            video_provider = body.get("video_provider")
+            tts_provider = body.get("tts_provider")
+            answer_engine = body.get("answer_engine")
             if not token:
                 token = body.get("token", "")
         else:
@@ -1854,9 +1908,9 @@ async def start_bot_endpoint(
             bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = form.get("avatar_id")
             autospeak_enabled = str(form.get("autospeak_enabled", "")).strip().lower() in ("true", "1", "on")
-            video_provider = form.get("video_provider") or DEFAULT_VIDEO_PROVIDER
-            tts_provider = form.get("tts_provider") or DEFAULT_TTS_PROVIDER
-            answer_engine = form.get("answer_engine") or DEFAULT_ANSWER_ENGINE
+            video_provider = form.get("video_provider")
+            tts_provider = form.get("tts_provider")
+            answer_engine = form.get("answer_engine")
             if not token:
                 token = form.get("token", "")
 
@@ -1909,115 +1963,12 @@ async def create_live_avatar_bot(
         request=request
     )
 
-async def _stop_avatar_session(session_id: Optional[str]) -> Optional[int]:
-    """Release the LiveAvatar session so the concurrency slot is freed.
-
-    LiveAvatar allows one concurrent session per key, so a session that outlives
-    its meeting does not merely bill — it blocks every subsequent start with
-    `4032 Session concurrency limit reached`. Stopping it is the single most
-    important half of teardown.
-    """
-    if not session_id or not LIVEAVATAR_API_KEY:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{LIVEAVATAR_BASE_URL}/v1/sessions/stop",
-                headers={"X-API-KEY": LIVEAVATAR_API_KEY, "Content-Type": "application/json"},
-                json={"session_id": session_id},
-            )
-        logger.info("[Teardown] LiveAvatar session %s stop -> %s", session_id, resp.status_code)
-        return resp.status_code
-    except Exception:
-        logger.error("[Teardown] Failed to stop LiveAvatar session %s", session_id, exc_info=True)
-        return None
-
-
-async def _leave_recall_call(bot_id: Optional[str]) -> Optional[int]:
-    if not bot_id or not RECALL_API_KEY:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{RECALL_BASE_URL.rstrip('/')}/api/v1/bot/{bot_id}/leave_call/",
-                headers={"Authorization": f"Token {RECALL_API_KEY}"},
-            )
-        logger.info("[Teardown] Recall bot %s leave_call -> %s", bot_id, resp.status_code)
-        return resp.status_code
-    except Exception:
-        logger.error("[Teardown] Failed to evict Recall bot %s", bot_id, exc_info=True)
-        return None
-
-
-async def _teardown_run(run_id: str) -> Dict[str, Any]:
-    """Release every resource a run holds, then evict it from the registry.
-
-    Written to be idempotent and to never raise: disconnect is the path a user
-    reaches for when something has already gone wrong, so a failure in one leg
-    must not strand the others. Each leg is attempted independently and the
-    run is evicted regardless of what the remote services report.
-    """
-    run = _ACTIVE_RUNS.get(run_id)
-    if not run:
-        return {"ok": True, "already_gone": True}
-
-    for key in ("active_response_task", "watchdog_task", "keepalive_task", "mute_expiry_task"):
-        task = run.get(key)
-        if task and not task.done():
-            task.cancel()
-    for entry in (run.get("pending_turns") or {}).values():
-        timer = entry.get("timer")
-        if timer and not timer.done():
-            timer.cancel()
-
-    intel = run.get("intel")
-    if intel:
-        intel.stop()
-
-    control_ws = run.get("control_ws")
-    if control_ws:
-        try:
-            await control_ws.close()
-        except Exception:
-            pass
-        run["control_ws"] = None
-
-    for socket in list(run.get("rep_sockets") or ()):
-        try:
-            await socket.close()
-        except Exception:
-            pass
-    run["rep_sockets"] = set()
-
-    # Fall back to the direct stop for runs created before the provider layer,
-    # so a rolling deploy cannot strand a session (`4032` on LiveAvatar).
-    providers = run.get("providers")
-    video_session = run.get("video_session")
-    close_video = (
-        providers.video.close(video_session)
-        if providers is not None and video_session is not None
-        else _stop_avatar_session(run.get("session_id"))
-    )
-    recall_status, avatar_status = await asyncio.gather(
-        _leave_recall_call(run.get("bot_id")),
-        close_video,
-    )
-
-    _ACTIVE_RUNS.pop(run_id, None)
-    logger.info("[Teardown] Run %s released (%d still active)", run_id, len(_ACTIVE_RUNS))
-    return {
-        "ok": True,
-        "run_id": run_id,
-        "recall_status": recall_status,
-        "avatar_session_status": avatar_status,
-    }
-
-
-def _find_run_id_by_bot(bot_id: str) -> Optional[str]:
-    for run_id, run in _ACTIVE_RUNS.items():
-        if run.get("bot_id") == bot_id:
-            return run_id
-    return None
+from src.core.runs import (
+    _ACTIVE_RUNS,
+    _find_run_id_by_bot,
+    _leave_recall_call,
+    _teardown_run,
+)
 
 
 @app.get("/api/active-runs")
@@ -2121,464 +2072,25 @@ def verify_recall_websocket(headers: Any, fallback_token: str, supplied_token: s
     return False
 
 
-def _push_heard(
-    run: Dict[str, Any],
-    speaker: str,
-    text: str,
-    reply: bool,
-    reason: str,
-) -> None:
-    """Mirror the gate's verdict onto the avatar overlay and the rep console.
-
-    In avatar mode this is the *only* path a transcript can reach the frontend:
-    the recall backend never saw this bot created, so its transcript stream is
-    empty by construction. These are the same finalized, speaker-attributed
-    turns the agent itself reasons over.
-    """
-    _push_rep(run, {
-        "type": "heard",
-        "speaker": speaker,
-        "text": text,
-        "reply": reply,
-        "reason": reason,
-    })
-
-    control_ws = run.get("control_ws")
-    if not control_ws:
-        return
-
-    async def send() -> None:
-        try:
-            await control_ws.send_json({
-                "type": "heard",
-                "speaker": speaker,
-                "text": text,
-                "reply": reply,
-                "reason": reason,
-            })
-        except Exception:
-            pass
-
-    asyncio.create_task(send())
-
-
-def _push_control(run: Dict[str, Any], message: Dict[str, Any]) -> None:
-    """Fire-and-forget a message to the avatar page itself (/ws/control).
-
-    Distinct from _push_rep: that reaches the rep's console, this reaches the
-    actual meeting video feed avatar.js renders — used for the mute countdown
-    overlay, which every meeting participant sees, not just the rep.
-    """
-    control_ws = run.get("control_ws")
-    if not control_ws:
-        return
-
-    async def send() -> None:
-        try:
-            await control_ws.send_json(message)
-        except Exception:
-            pass
-
-    try:
-        asyncio.create_task(send())
-    except RuntimeError:
-        send().close()
-
-
-def _push_rep(run: Dict[str, Any], message: Dict[str, Any]) -> None:
-    """Fire-and-forget a message to the rep's console, if one is attached.
-
-    Never awaited by the turn pipeline: a rep with a wedged socket must not be
-    able to slow down or block what the agent says in the room.
-    """
-    sockets = list(run.get("rep_sockets") or ())
-    if not sockets:
-        return
-
-    async def send() -> None:
-        for socket in sockets:
-            try:
-                await socket.send_json(message)
-            except Exception:
-                # A dead console is dropped on its own disconnect path; failing
-                # to reach one must not stop the others from being told.
-                pass
-
-    try:
-        asyncio.create_task(send())
-    except RuntimeError:
-        # No running loop. Notifying the console is never worth raising into a
-        # caller — _release_floor is on the speak path, and an exception there
-        # would strand the agent out of LISTENING permanently.
-        send().close()
-
-
-def _set_mute(run: Dict[str, Any], seconds: int) -> None:
-    """Mute the agent for `seconds`. A voice command reissued while already
-    muted simply replaces the previous timer, matching how the wake name
-    always grants the floor regardless of current state."""
-    now_mono = time.monotonic()
-    until_mono = now_mono + seconds
-    until_epoch_ms = int((time.time() + seconds) * 1000)
-    run["muted_until"] = until_mono
-    run["muted_until_epoch_ms"] = until_epoch_ms
-
-    previous = run.get("mute_expiry_task")
-    if previous and not previous.done():
-        previous.cancel()
-
-    logger.info("[Mute] Agent muted for %ds run_id=%s", seconds, run.get("run_id"))
-    mute_message = {"type": "agent_muted", "muted_until_epoch_ms": until_epoch_ms, "seconds": seconds}
-    _push_rep(run, mute_message)
-    _push_control(run, mute_message)
-
-    async def expire() -> None:
-        try:
-            await asyncio.sleep(seconds)
-            # Only clear if nothing re-muted (or cleared) it in the meantime.
-            if run.get("muted_until") == until_mono:
-                run["muted_until"] = None
-                run["muted_until_epoch_ms"] = None
-                logger.info("[Mute] Expired run_id=%s", run.get("run_id"))
-                _push_rep(run, {"type": "agent_unmuted", "reason": "expired"})
-                _push_control(run, {"type": "agent_unmuted", "reason": "expired"})
-        except asyncio.CancelledError:
-            pass
-
-    run["mute_expiry_task"] = asyncio.create_task(expire())
-
-
-def _clear_mute(run: Dict[str, Any], reason: str = "invoked") -> None:
-    """Ask Tom / explicit invocation always overrides mute — the button press
-    is itself the invitation, so it bypasses mute the same way it bypasses
-    the wake name and the addressee gate."""
-    if run.get("muted_until") is None:
-        return
-    run["muted_until"] = None
-    run["muted_until_epoch_ms"] = None
-    task = run.get("mute_expiry_task")
-    if task and not task.done():
-        task.cancel()
-    logger.info("[Mute] Cleared (%s) run_id=%s", reason, run.get("run_id"))
-    _push_rep(run, {"type": "agent_unmuted", "reason": reason})
-    _push_control(run, {"type": "agent_unmuted", "reason": reason})
-
-
-def _push_insight(run: Dict[str, Any], speaker: str, topic: str) -> None:
-    """Signal that the agent has something, without it taking the floor.
-
-    This is the whole of Level 1 on the wire: the rep's console learns the agent
-    could contribute, and nothing is said in the room unless somebody accepts.
-    """
-    _push_rep(run, {
-        "type": "insight_available",
-        "speaker": speaker,
-        "topic": topic,
-    })
-
-
-async def _dispatch_reply(run: Dict[str, Any], answer: str, turn_id: int, source: str = "addressed") -> bool:
-    """Send a finished reply to the avatar and arm the speak watchdog.
-
-    Shared by the addressed-turn path, the invoke endpoint, and the Level 1.5
-    autonomous path so every turn passes the same duplicate guard and echo
-    suppression — invitation bypasses the wake name, not the safety rails.
-    `source` ("addressed" | "invoke" | "autonomous") rides along on the rep
-    socket's agent_spoke event only, purely for console display/audit — it
-    has no effect on gating.
-    """
-    governor: SpeechGovernor = run["governor"]
-    bot_name = run.get("bot_name") or "Tom"
-    spoken_at = time.monotonic()
-
-    if governor.is_duplicate(answer, spoken_at):
-        logger.info("[Governor] Suppressed duplicate reply turn_id=%s", turn_id)
-        _release_floor(run, spoken_at)
-        return False
-
-    control_ws = run.get("control_ws")
-    if not control_ws:
-        logger.warning("[Agent] Avatar control socket unavailable for turn_id=%s", turn_id)
-        _release_floor(run, spoken_at)
-        return False
-
-    history = run.setdefault("history", [])
-    history.append({"speaker": bot_name, "participant_id": "bot", "text": answer})
-    del history[:-40]
-    # Register before dispatch: the echo can return before the socket ack.
-    run["echo"].note_bot_speech(answer, spoken_at)
-    governor.note_reply(answer, spoken_at)
-    _push_rep(run, {"type": "agent_spoke", "text": answer, "turn_id": turn_id, "source": source})
-
-    timing = run.setdefault("turn_timing", {}).setdefault(turn_id, {})
-    timing["dispatched_at"] = spoken_at
-    finalized_at = timing.get("finalized_at")
-    if finalized_at is not None:
-        logger.info(
-            "[TIMING] turn_id=%s finalize->dispatch=%.2fs (turn gate + classification + RAG)",
-            turn_id, spoken_at - finalized_at,
-        )
-
-    await speech.emit_speech(run, turn_id, None, answer)
-    run["watchdog_task"] = asyncio.create_task(_speak_watchdog(run, turn_id, answer))
-    return True
-
-
-async def _speak_chunk(run: Dict[str, Any], turn_id: int, chunk_id: str, text: str) -> bool:
-    """Send one sentence and wait for it to actually finish playing before
-    returning, so sequential chunks of one answer never overlap in the
-    avatar's audio. Returns False once the turn is no longer live (barge-in,
-    superseded turn, or the control socket dropped) — callers use that to
-    stop dispatching further chunks rather than talking over a turn that's
-    already over.
-    """
-    control_ws = run.get("control_ws")
-    # active_turn_id alone isn't enough: an in-place barge-in during SPEAKING
-    # releases the floor (state -> LISTENING) without changing active_turn_id
-    # at all, so a state check is the only thing that actually catches "this
-    # exact turn was just interrupted" between one chunk and the next.
-    if (
-        not control_ws
-        or run.get("active_turn_id") != turn_id
-        or run.get("state") not in (AgentState.THINKING, AgentState.SPEAKING)
-    ):
-        return False
-    event = asyncio.Event()
-    run.setdefault("chunk_events", {})[chunk_id] = event
-    # Stamp once, on this turn's first chunk only: the same field name
-    # _dispatch_reply writes for the legacy single-shot path, so the
-    # avatar_speak_started handler's dispatch->speaking log works for both
-    # without duplicating that logic. Streamed replies never went through
-    # _dispatch_reply at all, so without this, that log line's gating field
-    # was silently never set and the line never printed — see live_avatar.py
-    # avatar_control_endpoint's avatar_speak_started handling.
-    timing = run.setdefault("turn_timing", {}).setdefault(turn_id, {})
-    timing.setdefault("dispatched_at", time.monotonic())
-    try:
-        await speech.emit_speech(run, turn_id, chunk_id, text)
-        timeout = estimate_speech_seconds(text) + 5.0
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning("[Stream] turn_id=%s chunk_id=%s timed out waiting for speak_ended; continuing", turn_id, chunk_id)
-    finally:
-        (run.get("chunk_events") or {}).pop(chunk_id, None)
-    return run.get("active_turn_id") == turn_id and run.get("state") in (AgentState.THINKING, AgentState.SPEAKING)
-
-
-def _make_streaming_sentence_handler(
-    run: Dict[str, Any], turn_id: int, reply_word_limit: int,
-    filler_task: "Optional[asyncio.Task[bool]]" = None,
-) -> "tuple[Callable[[str], Awaitable[None]], Dict[str, Any]]":
-    """Build the on_sentence callback query_spiked_rag calls per sentence.
-
-    Speaks each complete sentence as soon as it's ready instead of waiting
-    for the whole answer — the entire point of streaming. Two safety checks
-    apply before anything is actually spoken:
-    - The first sentence is checked against the same degraded/error markers
-      _generate_grounded_reply already checks the full answer against. If it
-      looks like a failure, nothing is spoken here at all — the caller falls
-      through to the existing full-buffer degraded-check-and-retry path
-      exactly as if streaming had never been attempted.
-    - A running word count enforces the same backstop as the non-streaming
-      path (reply_word_limit + MAX_QUESTION_WORDS), stopping at a sentence
-      boundary instead of a raw word-count slice — so a long answer still
-      ends on a complete thought, just decided incrementally instead of
-      after the fact.
-
-    filler_task, when given, is the in-flight _speak_chunk() call for the
-    latency-masking filler line (see _generate_grounded_reply) — started
-    concurrently with the RAG call, not before it. The first real sentence
-    awaits it before dispatching, so the filler's own playback (~1-2s) never
-    overlaps the real answer's audio even though the RAG round trip that
-    produced this sentence ran the whole time the filler was talking.
-    Awaiting an already-finished task is a no-op, so a slow filler vs. a
-    fast RAG response (or the reverse) both resolve correctly without any
-    extra bookkeeping here.
-
-    Returns (callback, state) — state accumulates what was actually spoken
-    (state["spoken_parts"]) and whether anything was dispatched
-    (state["dispatched"]), which the caller uses to decide whether this
-    attempt already committed to speaking or is still free to retry.
-    """
-    backstop_words = reply_word_limit + MAX_QUESTION_WORDS
-    state: Dict[str, Any] = {
-        "dispatched": False,
-        "aborted": False,
-        "seen_first": False,
-        "cumulative_words": 0,
-        "chunk_n": 0,
-        "spoken_parts": [],
-    }
-
-    def _degraded_marker(text: str) -> bool:
-        lowered = text.lower()
-        return not text or lowered.startswith("error:") or any(marker in lowered for marker in (
-            "could not retrieve", "no specific documentation", "an error occurred",
-            "could not find relevant documents", "no relevant information found",
-            "request timed out", "service unavailable", "failed to get response",
-        ))
-
-    async def on_sentence(raw_sentence: str) -> None:
-        if state["aborted"]:
-            return
-        cleaned = re.sub(r"\[\d+\]", "", raw_sentence)
-        cleaned = re.sub(r"[#*`_~]", "", cleaned)
-        cleaned = re.sub(r"^\s*[-+•]\s+", "", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if not cleaned:
-            return
-        if not state["seen_first"]:
-            state["seen_first"] = True
-            if _degraded_marker(cleaned):
-                # Don't speak a raw failure string — bail out entirely and
-                # let the caller's existing full-buffer path (degraded
-                # check, one retry) handle it exactly as before.
-                state["aborted"] = True
-                return
-        if state["dispatched"] and (
-            run.get("active_turn_id") != turn_id
-            or run.get("state") not in (AgentState.THINKING, AgentState.SPEAKING)
-        ):
-            # Superseded, or barge-in released the floor without changing
-            # active_turn_id (see _speak_chunk) — stop speaking further
-            # chunks. The backend stream is still left to finish reading
-            # quietly in the background so the connection isn't torn down
-            # mid-response, but nothing more will be dispatched.
-            state["aborted"] = True
-            return
-        sentence_words = len(cleaned.split())
-        if state["cumulative_words"] and state["cumulative_words"] + sentence_words > backstop_words:
-            state["aborted"] = True  # budget hit; stop, same as the non-streaming backstop
-            return
-        if filler_task is not None and not state["dispatched"]:
-            # First real sentence: wait for the filler's own playback to
-            # finish so the two never overlap. The RAG round trip that
-            # produced this sentence already ran concurrently with that
-            # wait -- this is not extra latency on top, just sequencing.
-            filler_still_live = await filler_task
-            if not filler_still_live:
-                # Barge-in (or turn superseded) during the filler itself --
-                # don't speak the real answer on top of an interruption
-                # that already happened.
-                state["aborted"] = True
-                return
-        state["chunk_n"] += 1
-        chunk_id = f"{turn_id}-{state['chunk_n']}"
-        state["dispatched"] = True
-        state["cumulative_words"] += sentence_words
-        state["spoken_parts"].append(cleaned)
-        still_live = await _speak_chunk(run, turn_id, chunk_id, cleaned)
-        if not still_live:
-            state["aborted"] = True
-        if state["cumulative_words"] >= backstop_words:
-            state["aborted"] = True
-
-    return on_sentence, state
-
-
-def _finish_streamed_reply(run: Dict[str, Any], turn_id: int, spoken_text: str) -> None:
-    """Bookkeeping for a reply already spoken chunk-by-chunk via _speak_chunk.
-
-    Mirrors what _dispatch_reply does after a single-shot send — history,
-    echo registration, governor, timing log — without re-sending audio.
-    Unlike _dispatch_reply, this can't check governor.is_duplicate() before
-    speaking (there's no full text to check until streaming is already
-    underway), so within-window duplicate suppression doesn't apply to a
-    streamed reply — a real, accepted gap, not an oversight.
-    """
-    bot_name = run.get("bot_name") or "Tom"
-    spoken_at = time.monotonic()
-    governor: SpeechGovernor = run["governor"]
-
-    history = run.setdefault("history", [])
-    history.append({"speaker": bot_name, "participant_id": "bot", "text": spoken_text})
-    del history[:-40]
-    run["echo"].note_bot_speech(spoken_text, spoken_at)
-    governor.note_reply(spoken_text, spoken_at)
-    _push_rep(run, {"type": "agent_spoke", "text": spoken_text, "turn_id": turn_id})
-
-    timing = (run.get("turn_timing") or {}).pop(turn_id, None)
-    if timing and timing.get("finalized_at") is not None:
-        logger.info(
-            "[TIMING] turn_id=%s streamed reply complete, total=%.2fs (turn_finalize->last_chunk_spoken)",
-            turn_id, spoken_at - timing["finalized_at"],
-        )
-    _release_floor(run, spoken_at, reply_text=spoken_text)
-
-
-def _release_floor(run: Dict[str, Any], now: Optional[float] = None, reply_text: str = "") -> None:
-    """Return the agent to LISTENING and open the follow-up window.
-
-    reply_text, when given, sizes the follow-up window to how long that reply
-    actually took to say (see AGENT_FOLLOWUP_WINDOW_REPLY_SCALE) — omitted on
-    release paths where nothing was actually spoken (failures, duplicates,
-    watchdog timeouts), which correctly leaves the window at its flat floor.
-    """
-    run["state"] = AgentState.LISTENING
-    floor: FloorState = run["floor"]
-    floor.last_bot_finished_at = now if now is not None else time.monotonic()
-    if reply_text:
-        floor.last_reply_seconds = estimate_speech_seconds(reply_text)
-    _push_rep(run, {"type": "agent_state", "state": AgentState.LISTENING.value})
-
-
-async def _interrupt_avatar(run: Dict[str, Any], participant_id: str) -> None:
-    """Stop an in-flight turn. Playback and pending inference are both cancelled."""
-    state = run.get("state")
-    if state not in (AgentState.SPEAKING, AgentState.THINKING):
-        return
-
-    if state == AgentState.THINKING:
-        # The answer is not spoken yet and is already stale; drop it silently
-        # rather than delivering a reply to a question the room moved past.
-        pending = run.get("active_response_task")
-        if pending and not pending.done():
-            pending.cancel()
-        logger.info("[Barge-In] Cancelled pending turn participant_id=%s", participant_id)
-        _release_floor(run)
-        return
-
-    control_ws = run.get("control_ws")
-    if not control_ws:
-        return
-    run["state"] = AgentState.INTERRUPTING
-    logger.info("[Barge-In] participant_id=%s sustained_ms=%d", participant_id, AGENT_BARGE_IN_MS)
-    await control_ws.send_json({
-        "type": "avatar_interrupt",
-        "turn_id": run.get("active_turn_id"),
-    })
-
-
-async def _speak_watchdog(run: Dict[str, Any], turn_id: int, text: str) -> None:
-    """Force LISTENING if the avatar never reports speak_started/speak_ended.
-
-    Without this a single dropped LiveKit data event wedges the run in SPEAKING
-    forever, after which every reply is suppressed and only barge-in ever fires.
-    """
-    try:
-        await asyncio.sleep(AGENT_SPEAK_START_TIMEOUT_S)
-        if run.get("active_turn_id") != turn_id:
-            return
-        if run.get("state") == AgentState.THINKING:
-            logger.warning("[Watchdog] No speak_started for turn_id=%s; releasing floor", turn_id)
-            _release_floor(run)
-            return
-
-        remaining = estimate_speech_seconds(text) + AGENT_SPEAK_MAX_OVERRUN_S
-        await asyncio.sleep(remaining)
-        if run.get("active_turn_id") != turn_id:
-            return
-        if run.get("state") != AgentState.LISTENING:
-            logger.warning(
-                "[Watchdog] turn_id=%s stuck in %s after %.1fs; releasing floor",
-                turn_id,
-                run.get("state"),
-                AGENT_SPEAK_START_TIMEOUT_S + remaining,
-            )
-            _release_floor(run)
-    except asyncio.CancelledError:
-        pass
+# Floor state and speech dispatch live in the core; re-exported here while
+# live_avatar.py is still the service module.
+from src.core.floor import (
+    AGENT_BARGE_IN_MS,
+    AGENT_FOLLOWUP_WINDOW_REPLY_SCALE,
+    _clear_mute,
+    _dispatch_reply,
+    _finish_streamed_reply,
+    _interrupt_avatar,
+    _make_streaming_sentence_handler,
+    _push_control,
+    _push_heard,
+    _push_insight,
+    _push_rep,
+    _release_floor,
+    _set_mute,
+    _speak_chunk,
+    _speak_watchdog,
+)
 
 
 def _ingest_utterance(

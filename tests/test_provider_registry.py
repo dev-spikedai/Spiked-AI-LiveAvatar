@@ -138,4 +138,4 @@ def test_every_registered_adapter_satisfies_its_contract():
         engine = cls()
         assert isinstance(engine, AnswerEngine)
         assert engine.name == name
-        assert engine.mode in ("stream", "delegated")
+        assert callable(getattr(engine, "answer", None))

@@ -519,12 +519,13 @@ def test_teardown_is_idempotent_and_evicts_the_run(monkeypatch):
         stopped.append(("recall", bot_id))
         return 200
 
-    async def fake_stop(session_id):
-        stopped.append(("avatar", session_id))
-        return 200
+    class FakeVideo:
+        async def close(self, session):
+            stopped.append(("avatar", session.session_id))
 
-    monkeypatch.setattr(live_avatar, "_leave_recall_call", fake_leave)
-    monkeypatch.setattr(live_avatar, "_stop_avatar_session", fake_stop)
+    from src.core import runs as runs_module
+
+    monkeypatch.setattr(runs_module, "_leave_recall_call", fake_leave)
 
     class FakeIntel:
         def __init__(self):
@@ -537,6 +538,8 @@ def test_teardown_is_idempotent_and_evicts_the_run(monkeypatch):
     live_avatar._ACTIVE_RUNS["tear"] = _run_state(
         bot_id="bot-1", session_id="sess-1", intel=intel,
         active_response_task=None, watchdog_task=None,
+        providers=SimpleNamespace(video=FakeVideo()),
+        video_session=SimpleNamespace(session_id="sess-1"),
     )
 
     result = asyncio.run(live_avatar._teardown_run("tear"))

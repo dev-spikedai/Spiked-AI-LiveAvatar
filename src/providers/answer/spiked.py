@@ -1,52 +1,25 @@
-"""Spiked /ask as an answer engine. Wraps live_avatar.query_spiked_rag for now."""
+"""Spiked /ask as an answer engine."""
 
-import logging
-from typing import AsyncIterator
+from typing import Any, Optional
 
 from src.providers.base import AnswerEngine, TurnContext
-
-logger = logging.getLogger("SpikedMeetingAgent")
 
 
 class SpikedAnswerEngine(AnswerEngine):
     name = "spiked"
-    mode = "stream"
 
-    async def stream_answer(self, ctx: TurnContext) -> AsyncIterator[str]:
-        """Turn query_spiked_rag's sentence callbacks into a pull interface."""
-        import asyncio
-
-        # Lazy: live_avatar -> registry -> this module would cycle.
+    async def answer(self, ctx: TurnContext, on_sentence: Optional[Any] = None) -> str:
+        # Lazy: live_avatar -> registry -> this module would cycle. Goes away
+        # when retrieval moves into src/core.
         from src import live_avatar
 
-        queue: "asyncio.Queue[object]" = asyncio.Queue()
-        _DONE = object()
-
-        async def on_sentence(sentence: str) -> None:
-            await queue.put(sentence)
-
-        async def pump() -> None:
-            try:
-                await live_avatar.query_spiked_rag(
-                    ctx.question,
-                    auth_token=ctx.auth_token,
-                    client_id=ctx.client_id,
-                    on_sentence=on_sentence,
-                )
-            except Exception:
-                logger.error("[Spiked] retrieval failed run_id=%s turn_id=%s",
-                             ctx.run_id, ctx.turn_id, exc_info=True)
-            finally:
-                await queue.put(_DONE)
-
-        task = asyncio.create_task(pump())
-        try:
-            while True:
-                item = await queue.get()
-                if item is _DONE:
-                    return
-                yield item  # type: ignore[misc]
-        finally:
-            # Early exit (barge-in, backstop) must not leave retrieval running.
-            if not task.done():
-                task.cancel()
+        return await live_avatar.query_spiked_rag(
+            ctx.question,
+            ctx.auth_token or "",
+            ctx.client_id,
+            source_ids=ctx.source_ids,
+            timeout_s=ctx.timeout_s,
+            kyc_id=ctx.kyc_id,
+            source_ids_task=ctx.source_ids_task,
+            on_sentence=on_sentence,
+        )
