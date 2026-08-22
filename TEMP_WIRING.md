@@ -15,7 +15,7 @@ In `src/live_avatar.py`:
   answer lands, then returns that instead.
 - `_poll_cognitive_answer` — the poll loop itself.
 - Config (env-overridable):
-  - `AGENT_COGNITIVE_FALLBACK` (default `true`) — the kill switch.
+  - `AGENT_COGNITIVE_FALLBACK` (default `false`) — the kill switch.
   - `AGENT_COGNITIVE_FALLBACK_TIMEOUT_S` (default 25)
   - `AGENT_COGNITIVE_POLL_INTERVAL_S` (default 1.5)
 - The one-shot retry in `_generate_grounded_reply` is suppressed while the
