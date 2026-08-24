@@ -210,13 +210,15 @@ async def get_current_user_settings(user_id: str = Depends(get_user_id_from_toke
     supabase = g_vars["supabase"]
 
     try:
-        response = supabase.table("user_configs").select(
-            "bot_name, selected_persona, custom_prompt, answer_styles, meeting_domains, "
-            "strategic_keywords, executive_snapshot, "
-            "seller_company, products_services, product_domain, "
-            "client_company, seller_name, client_names, sub_domains, company_url, "
-            "seller_linkedin_url, seller_job_profile, user_industry"
-        ).eq("user_id", user_id).single().execute()
+        response = await asyncio.to_thread(
+            lambda: supabase.table("user_configs").select(
+                "bot_name, selected_persona, custom_prompt, answer_styles, meeting_domains, "
+                "strategic_keywords, executive_snapshot, "
+                "seller_company, products_services, product_domain, "
+                "client_company, seller_name, client_names, sub_domains, company_url, "
+                "seller_linkedin_url, seller_job_profile, user_industry"
+            ).eq("user_id", user_id).single().execute()
+        )
 
         settings = SettingsModel(**{
             "botName": response.data.get("bot_name", "SpikedAI"),

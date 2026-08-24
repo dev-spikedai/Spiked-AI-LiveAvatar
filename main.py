@@ -11,11 +11,22 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import faiss
+import torch
 from fastapi import FastAPI
 from fastapi import Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 from services.ai_helpers import cleanup_clients
+
+# Both torch and faiss default their CPU thread counts to os.cpu_count(),
+# which can oversubscribe a CPU-limited deployment container (e.g. Cloud Run
+# with --cpu=1 or 2) -- multiple intra-op threads competing for the same
+# throttled vCPU makes individual embedding/search calls slower, not faster.
+# Env-overridable so the numbers can be tuned per deployment without a code
+# change; set as early as possible, before any model/index work happens.
+torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS", "2")))
+faiss.omp_set_num_threads(int(os.getenv("FAISS_NUM_THREADS", "1")))
 
 from core.config import (
     init_jwt_authentication,

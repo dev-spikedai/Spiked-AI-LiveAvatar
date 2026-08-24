@@ -369,7 +369,9 @@ async def build_rag_context(
         hybrid_params["p_source_ids"] = source_ids
 
     try:
-        db_response = supabase.rpc("hybrid_match_chunks_by_sources", hybrid_params).execute()
+        db_response = await asyncio.to_thread(
+            lambda: supabase.rpc("hybrid_match_chunks_by_sources", hybrid_params).execute()
+        )
     except Exception as e:
         logger.warning(f"[RAG] hybrid RPC unavailable ({e}); falling back to vector-only")
         legacy_params = {
@@ -380,7 +382,9 @@ async def build_rag_context(
         }
         if source_ids:
             legacy_params["p_source_ids"] = source_ids
-        db_response = supabase.rpc("match_chunks_by_sources", legacy_params).execute()
+        db_response = await asyncio.to_thread(
+            lambda: supabase.rpc("match_chunks_by_sources", legacy_params).execute()
+        )
 
     logger.warning(f"[RAG] returned {len(db_response.data or [])} rows; first_source_id={(db_response.data[0].get('source_id') if db_response.data else None)}")
 

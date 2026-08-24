@@ -431,13 +431,21 @@ class _WarmIndex:
     ):
         """Dense top-k against the warm index (FAISS IndexFlatIP -- exact
         inner product, see _build_index). Returns None if this user isn't
-        warm yet -- caller should fall back to the DB RPC."""
+        warm yet -- caller should fall back to the DB RPC.
+
+        Stale-while-revalidate: once a bucket ages past WARM_INDEX_TTL_SECONDS,
+        a refresh is kicked off in the background, but this call still serves
+        the (slightly stale) in-memory data instead of discarding it and
+        forcing every request in that gap onto the slow RPC fallback. The
+        staleness window this can add (up to one reload's duration) is no
+        worse than the freshness window a warm hit already implies -- state
+        as of last load, not truly live -- so this doesn't introduce a new
+        class of correctness risk, just extends the existing one slightly."""
         bucket = self._by_user.get(user_id)
         if bucket is None:
             return None
         if not self.is_fresh(user_id):
             self.kick_off_warm_load(user_id)
-            return None
         if bucket["embeddings"].size == 0:
             return []
         return _search_index(bucket["index"], bucket["chunks"], query_embedding, source_ids, top_k)

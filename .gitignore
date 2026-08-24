@@ -6,6 +6,7 @@ __pycache__/
 # Virtual environments
 venv/
 virtualenv/
+.venv/
 .okay/
 .okay.*
 okay/
@@ -57,6 +58,9 @@ deploy.ps1
 
 # Notebooks (optional)
 .ipynb_checkpoints/
+
+# Local-only working docs (not for commit)
+*.local.md
 
 
 pdfs/

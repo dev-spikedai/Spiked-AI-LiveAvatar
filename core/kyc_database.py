@@ -5,18 +5,10 @@ import logging
 import asyncio
 import time
 from typing import Optional, Dict, Any
-from fastapi import Request, HTTPException
+from fastapi import HTTPException
 from datetime import datetime
-import httpx
-from jose import jwt
 
-from core.config import (
-    get_g_vars,
-    APP_ENV,
-    DEFAULT_TEST_USER_ID,
-    SUPABASE_URL,
-    SUPABASE_SERVICE_ROLE_KEY,
-)
+from core.config import get_g_vars
 
 # Sentinel kyc_id for the per-client buyer context that is set manually (via the
 # Client Context modal) rather than tied to a generated/selected KYC document.
@@ -27,89 +19,16 @@ MANUAL_KYC_ID = "00000000-0000-0000-0000-000000000000"
 
 logger = logging.getLogger(__name__)
 
-_MFA_ENROLLMENT_CACHE = {}
-_MFA_ENROLLMENT_CACHE_TTL = 300
-
-
-async def _user_has_verified_totp(user_id: str) -> bool:
-    now = time.time()
-    cached = _MFA_ENROLLMENT_CACHE.get(user_id)
-    if cached and now - cached["ts"] < _MFA_ENROLLMENT_CACHE_TTL:
-        return cached["has_totp"]
-
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return False
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(
-                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
-                headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                },
-            )
-            response.raise_for_status()
-
-        user_payload = response.json() or {}
-        factors = user_payload.get("factors", [])
-        has_totp = any(
-            (factor.get("factor_type") == "totp" or factor.get("type") == "totp")
-            and factor.get("status") == "verified"
-            for factor in factors
-        )
-        _MFA_ENROLLMENT_CACHE[user_id] = {"has_totp": has_totp, "ts": now}
-        return has_totp
-    except Exception as e:
-        logger.warning(f"Could not determine MFA enrollment for user {user_id}: {e}")
-        return False
-
-
-async def get_user_id_from_token(request: Request) -> str:
-    """
-    Validates the bearer token and returns the user ID.
-    Raises 401 Unauthorized in production if the token is invalid or missing.
-    """
-    auth_header = request.headers.get("Authorization")
-    g_vars = get_g_vars()
-    supabase = g_vars["supabase"]
-
-    if not auth_header:
-        if APP_ENV == "development":
-            logger.warning("No Authorization header. Using default test user.")
-            return DEFAULT_TEST_USER_ID
-        raise HTTPException(status_code=401, detail="Authorization header is required.")
-
-    try:
-        scheme, token = auth_header.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authentication scheme.")
-
-        user_response = await asyncio.to_thread(supabase.auth.get_user, token)
-        if not user_response.user:
-            raise HTTPException(status_code=401, detail="Invalid or expired token.")
-
-        claims = jwt.get_unverified_claims(token)
-        aal = claims.get("aal", "aal1")
-
-        if aal != "aal2":
-            has_verified_totp = await _user_has_verified_totp(user_response.user.id)
-            if has_verified_totp:
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "code": "MFA_REQUIRED",
-                        "message": "MFA verification required for this session.",
-                    },
-                )
-
-        return user_response.user.id
-    except Exception as e:
-        logger.error(f"Authentication failed: {e}", exc_info=True)
-        if APP_ENV == "development":
-            logger.warning("Authentication failed. Falling back to default test user.")
-            return DEFAULT_TEST_USER_ID
-        raise HTTPException(status_code=401, detail="Could not validate credentials.")
+# get_client_kyc_config is called on every /ask/* request that carries a
+# client_id (routers/search.py's _resolve_effective_settings), ahead of
+# retrieval -- an uncached hit here adds a full Supabase round trip to every
+# such request's time-to-first-byte. KYC config changes far less often than
+# per-request, so a longer TTL than the analogous _SETTINGS_CACHE
+# (core/dependencies.py, 60s) is safe. Invalidated explicitly on write (see
+# upsert_client_kyc_config/upsert_client_context below) so edits take effect
+# immediately rather than waiting out the TTL.
+_KYC_CONFIG_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_KYC_CONFIG_CACHE_TTL = 300  # seconds
 
 
 async def save_profile_to_db(
@@ -501,6 +420,7 @@ async def upsert_client_kyc_config(
             logger.info(
                 f"Upserted client_kyc_configs user={user_id} client={client_id} kyc={kyc_id}"
             )
+            _KYC_CONFIG_CACHE.pop((user_id, client_id, kyc_id), None)
             return response.data[0]
         raise Exception("No data returned from client_kyc_configs upsert")
     except Exception as e:
@@ -546,6 +466,7 @@ async def upsert_client_context(
             logger.info(
                 f"Upserted client context user={user_id} client={client_id} kyc={kyc_id}"
             )
+            _KYC_CONFIG_CACHE.pop((user_id, client_id, kyc_id), None)
             return response.data[0]
         raise Exception("No data returned from client context upsert")
     except Exception as e:
@@ -562,6 +483,12 @@ async def get_client_kyc_config(
     Fetch one client_kyc_configs row. Returns None if not found (caller falls
     back to user_configs to preserve legacy behavior).
     """
+    cache_key = (user_id, client_id, kyc_id)
+    now = time.time()
+    cached = _KYC_CONFIG_CACHE.get(cache_key)
+    if cached and now - cached["ts"] < _KYC_CONFIG_CACHE_TTL:
+        return cached["data"]
+
     g_vars = get_g_vars()
     supabase = g_vars["supabase"]
     if not supabase:
@@ -581,7 +508,9 @@ async def get_client_kyc_config(
             .maybe_single()
             .execute()
         )
-        return response.data if response and response.data else None
+        data = response.data if response and response.data else None
+        _KYC_CONFIG_CACHE[cache_key] = {"data": data, "ts": now}
+        return data
     except Exception as e:
         logger.warning(f"client_kyc_configs lookup failed (falling back): {e}")
         return None

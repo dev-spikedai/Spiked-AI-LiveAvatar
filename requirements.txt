@@ -17,7 +17,7 @@ cryptography>=41.0.0
 ecdsa>=0.18.0
 
 # AI & Machine Learning (embedding model + Groq/Gemini generation)
-openai>=1.40.0
+openai>=1.40.0,<2.0.0
 google-genai
 torch>=2.4.0
 --extra-index-url https://download.pytorch.org/whl/cpu
