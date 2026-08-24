@@ -1,0 +1,83 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+virtualenv/
+.okay/
+.okay.*
+okay/
+test_main.py
+# Logs and debug files
+*.log
+*.pot
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Environment & configuration
+.env
+*.env
+.env*
+.env.*.local
+# Local databases or vector stores
+vector_db/
+faiss_index.bin
+metadata.pkl
+.warm_index_cache.pkl
+*.db
+*.json
+!plans.json
+
+# Cache
+.cache/
+*.cache
+
+# Editor/IDE config
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+Desktop.ini
+
+# Build artifacts
+build/
+dist/
+deploy.sh
+deploy.ps1
+*.egg-info/
+
+# Notebooks (optional)
+.ipynb_checkpoints/
+
+
+pdfs/
+data/
+spikedAI/
+groq-key.txt
+vexa-key.txt
+openai-key.txt
+testing/
+AddWhileTesting.txt
+vector_store/
+checkpoint.py
+app.py
+cors.json
+testing.py
+
+# Test files
+test_kyc_ui.html
+test_kyc_runner.py
+test_kyc_standalone.py
+test_kyc_real.pyvirtual_env_name/
+scratch/
+virtual_env_name/
+virtual_env_test/

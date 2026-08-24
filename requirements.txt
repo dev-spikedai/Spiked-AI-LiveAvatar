@@ -1,0 +1,26 @@
+# FastAPI and Web Server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# HTTP Client
+httpx
+
+# Data Validation and Settings
+pydantic
+python-dotenv
+
+# Cloud Services & DB
+supabase>=2.3.0,<3
+python-jose[cryptography]==3.3.0
+cryptography>=41.0.0
+ecdsa>=0.18.0
+
+# AI & Machine Learning (embedding model + Groq/Gemini generation)
+openai>=1.40.0
+google-genai
+torch>=2.4.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+transformers
+numpy<2
+faiss-cpu
