@@ -146,6 +146,16 @@ const PROTOCOL_VERSION = 1;
       heardOverlay.classList.remove("visible");
     }
 
+    // Install the open handler before provider.connect(). LiveKit may take a
+    // moment to load/connect, and the control socket can become OPEN during
+    // that await. Registering this afterward loses the one-shot open event and
+    // leaves the page stuck on "Avatar Video Rendering" even though the
+    // backend already accepted the control socket.
+    controlWs.onopen = () => {
+      console.log("[WS] Control connection established");
+      updateStatus("Listening...", "active");
+    };
+
     const handle = await provider.connect({
       credentials,
       runId,
@@ -155,11 +165,6 @@ const PROTOCOL_VERSION = 1;
       onSpeakStarted,
       onSpeakEnded,
     });
-
-    controlWs.onopen = () => {
-      console.log("[WS] Control connection established");
-      updateStatus("Listening...", "active");
-    };
 
     controlWs.onmessage = (event) => {
       let data;

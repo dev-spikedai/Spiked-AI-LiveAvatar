@@ -157,6 +157,31 @@ def test_speaks_when_judged_worthy_and_confident(monkeypatch):
     assert reasoning[0]["worth_interjecting"] is True
 
 
+def test_explicit_speak_up_preference_overrides_discretionary_judge(monkeypatch):
+    run = _run_state(
+        rep_sockets={RecordingWS()},
+        meeting_preferences={"speak_up_when_helpful": True},
+    )
+    calls = []
+
+    async def should_not_run(**_kwargs):
+        calls.append("judged")
+        raise AssertionError("explicit speak-up preference should bypass social judge")
+
+    async def spy(run_, question, speaker, **kwargs):
+        calls.append((question, speaker, kwargs))
+
+    monkeypatch.setattr(live_avatar, "_judge_interjection", should_not_run)
+    monkeypatch.setattr(live_avatar, "_take_floor_and_speak", spy)
+
+    asyncio.run(live_avatar._consider_autospeak(
+        run, "Lisa", "the transcript", "warmed reply", "history"
+    ))
+
+    assert calls and calls[0][0] == "the transcript"
+    assert run["autospeak_count"] == 1
+
+
 def test_stays_silent_when_judged_not_worthy(monkeypatch):
     run = _run_state(rep_sockets={RecordingWS()})
     calls = []

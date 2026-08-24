@@ -10,6 +10,7 @@ from src.live_avatar import (
     remember_meeting_instruction,
 )
 from src.supabase_client import _is_active_memory_row
+from src import supabase_client
 
 
 def test_explicit_speak_up_preference_is_detected():
@@ -118,3 +119,25 @@ def test_first_turn_waits_for_startup_memory_before_classification(monkeypatch):
     prompt = str(captured[0]["contents"])
     assert "speak up" in prompt
     assert "solution architect" in prompt
+
+
+def test_completed_source_ids_are_scoped_to_client(monkeypatch):
+    class Query:
+        def select(self, *_args):
+            return self
+
+        def eq(self, *_args):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[{"id": "source-1"}, {"id": "source-2"}])
+
+    class Client:
+        def table(self, name):
+            assert name == "sources"
+            return Query()
+
+    monkeypatch.setattr(supabase_client, "_supabase_client", Client())
+    assert asyncio.run(
+        supabase_client.get_completed_source_ids("user-1", "client-1")
+    ) == ["source-1", "source-2"]

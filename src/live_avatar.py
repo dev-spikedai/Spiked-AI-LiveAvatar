@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.supabase_client import (
+    get_completed_source_ids,
     get_client_providers,
     get_user_keywords_and_products,
     load_agent_memory,
@@ -364,6 +365,7 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     user_id: Optional[str] = Field(default=None, description="Supabase user ID")
     token: Optional[str] = Field(default=None, description="User's Supabase JWT access token for document RAG")
     client_id: Optional[str] = Field(default=None, description="Client/Company scope identifier")
+    source_ids: Optional[List[str]] = Field(default=None, description="Verified document source IDs for scoped RAG")
     kyc_id: Optional[str] = Field(default=None, description="Active KYC overlay for buyer-aware answers; backend falls back to the manual overlay when absent")
     bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
@@ -499,11 +501,13 @@ async def get_provider_module(module_name: str):
 # ---------------------------------------------------------------------------
 
 async def resolve_source_ids(token_to_use: str, target_client_id: str) -> List[str]:
-    """Resolve a client's ingested (COMPLETED) document/website ids via the
-    backend's own /documents and /websites endpoints, authenticated with the
-    caller's JWT. Cached per user+client (SOURCE_IDS_CACHE_TTL_S) since this
-    costs two Cloud Run round trips and the document set changes on the scale
-    of minutes, not turns.
+    """Resolve a client's ingested (COMPLETED) source IDs.
+
+    Prefer the orchestrator's Supabase connection because the standalone warm
+    RAG service does not expose the legacy /documents and /websites routes.
+    Fall back to those routes for older deployments where direct Supabase
+    access is unavailable. Cache per user+client because the document set
+    changes on the scale of minutes, not turns.
 
     Split out from query_spiked_rag so callers on the speak path (see
     process_transcript_with_gemini) can kick this off *before* the turn is
@@ -511,6 +515,55 @@ async def resolve_source_ids(token_to_use: str, target_client_id: str) -> List[s
     serially afterward.
     """
     if not target_client_id or not token_to_use:
+        return []
+
+    cache_key = f"{extract_user_id_from_jwt(token_to_use)}|{target_client_id}"
+    cached = _SOURCE_IDS_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached["ts"] <= SOURCE_IDS_CACHE_TTL_S:
+        return cached["ids"]
+    _t0 = time.monotonic()
+    try:
+        # The warm-index service only needs source IDs to enforce client scope;
+        # the authoritative source listing already lives in Supabase. Resolve
+        # this locally first to avoid two guaranteed 404s on the stripped
+        # standalone backend.
+        direct = await get_completed_source_ids(
+            extract_user_id_from_jwt(token_to_use),
+            target_client_id,
+            auth_token=token_to_use,
+        )
+        if direct:
+            _SOURCE_IDS_CACHE[cache_key] = {"ts": time.monotonic(), "ids": direct}
+            logger.info(
+                "[RAG] Auto-resolved %d completed source_ids from Supabase for client_id=%s",
+                len(direct), target_client_id,
+            )
+            logger.info("[RAG][TIMING] resolve_source_ids=%.2fs (supabase)", time.monotonic() - _t0)
+            return direct
+
+        base = RAG_BACKEND_URL.rstrip('/')
+        auth_headers = {"Authorization": f"Bearer {token_to_use}"}
+        params = {"client_id": target_client_id}
+        client = _get_backend_http()
+        doc_res, web_res = await asyncio.gather(
+            client.get(f"{base}/documents", headers=auth_headers, params=params, timeout=8.0),
+            client.get(f"{base}/websites", headers=auth_headers, params=params, timeout=8.0),
+        )
+        resolved: List[str] = []
+        for res in (doc_res, web_res):
+            if res.status_code != 200:
+                logger.warning("[RAG] Source listing %s returned %s", res.request.url.path, res.status_code)
+                continue
+            for item in res.json():
+                if item.get("id") and item.get("status") == "COMPLETED":
+                    resolved.append(item["id"])
+        if resolved:
+            _SOURCE_IDS_CACHE[cache_key] = {"ts": time.monotonic(), "ids": resolved}
+            logger.info("[RAG] Auto-resolved %d completed source_ids for client_id=%s", len(resolved), target_client_id)
+        logger.info("[RAG][TIMING] resolve_source_ids=%.2fs (cache_miss)", time.monotonic() - _t0)
+        return resolved
+    except Exception as err:
+        logger.error("[RAG] Failed to auto-resolve source_ids (request will fail closed): %s", err)
         return []
 
 
@@ -573,38 +626,6 @@ async def _wait_for_warm_index(run: Optional[Dict[str, Any]]) -> None:
         raise
     except Exception:
         logger.info("[RAG][WARM] readiness task failed; using normal query path", exc_info=True)
-    cache_key = f"{extract_user_id_from_jwt(token_to_use)}|{target_client_id}"
-    cached = _SOURCE_IDS_CACHE.get(cache_key)
-    if cached and time.monotonic() - cached["ts"] <= SOURCE_IDS_CACHE_TTL_S:
-        return cached["ids"]
-    _t0 = time.monotonic()
-    try:
-        base = RAG_BACKEND_URL.rstrip('/')
-        auth_headers = {"Authorization": f"Bearer {token_to_use}"}
-        params = {"client_id": target_client_id}
-        client = _get_backend_http()
-        doc_res, web_res = await asyncio.gather(
-            client.get(f"{base}/documents", headers=auth_headers, params=params, timeout=8.0),
-            client.get(f"{base}/websites", headers=auth_headers, params=params, timeout=8.0),
-        )
-        resolved: List[str] = []
-        for res in (doc_res, web_res):
-            if res.status_code != 200:
-                logger.warning("[RAG] Source listing %s returned %s", res.request.url.path, res.status_code)
-                continue
-            for item in res.json():
-                if item.get("id") and item.get("status") == "COMPLETED":
-                    resolved.append(item["id"])
-        if resolved:
-            _SOURCE_IDS_CACHE[cache_key] = {"ts": time.monotonic(), "ids": resolved}
-            logger.info("[RAG] Auto-resolved %d completed source_ids for client_id=%s", len(resolved), target_client_id)
-        logger.info("[RAG][TIMING] resolve_source_ids=%.2fs (cache_miss)", time.monotonic() - _t0)
-        return resolved
-    except Exception as err:
-        # With a client_id set and no source_ids, the backend will fail
-        # closed — this request cannot succeed. Error, not warning.
-        logger.error("[RAG] Failed to auto-resolve source_ids (request will fail closed): %s", err)
-        return []
 
 
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
@@ -2080,6 +2101,7 @@ async def _deploy_live_avatar_bot(
     token: str,
     user_id: Optional[str] = None,
     client_id: Optional[str] = None,
+    source_ids: Optional[List[str]] = None,
     kyc_id: Optional[str] = None,
     bot_name: str = DEFAULT_BOT_NAME,
     avatar_id: Optional[str] = None,
@@ -2103,6 +2125,11 @@ async def _deploy_live_avatar_bot(
 
         run_id = f"run_{uuid.uuid4().hex}"
         recall_ws_token = uuid.uuid4().hex
+        logger.info(
+            "[RAG][START] client_id=%s frontend_source_ids=%d",
+            client_id,
+            len(source_ids or []),
+        )
         # Durable memory is loaded in parallel with provider/session setup so
         # persistence does not become a new startup bottleneck.
         memory_task = asyncio.create_task(
@@ -2150,6 +2177,10 @@ async def _deploy_live_avatar_bot(
             "avatar_id": avatar_id,
             "user_id": user_id,
             "client_id": client_id,
+            # IDs originate from the authenticated frontend's active company
+            # scope. The RAG service still applies its own user/client filters;
+            # backend auto-resolution remains the fallback when omitted.
+            "source_ids": [str(source_id) for source_id in (source_ids or []) if source_id],
             "kyc_id": kyc_id,
             "token": token,
             "session_id": video_session.session_id,
@@ -2439,6 +2470,7 @@ async def start_bot_endpoint(
             body = await request.json()
             meeting_url = body.get("meeting_url", "")
             client_id = body.get("client_id")
+            source_ids = body.get("source_ids")
             kyc_id = body.get("kyc_id")
             bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = body.get("avatar_id")
@@ -2452,6 +2484,11 @@ async def start_bot_endpoint(
             form = await request.form()
             meeting_url = form.get("meeting_url", "")
             client_id = form.get("client_id")
+            raw_source_ids = form.get("source_ids")
+            try:
+                source_ids = json.loads(raw_source_ids) if isinstance(raw_source_ids, str) else raw_source_ids
+            except json.JSONDecodeError:
+                source_ids = [item.strip() for item in str(raw_source_ids).split(",") if item.strip()]
             kyc_id = form.get("kyc_id")
             bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
             avatar_id = form.get("avatar_id")
@@ -2469,6 +2506,7 @@ async def start_bot_endpoint(
             meeting_url=meeting_url,
             token=token,
             client_id=client_id,
+            source_ids=source_ids,
             kyc_id=kyc_id,
             bot_name=bot_name,
             avatar_id=avatar_id,
@@ -2501,6 +2539,7 @@ async def create_live_avatar_bot(
         token=token or "",
         user_id=payload.user_id,
         client_id=payload.client_id,
+        source_ids=payload.source_ids,
         kyc_id=payload.kyc_id,
         bot_name=payload.bot_name,
         avatar_id=payload.avatar_id,
@@ -2988,14 +3027,26 @@ async def _consider_autospeak(
         logger.info("[Autospeak] Skipped run_id=%s reason=governor:%s", run_id, governor_reason)
         return
 
-    judgment = await _judge_interjection(
-        transcript=transcript,
-        history_text=history_text,
-        bot_name=bot_name,
-        preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        meeting_instructions=format_meeting_instructions(run),
-        persistent_memory=format_persistent_memory(run),
-    )
+    # An explicit user preference is stronger than the discretionary social
+    # judge. The grounded reply, floor checks, cooldown, and per-run cap still
+    # apply, but a judge must not reinterpret "always speak up when helpful"
+    # as permission to stay silent on a knowledge question.
+    explicit_speak_up = (run.get("meeting_preferences") or {}).get("speak_up_when_helpful") is True
+    if explicit_speak_up:
+        judgment = InterjectionJudgment(
+            worth_interjecting=True,
+            confidence=1.0,
+            reason="explicit speak-up preference with grounded reply",
+        )
+    else:
+        judgment = await _judge_interjection(
+            transcript=transcript,
+            history_text=history_text,
+            bot_name=bot_name,
+            preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            meeting_instructions=format_meeting_instructions(run),
+            persistent_memory=format_persistent_memory(run),
+        )
     logger.info(
         "[Autospeak] Judged run_id=%s worth_interjecting=%s confidence=%.2f reason=%r",
         run_id, judgment.worth_interjecting, judgment.confidence, judgment.reason,

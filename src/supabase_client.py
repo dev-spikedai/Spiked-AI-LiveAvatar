@@ -155,6 +155,51 @@ async def get_user_keywords_and_products(
     return result_data
 
 
+async def get_completed_source_ids(
+    user_id: Optional[str],
+    client_id: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> List[str]:
+    """Resolve completed source IDs directly from Supabase.
+
+    The standalone warm-RAG service intentionally exposes only the answer and
+    warm routes; it does not carry the legacy backend's ``/documents`` and
+    ``/websites`` endpoints. Keeping this lookup here lets the orchestrator
+    pass client-scoped source IDs to either backend without depending on those
+    legacy routes.
+    """
+    if not user_id or user_id == "unknown_user":
+        return []
+
+    client_to_use = _supabase_client
+    if not client_to_use and SUPABASE_URL and auth_token:
+        try:
+            client_to_use = create_client(SUPABASE_URL, auth_token)
+        except Exception:
+            client_to_use = None
+    if not client_to_use:
+        return []
+
+    try:
+        query = (
+            client_to_use.table("sources")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("ingestion_status", "COMPLETED")
+        )
+        if client_id:
+            query = query.eq("client_id", client_id)
+        response = await asyncio.to_thread(query.execute)
+        return [
+            str(row["id"])
+            for row in (response.data or [])
+            if isinstance(row, dict) and row.get("id")
+        ]
+    except Exception as exc:
+        logger.info("[Supabase] Source ID lookup unavailable: %s", exc)
+        return []
+
+
 # Per-client provider overrides. Cached alongside the keyword config because it
 # changes on the same timescale (rarely) and is read on the /start path.
 _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
