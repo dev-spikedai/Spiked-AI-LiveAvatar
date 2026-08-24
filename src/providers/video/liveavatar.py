@@ -13,7 +13,10 @@ logger = logging.getLogger("SpikedMeetingAgent")
 
 LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
-LIVEAVATAR_AVATAR_ID = "9650a758-1085-4d49-8bf3-f347565ec229"
+LIVEAVATAR_AVATAR_ID = os.getenv(
+    "LIVEAVATAR_AVATAR_ID",
+    "9650a758-1085-4d49-8bf3-f347565ec229",
+)
 LIVEAVATAR_SANDBOX = os.getenv("LIVEAVATAR_SANDBOX", "false").lower() == "true"
 # LiveAvatar auto-closes a session that sees no join/interaction for a while
 # (docs.liveavatar.com/reference/keep_session_alive_v1_sessions_keep_alive_post).

@@ -15,6 +15,7 @@ logger = logging.getLogger("SpikedMeetingAgent")
 
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_BASE_URL = os.getenv("RECALL_BASE_URL", "https://ap-northeast-1.recall.ai")
+MEMORY_WRITE_FLUSH_TIMEOUT_S = float(os.getenv("MEMORY_WRITE_FLUSH_TIMEOUT_S", "2.0"))
 
 _ACTIVE_RUNS: Dict[str, Dict[str, Any]] = {}
 
@@ -51,14 +52,50 @@ async def _teardown_run(run_id: str) -> Dict[str, Any]:
     if not run:
         return {"ok": True, "already_gone": True}
 
-    for key in ("active_response_task", "watchdog_task", "keepalive_task", "mute_expiry_task"):
+    for key in (
+        "active_response_task",
+        "watchdog_task",
+        "keepalive_task",
+        "warm_task",
+        "mute_expiry_task",
+    ):
         task = run.get(key)
+        if task and not task.done():
+            task.cancel()
+    for entry in (run.get("proactive_prefetches") or {}).values():
+        task = entry.get("task") if isinstance(entry, dict) else None
+        if task and not task.done():
+            task.cancel()
+    memory_writes = {
+        task for task in (run.get("memory_write_tasks") or ())
+        if task and not task.done()
+    }
+    for task in list(run.get("background_tasks") or ()):
+        if task in memory_writes:
+            continue
         if task and not task.done():
             task.cancel()
     for entry in (run.get("pending_turns") or {}).values():
         timer = entry.get("timer")
         if timer and not timer.done():
             timer.cancel()
+
+    # Durable preferences/facts are the one class of background work worth
+    # allowing to finish during a normal stop. Bound the wait so a broken
+    # Supabase connection can never strand Recall/avatar teardown.
+    if memory_writes:
+        _done, pending = await asyncio.wait(
+            memory_writes,
+            timeout=MEMORY_WRITE_FLUSH_TIMEOUT_S,
+        )
+        if pending:
+            logger.warning(
+                "[Teardown] %d memory writes exceeded %.1fs; cancelling",
+                len(pending), MEMORY_WRITE_FLUSH_TIMEOUT_S,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     intel = run.get("intel")
     if intel:

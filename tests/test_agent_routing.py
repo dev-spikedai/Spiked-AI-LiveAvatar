@@ -87,6 +87,42 @@ def test_turn_needing_context_still_runs_query_repair(monkeypatch):
     assert answer == "Enterprise pricing is published."
 
 
+def test_taught_fact_is_stored_on_the_run_and_not_sent_to_rag(monkeypatch):
+    models = FakeModels([
+        SimpleNamespace(parsed=live_avatar.TurnAnalysisAndReply(
+            response_action="acknowledge",
+            intent="taught_fact",
+            resolved_query="the renewal is in June",
+            taught_fact="The renewal is in June",
+            corrections=[],
+        )),
+    ])
+    monkeypatch.setattr(live_avatar, "gemini_client", SimpleNamespace(aio=SimpleNamespace(models=models)))
+    async def fail_if_rag_called(*args, **kwargs):
+        raise AssertionError("teaching a fact must not query RAG")
+    monkeypatch.setattr(live_avatar, "query_spiked_rag", fail_if_rag_called)
+    run = {"run_id": "meeting-1", "taught_facts": []}
+
+    answer = asyncio.run(live_avatar.process_transcript_with_gemini(
+        transcript="Tom, remember that the renewal is in June.",
+        speaker="Alice", conversation_history=[], auth_token="token",
+        user_context={"company_name": "SpikedAI", "bot_name": "Tom"}, run=run,
+    ))
+
+    assert answer == "Understood."
+    assert run["taught_facts"] == ["The renewal is in June"]
+
+
+def test_taught_facts_are_bounded_and_deduplicated():
+    run = {"run_id": "meeting-1", "taught_facts": []}
+    for index in range(30):
+        live_avatar.remember_taught_fact(run, f"Fact {index}")
+    live_avatar.remember_taught_fact(run, " fact 29. ")
+    assert len(run["taught_facts"]) == 24
+    assert run["taught_facts"][0] == "Fact 6"
+    assert run["taught_facts"][-1] == "fact 29"
+
+
 def test_rag_failure_returns_short_honest_fallback(monkeypatch):
     models = FakeModels([
         SimpleNamespace(
@@ -163,7 +199,7 @@ def test_llm_response_gate_can_acknowledge_without_generation(monkeypatch):
 
 
 def test_non_rag_intent_is_single_shot_and_never_composes_twice(monkeypatch):
-    """coaching/meeting_context/social/command turns used to cost two
+    """meeting_context/social/command turns used to cost two
     sequential Gemini calls (classify, then compose). The classify call now
     drafts the reply itself, so composing it must not consume a second
     response — FakeModels([...]) with exactly one entry proves that: a second

@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
 from supabase import create_client, Client
 
@@ -158,6 +159,105 @@ async def get_user_keywords_and_products(
 # changes on the same timescale (rarely) and is read on the /start path.
 _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
 PROVIDER_TABLE = os.getenv("SUPABASE_PROVIDER_TABLE", "client_provider_configs")
+
+MEMORY_TABLE = os.getenv("SUPABASE_AGENT_MEMORY_TABLE", "agent_memory")
+
+
+def _is_active_memory_row(row: Dict[str, Any]) -> bool:
+    """Fail closed for malformed expiry values; never hydrate expired memory."""
+    expires_at = row.get("expires_at")
+    if not expires_at:
+        return True
+    try:
+        value = expires_at if isinstance(expires_at, datetime) else datetime.fromisoformat(
+            str(expires_at).replace("Z", "+00:00")
+        )
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        logger.warning("[Memory] Ignoring row with malformed expires_at")
+        return False
+
+
+async def load_agent_memory(
+    user_id: Optional[str],
+    client_id: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load durable, explicitly scoped agent memory for a meeting.
+
+    The table is optional during rollout. A missing table or unavailable
+    Supabase connection returns an empty list, leaving the live meeting
+    functional with working and ephemeral memory only.
+    """
+    if not user_id or user_id == "unknown_user":
+        return []
+    client_to_use = _supabase_client
+    if not client_to_use and SUPABASE_URL and auth_token:
+        try:
+            client_to_use = create_client(SUPABASE_URL, auth_token)
+        except Exception:
+            client_to_use = None
+    if not client_to_use:
+        return []
+
+    try:
+        query = (
+            client_to_use.table(MEMORY_TABLE)
+            .select("memory_type, memory_key, memory_value, confidence, expires_at, updated_at")
+            .eq("user_id", user_id)
+            .order("updated_at", desc=True)
+            .limit(100)
+        )
+        if client_id:
+            query = query.or_(f"client_id.eq.,client_id.eq.{client_id}")
+        else:
+            query = query.eq("client_id", "")
+        response = await asyncio.to_thread(query.execute)
+        return [
+            row for row in (response.data or [])
+            if isinstance(row, dict) and _is_active_memory_row(row)
+        ]
+    except Exception as exc:
+        logger.info("[Memory] Persistent memory unavailable: %s", exc)
+        return []
+
+
+async def save_agent_memory(
+    user_id: Optional[str],
+    memory_type: str,
+    memory_key: str,
+    memory_value: Any,
+    client_id: Optional[str] = None,
+    confidence: float = 0.9,
+    source: str = "meeting_instruction",
+) -> bool:
+    """Upsert one durable memory item; failures never affect speech."""
+    if not user_id or user_id == "unknown_user" or not memory_key.strip():
+        return False
+    client_to_use = _supabase_client
+    if not client_to_use:
+        return False
+    row = {
+        "user_id": user_id,
+        "client_id": client_id or "",
+        "memory_type": memory_type,
+        "memory_key": memory_key.strip(),
+        "memory_value": memory_value,
+        "confidence": max(0.0, min(float(confidence), 1.0)),
+        "source": source,
+    }
+    try:
+        await asyncio.to_thread(
+            lambda: client_to_use.table(MEMORY_TABLE)
+            .upsert(row, on_conflict="user_id,client_id,memory_type,memory_key")
+            .execute()
+        )
+        return True
+    except Exception as exc:
+        logger.info("[Memory] Persistent write unavailable: %s", exc)
+        return False
 
 
 async def get_client_providers(client_id: Optional[str]) -> Dict[str, Optional[str]]:

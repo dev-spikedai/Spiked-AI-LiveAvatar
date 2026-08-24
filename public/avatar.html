@@ -26,6 +26,14 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      /* The avatar video is square; object-fit:contain shrinks it to
+         min(100vw,100vh) and centers it, letterboxing the rest. Overlays
+         anchored to the raw viewport edges land in that letterboxed strip
+         and get cropped -- --safe-x/--safe-y is the offset from the
+         viewport edge to the actual visible square's edge, so "left: 12px"
+         becomes "left: calc(var(--safe-x) + 12px)" and lands on the square. */
+      --safe-x: calc((100vw - min(100vw, 100vh)) / 2);
+      --safe-y: calc((100vh - min(100vw, 100vh)) / 2);
     }
     video {
       width: 100%;
@@ -36,8 +44,8 @@
     }
     #status-overlay {
       position: absolute;
-      bottom: 12px;
-      left: 12px;
+      bottom: calc(var(--safe-y) + 48px);
+      left: calc(var(--safe-x) + 24px);
       padding: 6px 12px;
       border-radius: 6px;
       background: rgba(15, 23, 42, 0.75);
@@ -68,9 +76,9 @@
        Rendered into the meeting camera feed, so it is opt-in via ?debug=1. */
     #heard-overlay {
       position: absolute;
-      top: 12px;
-      left: 12px;
-      right: 12px;
+      top: calc(var(--safe-y) + 12px);
+      left: calc(var(--safe-x) + 12px);
+      right: calc(var(--safe-x) + 12px);
       max-height: 45vh;
       overflow: hidden;
       padding: 10px 12px;
@@ -130,7 +138,7 @@
        just the rep's console. */
     #mute-overlay {
       position: absolute;
-      bottom: 24px;
+      bottom: calc(var(--safe-y) + 24px);
       left: 50%;
       transform: translateX(-50%);
       display: none;
@@ -184,11 +192,21 @@
       letter-spacing: 0.5px;
       text-transform: uppercase;
     }
+    #brand-logo {
+      position: absolute;
+      top: calc(var(--safe-y) + 48px);
+      left: calc(var(--safe-x) + 24px);
+      height: 32px;
+      width: auto;
+      z-index: 15;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
   <div id="video-container">
     <video id="avatar-video" autoplay playsinline muted></video>
+    <img id="brand-logo" src="/static/logo.webp" alt="" />
     <div id="heard-overlay">
       <div id="heard-title">Heard this turn</div>
       <div id="heard-lines"></div>

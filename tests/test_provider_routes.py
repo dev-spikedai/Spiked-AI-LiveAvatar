@@ -5,7 +5,9 @@ and nothing else.
 
 import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
+import src.live_avatar as live_avatar
 from src.live_avatar import app
 from src.providers import registry
 
@@ -43,3 +45,44 @@ def test_shell_is_served_and_resolves_a_provider(client):
     assert resp.status_code == 200
     assert "browser_module" in resp.text
     assert "import(moduleUrl)" in resp.text
+
+
+def test_health_exposes_non_secret_runtime_capabilities(client):
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert "warm_rag_configured" in body
+    assert "mcp_configured" in body
+    assert "liveavatar_full_mode" in body
+    assert "persistent_memory_configured" in body
+    assert "RECALL_API_KEY" not in str(body)
+
+
+def test_diagnostics_are_sanitized_and_include_live_timing(client):
+    run_id = "run_diagnostics_test"
+    live_avatar._ACTIVE_RUNS[run_id] = {
+        "run_id": run_id,
+        "state": "LISTENING",
+        "bot_name": "Tom",
+        "providers": SimpleNamespace(video=SimpleNamespace(name="liveavatar")),
+        "autospeak_enabled": True,
+        "meeting_preferences": {"speak_up_when_helpful": True},
+        "turn_timing": {1: {"finalized_at": 1.0, "dispatched_at": 2.0}},
+        "live_turns": {"p1": {"speaker": "Client", "updated_at": 3.0, "wake_candidate": True}},
+        "proactive_prefetches": {},
+        "persistent_memory": [],
+        "warm_task": None,
+        "active_mcp_context": None,
+        "token": "must-not-appear",
+        "meeting_url": "must-not-appear",
+    }
+    try:
+        response = client.get(f"/api/runs/{run_id}/diagnostics")
+    finally:
+        live_avatar._ACTIVE_RUNS.pop(run_id, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["turn_timing"]["1"]["dispatched_at"] == 2.0
+    assert body["live_turns"]["p1"]["wake_candidate"] is True
+    assert "token" not in body
+    assert "meeting_url" not in body

@@ -25,6 +25,11 @@ logger = logging.getLogger("SpikedMeetingAgent")
 AGENT_BARGE_IN_MS = int(os.getenv("AGENT_BARGE_IN_MS", "700"))
 # Scales the follow-up window by how long the reply took to say.
 AGENT_FOLLOWUP_WINDOW_REPLY_SCALE = float(os.getenv("AGENT_FOLLOWUP_WINDOW_REPLY_SCALE", "0.5"))
+# _speak_watchdog's two timers: how long to wait for speak_started before
+# assuming the event was dropped, and how much overrun past the estimated
+# speech duration to tolerate before assuming speak_ended was dropped too.
+AGENT_SPEAK_START_TIMEOUT_S = float(os.getenv("AGENT_SPEAK_START_TIMEOUT_S", "4"))
+AGENT_SPEAK_MAX_OVERRUN_S = float(os.getenv("AGENT_SPEAK_MAX_OVERRUN_S", "6"))
 
 
 def _push_heard(
@@ -404,8 +409,9 @@ def _finish_streamed_reply(run: Dict[str, Any], turn_id: int, spoken_text: str) 
     governor.note_reply(spoken_text, spoken_at)
     _push_rep(run, {"type": "agent_spoke", "text": spoken_text, "turn_id": turn_id})
 
-    timing = (run.get("turn_timing") or {}).pop(turn_id, None)
+    timing = (run.get("turn_timing") or {}).get(turn_id)
     if timing and timing.get("finalized_at") is not None:
+        timing["completed_at"] = spoken_at
         logger.info(
             "[TIMING] turn_id=%s streamed reply complete, total=%.2fs (turn_finalize->last_chunk_spoken)",
             turn_id, spoken_at - timing["finalized_at"],

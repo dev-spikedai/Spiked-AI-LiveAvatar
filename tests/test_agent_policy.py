@@ -25,6 +25,9 @@ def result(text, *, is_final=True, speech_final=False):
 def test_invocation_requires_safe_explicit_name():
     assert detect_invocation("Tom, what does it cost?", "Tom").addressed
     assert detect_invocation("What does it cost, Thom?", "Tom").addressed
+    assert detect_invocation("Time, what does it cost?", "Tom").addressed
+    assert detect_invocation("Tone, can you explain that?", "Tom").addressed
+    assert detect_invocation("Tome, can you explain that?", "Tom").addressed
     assert not detect_invocation("What time can you meet?", "Tom").addressed
     assert not detect_invocation("Dom, what do you think?", "Tom").addressed
     assert not detect_invocation("We will discuss tomorrow.", "Tom").addressed

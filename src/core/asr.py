@@ -42,11 +42,16 @@ class ParticipantTranscriber:
         participant_name: str,
         keywords: List[str],
         on_utterance: Any,
+        on_interim: Optional[Any] = None,
     ):
         self.participant_id = participant_id
         self.participant_name = participant_name
         self.keywords = keywords
         self.on_utterance = on_utterance
+        # Interim text is deliberately a side channel: it can warm routing and
+        # retrieval, but only the finalized callback is allowed to commit a
+        # turn to history or make Tom speak.
+        self.on_interim = on_interim
         self.ws: Any = None
         self.receiver_task: Optional[asyncio.Task] = None
         self.buffer = FinalUtteranceBuffer()
@@ -113,7 +118,31 @@ class ParticipantTranscriber:
 
     async def send(self, pcm: bytes) -> None:
         await self.ensure_started()
-        await self.ws.send(pcm)
+        try:
+            await self.ws.send(pcm)
+        except (ConnectionClosed, OSError, asyncio.TimeoutError):
+            logger.warning(
+                "[Deepgram] participant socket dropped; reconnecting participant_id=%s",
+                self.participant_id,
+            )
+            await self._reset_connection()
+            await self.ensure_started()
+            await self.ws.send(pcm)
+
+    async def _reset_connection(self) -> None:
+        """Drop only this participant's stream so other speakers continue."""
+        socket = self.ws
+        self.ws = None
+        receiver = self.receiver_task
+        self.receiver_task = None
+        if receiver and not receiver.done():
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+        if socket:
+            try:
+                await socket.close()
+            except Exception:
+                pass
 
     async def _receive(self) -> None:
         try:
@@ -123,9 +152,29 @@ class ParticipantTranscriber:
                 msg_type = data.get("type")
 
                 has_words = False
+                interim_text = ""
                 if msg_type == "Results":
                     alternatives = data.get("channel", {}).get("alternatives", [])
-                    has_words = bool(alternatives and (alternatives[0].get("transcript") or "").strip())
+                    if alternatives:
+                        interim_text = (alternatives[0].get("transcript") or "").strip()
+                    has_words = bool(interim_text)
+
+                    if interim_text and self.on_interim is not None:
+                        try:
+                            self.on_interim(
+                                self.participant_id,
+                                self.participant_name,
+                                interim_text,
+                                bool(data.get("is_final")),
+                            )
+                        except Exception:
+                            # Interim routing is an optimization. A faulty
+                            # observer must never stop the ASR receiver.
+                            logger.warning(
+                                "[Deepgram] interim observer failed participant_id=%s",
+                                self.participant_id,
+                                exc_info=True,
+                            )
 
                 utterance = self.buffer.add_result(data)
                 if utterance:
@@ -153,8 +202,33 @@ class ParticipantTranscriber:
         if self.ws:
             try:
                 await self.ws.send(json.dumps({"type": "CloseStream"}))
-                await self.ws.close()
             except Exception:
                 pass
         if self.receiver_task:
-            self.receiver_task.cancel()
+            try:
+                # Give Deepgram a short chance to emit the final Results or
+                # UtteranceEnd after CloseStream. This preserves the last
+                # addressed fragment when a participant leaves mid-turn,
+                # without allowing shutdown to wait on a dead socket.
+                await asyncio.wait_for(
+                    asyncio.shield(self.receiver_task),
+                    timeout=0.35,
+                )
+            except (asyncio.TimeoutError, ConnectionClosed):
+                self.receiver_task.cancel()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.receiver_task.cancel()
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+        # Deepgram may close without sending an explicit UtteranceEnd. Flush
+        # only what is already finalized; interim-only speech is intentionally
+        # not promoted to a spoken turn.
+        pending = self.buffer.flush()
+        if pending:
+            self.on_utterance(self.participant_id, self.participant_name, pending)

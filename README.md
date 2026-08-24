@@ -27,6 +27,7 @@ RECALL_WEBHOOK_SECRET=whsec_your_recall_workspace_secret
 LIVEAVATAR_API_KEY=your_liveavatar_key
 LIVEAVATAR_AVATAR_ID=your_avatar_id
 SPIKED_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app
+RAG_BACKEND_URL=https://spikedai-production-application-409019309412.us-central1.run.app
 RECALL_WEBHOOK_URL=https://recall-backend-production-409019309412.us-central1.run.app/webhook/recall/transcript
 PUBLIC_BASE_URL=https://your-domain.ngrok-free.app
 AGENT_BARGE_IN_MS=700

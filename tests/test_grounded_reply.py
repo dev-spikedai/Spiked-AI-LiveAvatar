@@ -142,7 +142,9 @@ def test_company_knowledge_streams_sentence_by_sentence(monkeypatch):
     # The filler goes out first and is not part of the answer; everything
     # after it is.
     assert _speaks(run)[0]["chunk_id"] == "1-filler"
-    assert _speaks(run)[0]["text"] in live_avatar.COMPANY_KNOWLEDGE_FILLER_PHRASES
+    assert _speaks(run)[0]["text"] in [
+        phrase.format(name="Lisa") for phrase in live_avatar.COMPANY_KNOWLEDGE_FILLER_PHRASES
+    ]
 
     speak_messages = _answer_speaks(run)
     assert len(speak_messages) == 2
@@ -360,29 +362,6 @@ def test_backstop_trims_on_a_sentence_boundary_not_mid_clause(monkeypatch):
     assert "gamma" not in reply
 
 
-def test_coaching_intent_skips_retrieval(monkeypatch):
-    """Coaching is about running the call, so it never consults the knowledge base."""
-    _install_model(monkeypatch, [
-        SimpleNamespace(parsed=live_avatar.GroundedReply(
-            answer="Decision criteria are still open.",
-            bridge="",
-            next_question="Ask who else has to sign off on this",
-        ))
-    ])
-    called = []
-
-    async def tracking_rag(*args, **kwargs):
-        called.append(args)
-        return "should not be reached"
-
-    monkeypatch.setattr(live_avatar, "query_spiked_rag", tracking_rag)
-
-    reply = _run_reply(intent="coaching")
-
-    assert called == []
-    assert reply.endswith("?")
-
-
 def test_unavailable_retrieval_admits_it(monkeypatch):
     _install_model(monkeypatch, [])
 
@@ -555,3 +534,69 @@ def test_teardown_is_idempotent_and_evicts_the_run(monkeypatch):
         "ok": True,
         "already_gone": True,
     }
+
+
+def test_teardown_flushes_durable_memory_writes_before_evicting(monkeypatch):
+    saved = []
+
+    async def fake_leave(_bot_id):
+        return 200
+
+    class FakeVideo:
+        async def close(self, _session):
+            return 200
+
+    from src.core import runs as runs_module
+    monkeypatch.setattr(runs_module, "_leave_recall_call", fake_leave)
+
+    async def scenario():
+        async def write_memory():
+            await asyncio.sleep(0)
+            saved.append("written")
+
+        task = asyncio.create_task(write_memory())
+        live_avatar._ACTIVE_RUNS["memory-flush"] = _run_state(
+            bot_id="bot-memory",
+            providers=SimpleNamespace(video=FakeVideo()),
+            video_session=SimpleNamespace(session_id="session-memory"),
+            background_tasks={task},
+            memory_write_tasks={task},
+        )
+        return await live_avatar._teardown_run("memory-flush")
+
+    result = asyncio.run(scenario())
+
+    assert result["ok"] is True
+    assert saved == ["written"]
+    assert "memory-flush" not in live_avatar._ACTIVE_RUNS
+
+
+def test_teardown_closes_avatar_control_socket(monkeypatch):
+    closed = []
+
+    async def fake_leave(_bot_id):
+        return 200
+
+    class FakeControl:
+        async def close(self):
+            closed.append(True)
+
+    class FakeVideo:
+        async def close(self, _session):
+            return 200
+
+    from src.core import runs as runs_module
+    monkeypatch.setattr(runs_module, "_leave_recall_call", fake_leave)
+
+    live_avatar._ACTIVE_RUNS["control-close"] = _run_state(
+        bot_id="bot-control",
+        control_ws=FakeControl(),
+        providers=SimpleNamespace(video=FakeVideo()),
+        video_session=SimpleNamespace(session_id="session-control"),
+    )
+
+    result = asyncio.run(live_avatar._teardown_run("control-close"))
+
+    assert result["ok"] is True
+    assert closed == [True]
+    assert "control-close" not in live_avatar._ACTIVE_RUNS

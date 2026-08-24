@@ -14,7 +14,19 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal, Callable, Awaitable
 from urllib.parse import urlencode, quote
 
-from src.supabase_client import get_client_providers, get_user_keywords_and_products
+from dotenv import load_dotenv
+
+# Must run before any first-party import below: several of them (agent_policy,
+# core.asr, supabase_client, providers.*) read env vars at module import time,
+# so loading .env any later leaves those constants frozen at "".
+load_dotenv()
+
+from src.supabase_client import (
+    get_client_providers,
+    get_user_keywords_and_products,
+    load_agent_memory,
+    save_agent_memory,
+)
 from src.agent_policy import (
     AgentState,
     EchoSuppressor,
@@ -28,6 +40,7 @@ from src.agent_policy import (
     closest_entities,
     compose_reply,
     detect_mute_command,
+    detect_invocation,
     estimate_speech_seconds,
     is_directly_addressed,
     evaluate_turn,
@@ -47,7 +60,7 @@ from src.call_intelligence import CallIntelligence
 from src.providers import registry as provider_registry
 from src.providers.base import RunContext, TurnContext, VideoProvider, VideoSession
 
-from src.core import persona, protocol, speech
+from src.core import mcp_tools, persona, protocol, speech
 from src.core.asr import (
     AGENT_ENDPOINTING_MS,
     AGENT_UTTERANCE_END_MS,
@@ -64,12 +77,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 
 from google import genai
 from google.genai import types
-
-load_dotenv()
 
 # Setup logging: terminal keeps today's exact output, and every process start
 # (a fresh `npm start` launch, or a --reload respawn on file save) also gets
@@ -96,6 +106,11 @@ logger = logging.getLogger("SpikedMeetingAgent")
 GEMINI_API_KEY = os.getenv("GEMINI_API") or os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SPIKED_BACKEND_URL = os.getenv("SPIKED_BACKEND_URL", "https://spikedai-production-application-409019309412.us-central1.run.app")
+# The warm in-memory service can be deployed separately from the legacy
+# backend. Keep the legacy URL as the safe default until the warm service is
+# promoted, but make the RAG target explicit so a deployment cannot appear
+# configured while still sending queries to the cold service.
+RAG_BACKEND_URL = os.getenv("RAG_BACKEND_URL", SPIKED_BACKEND_URL)
 RECALL_API_KEY = os.getenv("RECALL_API_KEY", "")
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
 # Defaults to ap-northeast-1 for local dev, where RECALL_API_KEY has
@@ -113,7 +128,10 @@ RECALL_WEBHOOK_URL = os.getenv(
 )
 LIVEAVATAR_API_KEY = os.getenv("LIVEAVATAR_API_KEY", "")
 LIVEAVATAR_BASE_URL = os.getenv("LIVEAVATAR_API_URL", "https://api.liveavatar.com")
-LIVEAVATAR_AVATAR_ID = "9650a758-1085-4d49-8bf3-f347565ec229"
+LIVEAVATAR_AVATAR_ID = os.getenv(
+    "LIVEAVATAR_AVATAR_ID",
+    "9650a758-1085-4d49-8bf3-f347565ec229",
+)
 LIVEAVATAR_SANDBOX = os.getenv("LIVEAVATAR_SANDBOX", "false").lower() == "true"
 # LiveAvatar auto-closes a session that sees no join/interaction for a while
 # (docs.liveavatar.com/reference/keep_session_alive_v1_sessions_keep_alive_post).
@@ -140,10 +158,10 @@ DEFAULT_BOT_NAME = os.getenv("BOT_NAME", "Tom").strip() or "Tom"
 # real RAG latency, not padding meant to run the clock out. Several variants
 # so back-to-back company_knowledge turns don't say the identical line twice.
 COMPANY_KNOWLEDGE_FILLER_PHRASES = [
-    "Yeah, let me check the docs real quick.",
-    "Good question, one sec, pulling that up.",
-    "Let me check on that real quick.",
-    "One sec, let me pull that up.",
+    "Yeah {name}, let me check the docs real quick.",
+    "Good question {name}, one sec, pulling that up.",
+    "Let me check on that real quick, {name}.",
+    "One sec {name}, let me pull that up.",
 ]
 # Retrieval budget on the live speak path. Nobody is waiting on a prefetch, so
 # that path passes AGENT_RAG_PREFETCH_TIMEOUT_S instead.
@@ -153,6 +171,13 @@ AGENT_RAG_TIMEOUT_S = float(os.getenv("AGENT_RAG_TIMEOUT_S", "12"))
 # live speak path before giving up. Was referenced but never defined — every
 # prefetch NameError'd and got silently swallowed by its own except block.
 AGENT_RAG_PREFETCH_TIMEOUT_S = float(os.getenv("AGENT_RAG_PREFETCH_TIMEOUT_S", "12"))
+# Persistent memory loads during meeting startup. The first addressed turn
+# waits briefly for that parallel work so a stored role/preference is not
+# silently ignored; an unavailable store must never hold speech indefinitely.
+AGENT_MEMORY_READY_TIMEOUT_S = float(os.getenv("AGENT_MEMORY_READY_TIMEOUT_S", "1.5"))
+# Warm RAG is started before Recall joins. Give it a short head start after
+# classification so the first grounded question uses RAM when possible.
+AGENT_WARM_READY_TIMEOUT_S = float(os.getenv("AGENT_WARM_READY_TIMEOUT_S", "2.0"))
 
 # TEMPORARY (see TEMP_WIRING.md): when the backend's live Groq answer stream
 # errors, fall back to polling its slower cognitive (background) answer, which
@@ -190,6 +215,30 @@ def _get_backend_http() -> httpx.AsyncClient:
         )
     return _backend_http
 
+
+def _track_background_task(
+    run: Dict[str, Any],
+    awaitable: Awaitable[Any],
+) -> asyncio.Task[Any]:
+    """Own a fire-and-forget task so teardown can cancel it deterministically."""
+    task = asyncio.create_task(awaitable)
+    tasks = run.setdefault("background_tasks", set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
+def _track_memory_write(
+    run: Dict[str, Any],
+    awaitable: Awaitable[Any],
+) -> asyncio.Task[Any]:
+    """Track durable writes separately so teardown can flush them briefly."""
+    task = _track_background_task(run, awaitable)
+    writes = run.setdefault("memory_write_tasks", set())
+    writes.add(task)
+    task.add_done_callback(writes.discard)
+    return task
+
 # Level 1: the agent noticed something it could speak to but was not invited.
 # The cue goes to the rep and the answer is warmed silently. Rate-limited so a
 # technical stretch of conversation does not fire retrieval on every sentence.
@@ -213,8 +262,8 @@ AGENT_TURN_MERGE_INCOMPLETE_MS = int(os.getenv("AGENT_TURN_MERGE_INCOMPLETE_MS",
 # Floor control. Opt-in: 0 means the wake name is required on every single turn,
 # which is the behavior the product expects. Raise it only to allow nameless
 # question-shaped continuations shortly after the agent stops speaking.
-AGENT_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_FOLLOWUP_WINDOW_MS", "8000"))
-AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "1"))
+AGENT_FOLLOWUP_WINDOW_MS = int(os.getenv("AGENT_FOLLOWUP_WINDOW_MS", "15000"))
+AGENT_MAX_FOLLOWUPS = int(os.getenv("AGENT_MAX_FOLLOWUPS", "3"))
 # The follow-up window shrinks by this factor on each successive nameless
 # follow-up, down to AGENT_MIN_FOLLOWUP_WINDOW_MS, instead of hard-cutting at a
 # fixed count — a long on-topic exchange tapers rather than hitting a cliff.
@@ -231,12 +280,11 @@ AGENT_REPLY_WINDOW_S = float(os.getenv("AGENT_REPLY_WINDOW_S", "30"))
 # Echo suppression: how close a transcript must be to the agent's own words.
 AGENT_ECHO_SIMILARITY = float(os.getenv("AGENT_ECHO_SIMILARITY", "0.72"))
 AGENT_ECHO_TAIL_S = float(os.getenv("AGENT_ECHO_TAIL_S", "2.5"))
-# Watchdog: force LISTENING if the avatar never reports back.
 # Renders the "what the agent heard" panel into the meeting camera feed, which
 # every participant can see. Off unless explicitly opted into for local debugging.
 AGENT_DEBUG_OVERLAY = os.getenv("AGENT_DEBUG_OVERLAY", "false").lower() == "true"
-AGENT_SPEAK_START_TIMEOUT_S = float(os.getenv("AGENT_SPEAK_START_TIMEOUT_S", "4"))
-AGENT_SPEAK_MAX_OVERRUN_S = float(os.getenv("AGENT_SPEAK_MAX_OVERRUN_S", "6"))
+# _speak_watchdog's timeouts live in core/floor.py now, next to the only code
+# that reads them.
 
 # Configure Modern Google GenAI Client
 # Using gemini-3.5-flash-lite for cost-effective, low-latency function calling
@@ -259,6 +307,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+async def shutdown_orchestrator() -> None:
+    """Release process-local runs and the shared RAG connection pool.
+
+    Normal UI disconnects already call `_teardown_run`; this hook covers
+    Cloud Run revisions, local reloads, and other process exits so a restart
+    does not leave a Recall bot or FULL-mode LiveAvatar session behind.
+    """
+    for run_id in list(_ACTIVE_RUNS):
+        try:
+            await _teardown_run(run_id)
+        except Exception:
+            logger.warning("[Shutdown] Failed to teardown run=%s", run_id, exc_info=True)
+    global _backend_http
+    if _backend_http is not None and not _backend_http.is_closed:
+        await _backend_http.aclose()
+        _backend_http = None
 
 # In-memory session and run registry
 
@@ -314,14 +381,25 @@ class TranscriptCorrection(BaseModel):
 
 class TurnAnalysis(BaseModel):
     response_action: Literal["respond", "acknowledge", "silent"] = "respond"
-    intent: Literal["company_knowledge", "meeting_context", "social", "command", "coaching"]
+    intent: Literal[
+        "company_knowledge",
+        "meeting_context",
+        "social",
+        "command",
+        "taught_fact",
+        "memory_instruction",
+    ]
     resolved_query: str
     corrections: List[TranscriptCorrection] = Field(default_factory=list)
+    taught_fact: str = Field(default="", description="Concise fact explicitly taught for this meeting only")
+    memory_item: str = Field(default="", description="Concise preference or role instruction to remember for this meeting")
+    preference_speak_up: Optional[bool] = Field(default=None, description="Explicit preference for proactive helpful interjections")
+    role_profile: str = Field(default="", description="Explicit role requested for Tom in this meeting")
 
 
 class TurnAnalysisAndReply(TurnAnalysis):
     """TurnAnalysis plus an optional draft reply, for the single-shot classify
-    path (agent_policy: coaching/meeting_context/social/command).
+    path (agent_policy: meeting_context/social/command).
 
     company_knowledge needs retrieved facts before it can answer, so the
     reply fields are left empty by prompt instruction whenever intent is
@@ -434,13 +512,74 @@ async def resolve_source_ids(token_to_use: str, target_client_id: str) -> List[s
     """
     if not target_client_id or not token_to_use:
         return []
+
+
+async def warm_user_knowledge(token_to_use: str, user_id: str) -> int:
+    """Ask the RAG service to load the user's full corpus into memory.
+
+    This runs during meeting startup and is intentionally best-effort: joining
+    the meeting must not fail because the warm service is deploying or because
+    an older backend does not expose `/warm` yet. The first query will still
+    use the backend's normal lazy-warm/fallback path in that case.
+    """
+    if not token_to_use or not user_id:
+        return 0
+    started = time.monotonic()
+    try:
+        client = _get_backend_http()
+        response = await client.post(
+            f"{RAG_BACKEND_URL.rstrip('/')}/warm",
+            headers={"Authorization": f"Bearer {token_to_use}"},
+            timeout=30.0,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            count = int(payload.get("chunks_loaded") or 0)
+            logger.info(
+                "[RAG][WARM] user=%s chunks=%d total=%.2fs",
+                user_id,
+                count,
+                time.monotonic() - started,
+            )
+            return count
+        if response.status_code == 404:
+            logger.info("[RAG][WARM] backend does not expose /warm; lazy warm remains active")
+        else:
+            logger.warning("[RAG][WARM] backend returned status=%s", response.status_code)
+    except Exception:
+        logger.warning("[RAG][WARM] startup warm failed; continuing with lazy fallback", exc_info=True)
+    return 0
+
+
+async def _wait_for_warm_index(run: Optional[Dict[str, Any]]) -> None:
+    """Wait briefly for startup warming without making RAG availability fatal."""
+    if not run:
+        return
+    warm_task = run.get("warm_task")
+    if warm_task is None or warm_task.done():
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(warm_task),
+            timeout=AGENT_WARM_READY_TIMEOUT_S,
+        )
+        logger.info("[RAG][WARM] ready before grounded reply")
+    except asyncio.TimeoutError:
+        logger.info(
+            "[RAG][WARM] not ready after %.2fs; using normal query path",
+            AGENT_WARM_READY_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.info("[RAG][WARM] readiness task failed; using normal query path", exc_info=True)
     cache_key = f"{extract_user_id_from_jwt(token_to_use)}|{target_client_id}"
     cached = _SOURCE_IDS_CACHE.get(cache_key)
     if cached and time.monotonic() - cached["ts"] <= SOURCE_IDS_CACHE_TTL_S:
         return cached["ids"]
     _t0 = time.monotonic()
     try:
-        base = SPIKED_BACKEND_URL.rstrip('/')
+        base = RAG_BACKEND_URL.rstrip('/')
         auth_headers = {"Authorization": f"Bearer {token_to_use}"}
         params = {"client_id": target_client_id}
         client = _get_backend_http()
@@ -488,7 +627,7 @@ async def query_spiked_rag(
     # /ask/handsfree at ~9.7s from here for a comparable question. /ask/regular
     # also keeps KYC-steered query augmentation (search.py's ask_handsfree omits
     # _build_query_augment), which handsfree traded away for no measured benefit.
-    url = f"{SPIKED_BACKEND_URL.rstrip('/')}/ask/regular"
+    url = f"{RAG_BACKEND_URL.rstrip('/')}/ask/regular"
     token_to_use = auth_token or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     target_client_id = client_id or os.getenv("DEFAULT_CLIENT_ID") or ""
     headers = {
@@ -660,6 +799,227 @@ async def _poll_cognitive_answer(cognitive_key: str, authorization: str) -> Opti
 # Gemini turn routing with deterministic RAG execution
 # ---------------------------------------------------------------------------
 
+_MAX_TAUGHT_FACTS = 24
+
+
+def looks_like_taught_fact(text: str) -> bool:
+    lowered = (text or "").casefold()
+    return any(phrase in lowered for phrase in (
+        "remember that", "remember this", "keep in mind", "note that",
+        "for this meeting", "for today", "just so you know",
+    ))
+
+
+def remember_taught_fact(run: Optional[Dict[str, Any]], fact: str) -> None:
+    """Store a bounded fact on this run; teardown drops the whole list."""
+    if run is None:
+        return
+    clean = re.sub(r"\s+", " ", fact).strip(" \t\r\n.,;:")
+    if not clean:
+        return
+    facts = run.setdefault("taught_facts", [])
+    key = clean.casefold()
+    for index, existing in enumerate(facts):
+        if str(existing).casefold() == key:
+            facts[index] = clean
+            return
+    facts.append(clean)
+    del facts[:-_MAX_TAUGHT_FACTS]
+    try:
+        loop = asyncio.get_running_loop()
+        _track_memory_write(run, save_agent_memory(
+            run.get("user_id"),
+            "fact",
+            hashlib.sha256(clean.casefold().encode("utf-8")).hexdigest(),
+            clean,
+            client_id=run.get("client_id"),
+            confidence=0.85,
+            source="explicit_taught_fact",
+        ))
+    except RuntimeError:
+        # The in-run fact remains available when called from synchronous tests
+        # or a shutdown path without an active event loop.
+        pass
+    logger.info("[Memory] Stored taught fact for run=%s: %r", run.get("run_id", "unknown"), clean)
+
+
+def format_taught_facts(facts: List[Any]) -> str:
+    if not facts:
+        return ""
+    return "Session-only facts explicitly provided by meeting participants (not verified company knowledge):\n" + "\n".join(
+        f"- {fact}" for fact in facts[-_MAX_TAUGHT_FACTS:]
+    )
+
+
+def remember_meeting_instruction(
+    run: Optional[Dict[str, Any]],
+    instruction: str,
+    *,
+    speak_up: Optional[bool] = None,
+    role_profile: str = "",
+) -> None:
+    """Store explicit meeting instructions separately from factual memory."""
+    if run is None:
+        return
+    prefs = run.setdefault("meeting_preferences", {})
+    clean = re.sub(r"\s+", " ", instruction or "").strip(" \t\r\n.,;:")
+    if clean:
+        prefs["last_instruction"] = clean
+    if speak_up is not None:
+        prefs["speak_up_when_helpful"] = bool(speak_up)
+    clean_role = re.sub(r"\s+", " ", role_profile or "").strip(" \t\r\n.,;:")
+    if clean_role:
+        run["role_profile"] = clean_role
+    # Explicit preferences are durable user instructions, not guesses inferred
+    # from ordinary room conversation. Persistence is best-effort and never on
+    # the awaited speech path.
+    try:
+        loop = asyncio.get_running_loop()
+        if speak_up is not None:
+            _track_memory_write(run, save_agent_memory(
+                run.get("user_id"),
+                "preference",
+                "speak_up_when_helpful",
+                bool(speak_up),
+                # This is a user preference, not client knowledge: persist it
+                # globally so the next client session can honor it too.
+                client_id=None,
+                source="explicit_meeting_instruction",
+            ))
+        if clean_role:
+            _track_memory_write(run, save_agent_memory(
+                run.get("user_id"),
+                "role",
+                "active_role",
+                clean_role,
+                client_id=run.get("client_id"),
+                source="explicit_meeting_instruction",
+            ))
+    except RuntimeError:
+        # Synchronous policy tests and shutdown paths may not have an active
+        # event loop; the in-run memory remains authoritative for that call.
+        pass
+    if clean or speak_up is not None or clean_role:
+        logger.info(
+            "[Memory] Stored meeting instruction run=%s speak_up=%s role=%r instruction=%r",
+            run.get("run_id", "unknown"),
+            speak_up,
+            clean_role,
+            clean,
+        )
+
+
+def detect_speak_up_preference(text: str) -> Optional[bool]:
+    """Recognize only explicit user preferences, never ordinary opinions."""
+    lowered = re.sub(r"[^a-z0-9' ]+", " ", (text or "").casefold())
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    preference_marker = any(phrase in lowered for phrase in (
+        "i prefer you to",
+        "i want you to",
+        "please always",
+        "please only",
+        "please do not",
+        "please don't",
+        "you should always",
+        "from now on",
+        "your preference should be",
+    ))
+    if not preference_marker:
+        return None
+    if any(phrase in lowered for phrase in (
+        "speak up when you can",
+        "speak up whenever you can",
+        "interject when you can help",
+        "volunteer when you can help",
+        "jump in when you can help",
+        "offer your input when useful",
+    )):
+        return True
+    if any(phrase in lowered for phrase in (
+        "stay quiet unless asked",
+        "only speak when asked",
+        "do not speak up unless asked",
+        "don't speak up unless asked",
+    )):
+        return False
+    return None
+
+
+def detect_role_instruction(text: str) -> str:
+    """Extract a narrow explicit role request for the current meeting."""
+    lowered = (text or "").casefold()
+    match = re.search(r"\bas a ([a-z][a-z0-9 -]{2,50})\b", lowered)
+    if not match:
+        match = re.search(r"\byour role is ([a-z][a-z0-9 -]{2,50})\b", lowered)
+    if not match:
+        return ""
+    role = re.split(r"\b(?:how|what|when|where|and|then)\b|[?.!,]", match.group(1), maxsplit=1)[0]
+    return re.sub(r"\s+", " ", role).strip()
+
+
+def format_meeting_instructions(run: Optional[Dict[str, Any]]) -> str:
+    if not run:
+        return ""
+    prefs = run.get("meeting_preferences") or {}
+    lines: List[str] = []
+    if prefs.get("speak_up_when_helpful") is True:
+        lines.append("The user explicitly prefers Tom to speak up when he can materially help.")
+    elif prefs.get("speak_up_when_helpful") is False:
+        lines.append("The user explicitly prefers Tom to wait for an invitation before speaking.")
+    if run.get("role_profile"):
+        lines.append(f"Tom's active meeting role: {run['role_profile']}")
+    if prefs.get("last_instruction"):
+        lines.append(f"Latest explicit meeting instruction: {prefs['last_instruction']}")
+    return "\n".join(lines)
+
+
+def proactive_speaking_enabled(run: Optional[Dict[str, Any]]) -> bool:
+    """Explicit meeting preference can opt into the autonomous path."""
+    if not run:
+        return False
+    prefs = run.get("meeting_preferences") or {}
+    return bool(run.get("autospeak_enabled") or prefs.get("speak_up_when_helpful") is True)
+
+
+async def hydrate_persistent_memory(
+    run: Dict[str, Any],
+    memory_task: "asyncio.Task[List[Dict[str, Any]]]",
+) -> None:
+    """Merge durable memory into the run without blocking meeting startup."""
+    try:
+        rows = await memory_task
+        run["persistent_memory"] = rows[-100:]
+        prefs = run.setdefault("meeting_preferences", {})
+        for row in rows:
+            kind = row.get("memory_type")
+            key = row.get("memory_key")
+            value = row.get("memory_value")
+            if kind == "preference" and key == "speak_up_when_helpful":
+                prefs["speak_up_when_helpful"] = bool(value)
+            elif kind == "role" and key == "active_role" and isinstance(value, str):
+                run["role_profile"] = value
+        logger.info("[Memory] Hydrated %d durable items for run=%s", len(rows), run.get("run_id"))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("[Memory] Durable hydration failed for run=%s", run.get("run_id"), exc_info=True)
+
+
+def format_persistent_memory(run: Optional[Dict[str, Any]]) -> str:
+    if not run:
+        return ""
+    rows = run.get("persistent_memory") or []
+    lines: List[str] = []
+    for row in rows[:24]:
+        kind = row.get("memory_type") or "memory"
+        key = row.get("memory_key") or "item"
+        value = row.get("memory_value")
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        if value is not None:
+            lines.append(f"- [{kind}] {key}: {value}")
+    return "Persistent memory (use only when relevant and within its scope):\n" + "\n".join(lines) if lines else ""
+
 async def process_transcript_with_gemini(
     transcript: str,
     speaker: str,
@@ -680,6 +1040,25 @@ async def process_transcript_with_gemini(
     the contract callers must honor (check run["_streamed_turn_id"] afterward).
     """
     _t_turn_start = time.monotonic()
+    if run is not None:
+        run["active_mcp_context"] = None
+        memory_task = run.get("memory_task")
+        if memory_task is not None and not memory_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(memory_task),
+                    timeout=AGENT_MEMORY_READY_TIMEOUT_S,
+                )
+                logger.info("[Memory] Ready before first-turn prompt")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Memory] Readiness exceeded %.2fs; continuing with current state",
+                    AGENT_MEMORY_READY_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.info("[Memory] Readiness task failed; continuing", exc_info=True)
     if not gemini_client:
         logger.error("[Google GenAI] Client is not initialized")
         return None
@@ -692,6 +1071,12 @@ async def process_transcript_with_gemini(
     preferred_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     catalog = build_entity_catalog(ctx)
     candidate_entities = closest_entities(transcript, catalog)
+    taught_facts_text = format_taught_facts((run or {}).get("taught_facts") or [])
+    meeting_instructions_text = format_meeting_instructions(run)
+    persistent_memory_text = format_persistent_memory(run)
+    mcp_context = (run or {}).get("active_mcp_context") or ""
+    explicit_speak_up = detect_speak_up_preference(transcript)
+    explicit_role = detect_role_instruction(transcript)
     history_text = "\n".join(
         f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
         for turn in conversation_history[-12:]
@@ -706,13 +1091,20 @@ async def process_transcript_with_gemini(
     target_client_id_for_prefetch = client_id or os.getenv("DEFAULT_CLIENT_ID") or ""
     source_ids_task: "Optional[asyncio.Task[List[str]]]" = None
     if not source_ids and target_client_id_for_prefetch and auth_token:
-        source_ids_task = asyncio.create_task(resolve_source_ids(auth_token, target_client_id_for_prefetch))
+        source_ids_task = (
+            _track_background_task(run, resolve_source_ids(auth_token, target_client_id_for_prefetch))
+            if run is not None
+            else asyncio.create_task(resolve_source_ids(auth_token, target_client_id_for_prefetch))
+        )
 
     try:
         if (
             is_directly_addressed(transcript, bot_name)
             and requires_company_knowledge(transcript, catalog)
             and not needs_context_resolution(transcript)
+            and not looks_like_taught_fact(transcript)
+            and explicit_speak_up is None
+            and not explicit_role
         ):
             logger.info("[Agent Route] Fast path: skipped classification round trip")
             analysis = TurnAnalysis(
@@ -743,7 +1135,7 @@ async def process_transcript_with_gemini(
             return reply
 
         call_state = intel.call_state_block() if intel else ""
-        # Dossier/room, needed only if this turn ends up coaching/social/
+        # Dossier/room, needed only if this turn ends up social/
         # meeting_context/command, are computed up front (cheap, local intel
         # reads, no I/O) so they can ride along in the single classify+reply
         # call below instead of requiring a second call once the intent is
@@ -753,15 +1145,21 @@ async def process_transcript_with_gemini(
         room = intel.room_block() if intel else ""
         detailed_request = any(
             phrase in transcript.casefold()
-            for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive")
+            for phrase in ("more detail", "in detail", "elaborate", "explain fully", "deep dive", "summarize", "summarise", "summary")
         )
         reply_word_limit = 90 if detailed_request else AGENT_MAX_REPLY_WORDS
-        analysis_prompt = f"""Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn. If the turn also needs a spoken reply and isn't a company_knowledge question, draft that reply in the same response.
+        analysis_prompt = f"""{persona.block("identity", bot_name=bot_name, company_name=company_name)}
+
+Decide whether {bot_name} should respond, then classify and normalize this wake-name-matched meeting turn. If the turn also needs a spoken reply and isn't a company_knowledge question, draft that reply in the same response.
 Company: {company_name}
 Offerings: {products_services or product_domain}
 Verified entity candidates: {candidate_entities}
 Recent finalized conversation:
 {history_text}
+{taught_facts_text}
+{f'Meeting instructions and active role:{chr(10)}{meeting_instructions_text}' if meeting_instructions_text else ''}
+{persistent_memory_text}
+{mcp_context}
 {f'What this call has established so far:{chr(10)}{call_state}' if call_state else ''}
 {f'In the room:{chr(10)}{room}' if room else ''}
 {f'Who is speaking: {dossier}' if dossier else ''}
@@ -775,14 +1173,15 @@ Set response_action to:
 The presence of the wake name alone is not sufficient. Prefer silent when the addressee is ambiguous.
 Use company_knowledge for company/product/features/pricing/security/SLA/integration questions.
 Use meeting_context for questions about what meeting participants said or discussed, and for questions about this specific call's live state — sentiment, mood, engagement, or how a participant seems — never company_knowledge for those, since the knowledge base has no data on this call or its participants.
-Use coaching when the sales rep asks {bot_name} for help running the call itself rather than for an answer to relay: what to ask next, what is being missed, how to handle an objection, where the conversation should go — including a vague invitation to contribute ("can you hop in", "jump in here", "chime in", "anything to add") ONLY when it has no specific ask attached AND Recent finalized conversation has no clear subject a company_knowledge answer could address. If a vague invitation follows a turn with an identifiable topic (a product, technology, or question already on the table — "jump in on the pricing", "chime in on that", or just "jump in" right after the room was discussing something specific), treat it as company_knowledge about that topic, not coaching: the rep wants {bot_name} to answer what's already being discussed, not to be coached on what to ask next. Only fall back to coaching's "what am I missing?" framing when the invitation is genuinely topic-less.
 Use social only for actual greetings, audio checks, and questions about {bot_name}'s own identity/role ("who are you", "what are you") — never company_knowledge for those, since the knowledge base has no document about {bot_name} himself. Use command for stop/wait/repeat commands.
+Use taught_fact when the speaker explicitly gives Tom a fact to remember for this meeting. Put only the concise fact in taught_fact; leave it empty for ordinary questions, guesses, or general conversation. These facts are session-only user-provided context, not verified company knowledge.
+Use memory_instruction when the speaker explicitly changes how Tom should behave in this meeting, such as preferring him to speak up when he can help, asking him to wait until invited, or assigning him a role. Put the concise instruction in memory_item, set preference_speak_up when applicable, and put the requested role in role_profile. Do not infer a preference from ordinary conversation.
 Resolve pronouns and omitted context only in resolved_query. Propose corrections only from the verified entity candidates.
 
 Reply fields (answer/bridge/next_question): leave ALL THREE empty if intent is company_knowledge (a separate step with retrieved facts will answer it) or if response_action is not "respond". Otherwise fill them in for spoken delivery:
-- answer: the direct answer, at most {reply_word_limit} words. No markdown, lists, or filler. If intent is coaching, this is one specific, actionable suggestion grounded in what this call has established — name the gap or risk plainly, do not summarize the call back, do not pitch — and aim it at what {f"{dossier}" if dossier else "the sales rep"} is accountable for if that framing is known.
+- answer: the direct answer, at most {reply_word_limit} words. No markdown, lists, or filler.
 - bridge: at most one short clause connecting the answer to what {speaker} is trying to decide. Leave empty rather than padding.
-- next_question: one question, at most {MAX_QUESTION_WORDS} words, that opens the next useful step. For coaching, phrase it as the question {speaker} should ask the room next, verbatim. Ask a question by default — leave it empty only when one would be unwelcome (greetings, audio checks, a command being acknowledged, a short confirmation).
+- next_question: one question, at most {MAX_QUESTION_WORDS} words, that opens the next useful step. Ask a question by default — leave it empty only when one would be unwelcome (greetings, audio checks, a command being acknowledged, a short confirmation).
 Neither answer nor next_question may restate or re-ask anything Recent finalized conversation or What this call has established already covers — check both before writing either field. If the only thing you have to offer already happened, say what's genuinely still open instead."""
         _t_classify_start = time.monotonic()
         try:
@@ -812,6 +1211,26 @@ Neither answer nor next_question may restate or re-ask anything Recent finalized
                 corrections=[],
             )
 
+        if analysis.response_action != "silent" and (
+            analysis.intent == "taught_fact" or analysis.taught_fact.strip()
+        ):
+            fact = analysis.taught_fact.strip() or analysis.resolved_query.strip()
+            if fact:
+                remember_taught_fact(run, fact)
+
+        if analysis.response_action != "silent" and (
+            analysis.intent == "memory_instruction"
+            or analysis.memory_item.strip()
+            or analysis.preference_speak_up is not None
+            or analysis.role_profile.strip()
+        ):
+            remember_meeting_instruction(
+                run,
+                analysis.memory_item or analysis.resolved_query,
+                speak_up=analysis.preference_speak_up,
+                role_profile=analysis.role_profile,
+            )
+
         logger.info(
             "[LLM Response Gate] speaker=%s action=%s intent=%s",
             speaker,
@@ -827,7 +1246,20 @@ Neither answer nor next_question may restate or re-ask anything Recent finalized
                 source_ids_task.cancel()
             return "Understood."
 
-        if analysis.intent not in ("social", "command") and requires_company_knowledge(transcript, catalog):
+        # MCP is an optional read-only enrichment layer. Keep it out of the
+        # company-knowledge path (warm RAG is faster and authoritative there),
+        # and call at most one tool for a turn that clearly needs platform
+        # state. The result is placed on the run so the grounded response
+        # prompt can use it without changing the provider contract.
+        if run is not None:
+            run["active_mcp_context"] = await mcp_tools.enrich_turn(
+                transcript=transcript,
+                intent=analysis.intent,
+                run=run,
+                auth_token=auth_token,
+            )
+
+        if analysis.intent not in ("social", "command", "taught_fact", "memory_instruction") and requires_company_knowledge(transcript, catalog):
             analysis.intent = "company_knowledge"
 
         if analysis.intent == "company_knowledge":
@@ -856,9 +1288,27 @@ Neither answer nor next_question may restate or re-ask anything Recent finalized
             logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (classified_path, rag)", time.monotonic() - _t_turn_start)
             return reply
 
-        # coaching / meeting_context / social / command: the reply already
-        # came back in this same call — compose it directly, no second
-        # Gemini round trip.
+        if run is not None and run.get("active_mcp_context"):
+            reply = await _generate_grounded_reply(
+                analysis=analysis,
+                transcript=transcript,
+                speaker=speaker,
+                bot_name=bot_name,
+                company_name=company_name,
+                history_text=history_text,
+                catalog=catalog,
+                auth_token=auth_token,
+                client_id=client_id,
+                preferred_model=preferred_model,
+                intel=intel,
+                kyc_id=kyc_id,
+                run=run,
+            )
+            logger.info("[TIMING] process_transcript_with_gemini total=%.2fs (classified_path, mcp)", time.monotonic() - _t_turn_start)
+            return reply
+
+        # meeting_context / social / command: the reply already came back in
+        # this same call — compose it directly, no second Gemini round trip.
         if source_ids_task is not None:
             source_ids_task.cancel()
         reply = compose_reply(
@@ -951,9 +1401,15 @@ async def _generate_grounded_reply(
     always dispatches.
     """
 
+    await _wait_for_warm_index(run)
+
     corrections = [item.model_dump() for item in analysis.corrections]
     corrected_transcript = apply_validated_corrections(transcript, corrections, catalog)
     resolved_query = analysis.resolved_query.strip() or corrected_transcript
+    taught_facts_text = format_taught_facts((run or {}).get("taught_facts") or [])
+    meeting_instructions_text = format_meeting_instructions(run)
+    persistent_memory_text = format_persistent_memory(run)
+    mcp_context = (run or {}).get("active_mcp_context") or ""
 
     providers = run.get("providers") if run is not None else None
     if providers is not None and providers.is_delegated and turn_id is not None:
@@ -1030,9 +1486,11 @@ async def _generate_grounded_reply(
         # actually being ready. _make_streaming_sentence_handler's first real
         # dispatch awaits this task so the filler's audio and the real
         # answer's audio never overlap.
+        filler_name = (speaker or "").strip().split(" ")[0] or "there"
         filler_task = (
             asyncio.create_task(_speak_chunk(
-                run, turn_id, f"{turn_id}-filler", random.choice(COMPANY_KNOWLEDGE_FILLER_PHRASES),
+                run, turn_id, f"{turn_id}-filler",
+                random.choice(COMPANY_KNOWLEDGE_FILLER_PHRASES).format(name=filler_name),
             ))
             if stream_enabled else None
         )
@@ -1140,16 +1598,7 @@ async def _generate_grounded_reply(
     room = intel.room_block() if intel else ""
     call_state = intel.call_state_block() if intel else ""
 
-    if analysis.intent == "coaching":
-        # Coaching is addressed to the rep about how to run the call, so it is
-        # aimed at the conversation rather than at the knowledge base. The reply
-        # is still spoken into the room: there is no rep-private channel here.
-        task_block = f"""{speaker} is the sales rep asking you for help running this call, not for a fact to relay.
-Give one specific, actionable suggestion grounded in what this call has actually established.
-Name the gap or the risk plainly. Do not summarize the call back to them, and do not pitch.
-Your next_question should be the question you think {speaker} should ask the room next, phrased so they can say it verbatim."""
-    else:
-        task_block = f"""Answer {speaker}'s addressed turn."""
+    task_block = f"""Answer {speaker}'s addressed turn."""
 
     answer_prompt = f"""{persona.block("identity", bot_name=bot_name, company_name=company_name)}
 {f'{chr(10)}Who is speaking: {dossier}' if dossier else ''}{f'{chr(10)}Aim the answer at what this person is accountable for. A finance stakeholder and an engineering stakeholder need the same fact framed differently.' if dossier else ''}
@@ -1167,6 +1616,10 @@ Neither answer nor next_question may restate or re-ask anything Recent finalized
 Intent: {analysis.intent}
 Corrected turn: {corrected_transcript}
 Resolved meaning: {resolved_query}
+{taught_facts_text}
+{f'Meeting instructions and active role:{chr(10)}{meeting_instructions_text}' if meeting_instructions_text else ''}
+{persistent_memory_text}
+{mcp_context}
 {f'In the room:{chr(10)}{room}' if room else ''}
 {f'What this call has established so far:{chr(10)}{call_state}' if call_state else ''}
 Recent finalized conversation:
@@ -1221,6 +1674,8 @@ async def _judge_interjection(
     history_text: str,
     bot_name: str,
     preferred_model: str,
+    meeting_instructions: str = "",
+    persistent_memory: str = "",
 ) -> InterjectionJudgment:
     """Level 1.5: is this warmed reply worth volunteering unprompted?
 
@@ -1235,6 +1690,9 @@ async def _judge_interjection(
 
 Recent finalized conversation:
 {history_text}
+
+{f'Meeting instructions and active role:{chr(10)}{meeting_instructions}' if meeting_instructions else ''}
+{persistent_memory}
 
 The moment in question: {transcript}
 
@@ -1283,7 +1741,18 @@ def health_check():
         "gemini_configured": bool(GEMINI_API_KEY),
         "gemini_model": GEMINI_MODEL,
         "recall_configured": bool(RECALL_API_KEY),
+        "liveavatar_full_mode": DEFAULT_VIDEO_PROVIDER == "liveavatar",
+        "warm_rag_configured": RAG_BACKEND_URL != SPIKED_BACKEND_URL,
+        "mcp_configured": bool(mcp_tools.MCP_SERVER_URL),
+        "persistent_memory_configured": bool(
+            os.getenv("SUPABASE_URL") and (
+                os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+                or os.getenv("SUPABASE_KEY")
+                or os.getenv("SUPABASE_KEY_TRANSCRIPT")
+            )
+        ),
         "spiked_backend_url": SPIKED_BACKEND_URL,
+        "rag_backend_url": RAG_BACKEND_URL,
         "recall_webhook_url": RECALL_WEBHOOK_URL,
         "public_base_url": PUBLIC_BASE_URL
     }
@@ -1354,7 +1823,9 @@ async def _take_floor_and_speak(
                 answer = await _generate_grounded_reply(
                     analysis=TurnAnalysis(
                         response_action="respond",
-                        intent="coaching" if coaching else "company_knowledge",
+                        # "coaching" intent removed from the classifier; the
+                        # invoke endpoint's coaching flag is now a no-op.
+                        intent="company_knowledge",
                         resolved_query=question,
                         corrections=[],
                     ),
@@ -1430,6 +1901,13 @@ async def invoke_agent(run_id: str, payload: Optional[InvokeAgentRequest] = None
     warm = insight.get("reply") if (insight_fresh and not payload.question and not payload.coaching) else None
     run["pending_insight"] = None
 
+    # These locals matter during partial startup.  A provider or Recall
+    # failure can happen before the run is inserted into _ACTIVE_RUNS, so
+    # resources created above that point cannot rely on normal teardown.
+    memory_task: Optional[asyncio.Task] = None
+    run_id: Optional[str] = None
+    provider_set = None
+    video_session = None
     try:
         result = await _take_floor_and_speak(
             run,
@@ -1625,6 +2103,11 @@ async def _deploy_live_avatar_bot(
 
         run_id = f"run_{uuid.uuid4().hex}"
         recall_ws_token = uuid.uuid4().hex
+        # Durable memory is loaded in parallel with provider/session setup so
+        # persistence does not become a new startup bottleneck.
+        memory_task = asyncio.create_task(
+            load_agent_memory(user_id, client_id=client_id, auth_token=token)
+        )
 
         # 1. Resolve which providers this run uses, then open the video session.
         # Resolution validates the combination up front (see registry.resolve):
@@ -1681,6 +2164,21 @@ async def _deploy_live_avatar_bot(
             "recall_ws_token": recall_ws_token,
             "state": AgentState.LISTENING,
             "history": [],
+            # Latest interim transcript per participant. This is deliberately
+            # separate from finalized history: it is a low-latency signal for
+            # wake candidates and speculative routing only.
+            "live_turns": {},
+            # Deliberately process-local and per meeting. Never persisted or
+            # merged into the company knowledge base.
+            "taught_facts": [],
+            "meeting_preferences": {},
+            "role_profile": "",
+            "persistent_memory": [],
+            "active_mcp_context": None,
+            "proactive_prefetches": {},
+            "background_tasks": set(),
+            "memory_write_tasks": set(),
+            "memory_task": memory_task,
             "turn_counter": 0,
             "control_ws": None,
             # Separate from control_ws on purpose: that socket belongs to the
@@ -1694,6 +2192,7 @@ async def _deploy_live_avatar_bot(
             "active_response_task": None,
             "watchdog_task": None,
             "keepalive_task": None,
+            "warm_task": None,
             # "Tom, stay quiet for 30 seconds" — muted_until is monotonic, used
             # for gating; muted_until_epoch_ms is wall-clock, sent to the
             # frontend so it can render a countdown against Date.now().
@@ -1706,6 +2205,10 @@ async def _deploy_live_avatar_bot(
             # playing before sending the next, so audio never overlaps.
             "chunk_events": {},
             "pending_turns": {},
+            # Bounded, sanitized timing state for the rep console and smoke
+            # tests. Values are monotonic seconds and never credentials or
+            # transcript contents.
+            "turn_timing": {},
             "intel": None,
             # Level 1: a warmed answer the agent is holding but was not invited
             # to give. Consumed by the invoke endpoint, expired by TTL.
@@ -1729,12 +2232,27 @@ async def _deploy_live_avatar_bot(
             ),
         }
 
+        # The loader itself was started before provider setup. Replace the raw
+        # task with a run-owned hydration task so completed memory is merged
+        # into preferences/role state and teardown can cancel it safely.
+        _ACTIVE_RUNS[run_id]["memory_task"] = asyncio.create_task(
+            hydrate_persistent_memory(_ACTIVE_RUNS[run_id], memory_task)
+        )
+
         # Warm the conversation-intelligence snapshot in the background. It is
         # empty for the first cycle, which simply means the earliest turns get
         # the name-only behavior until the backend has something to say.
         intel = CallIntelligence(auth_token=token)
         intel.start()
         _ACTIVE_RUNS[run_id]["intel"] = intel
+
+        # Load the user's complete permitted corpus while the avatar and
+        # Recall bot are joining. This removes the first-question cold-start
+        # penalty when the deployed RAG service supports the authenticated
+        # warm endpoint; older deployments safely fall back to lazy warming.
+        _ACTIVE_RUNS[run_id]["warm_task"] = asyncio.create_task(
+            warm_user_knowledge(token, user_id)
+        )
 
         # Only providers that actually need pinging get a task. Simli bounds the
         # session with maxIdleTime and Anam with maxSessionLengthSeconds, so for
@@ -1753,7 +2271,10 @@ async def _deploy_live_avatar_bot(
         # Cheap even if it goes to waste: if the first real question comes
         # after the 5-minute cache TTL, this was just one harmless early call.
         if client_id and token:
-            asyncio.create_task(resolve_source_ids(token, client_id))
+            _track_background_task(
+                _ACTIVE_RUNS[run_id],
+                resolve_source_ids(token, client_id),
+            )
 
         # 3. Build Output Media URL
         base_url = PUBLIC_BASE_URL.rstrip('/')
@@ -1867,9 +2388,25 @@ async def _deploy_live_avatar_bot(
                 "status": latest_status
             }
 
-    except HTTPException:
-        raise
-    except Exception as e:
+    except BaseException as e:
+        if run_id is not None and run_id in _ACTIVE_RUNS:
+            # Once registered, use the canonical teardown path so its
+            # sockets, background tasks, Recall bot, and provider session all
+            # receive the same cleanup guarantees as a normal stop.
+            await _teardown_run(run_id)
+        else:
+            # If startup failed before _ACTIVE_RUNS was populated, normal run
+            # teardown never gets a chance to cancel these resources.
+            if memory_task is not None and not memory_task.done():
+                memory_task.cancel()
+                await asyncio.gather(memory_task, return_exceptions=True)
+            if video_session is not None and provider_set is not None:
+                try:
+                    await provider_set.video.close(video_session)
+                except Exception:
+                    logger.warning("Failed to close video session after partial startup", exc_info=True)
+        if isinstance(e, (HTTPException, asyncio.CancelledError)):
+            raise
         logger.error(f"Error deploying live avatar bot: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2018,6 +2555,55 @@ async def stop_run_endpoint(run_id: str):
     return await _teardown_run(run_id)
 
 
+@app.get("/api/runs/{run_id}/diagnostics")
+async def run_diagnostics_endpoint(run_id: str):
+    """Return sanitized live diagnostics for latency and routing tuning."""
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    timing = {
+        str(turn_id): dict(values)
+        for turn_id, values in (run.get("turn_timing") or {}).items()
+    }
+    prefetches = run.get("proactive_prefetches") or {}
+    providers = run.get("providers")
+    return {
+        "run_id": run_id,
+        "state": str(run.get("state")),
+        "bot_name": run.get("bot_name"),
+        "provider": getattr(providers.video, "name", None) if providers else None,
+        "autospeak_enabled": bool(run.get("autospeak_enabled")),
+        "proactive_memory_enabled": proactive_speaking_enabled(run),
+        "active_turn_id": run.get("active_turn_id"),
+        "turn_timing": timing,
+        "live_turns": {
+            str(participant_id): {
+                "speaker": entry.get("speaker"),
+                "updated_at": entry.get("updated_at"),
+                "first_interim_at": entry.get("first_interim_at"),
+                "wake_candidate": bool(entry.get("wake_candidate")),
+                "wake_candidate_at": entry.get("wake_candidate_at"),
+                "is_final_segment": bool(entry.get("is_final_segment")),
+            }
+            for participant_id, entry in (run.get("live_turns") or {}).items()
+        },
+        "proactive_prefetches": {
+            str(participant_id): {
+                "started": True,
+                "done": bool(entry.get("task") is None or entry["task"].done()),
+            }
+            for participant_id, entry in prefetches.items()
+        },
+        "memory_task_done": bool(
+            run.get("memory_task") is None or run["memory_task"].done()
+        ),
+        "memory_item_count": len(run.get("persistent_memory") or []),
+        "warm_task_done": bool(run.get("warm_task") is None or run["warm_task"].done()),
+        "mcp_context_available": bool(run.get("active_mcp_context")),
+    }
+
+
 @app.post("/remove-bot/{bot_id}")
 @app.post("/leave-call/{bot_id}")
 async def leave_call_endpoint(bot_id: str):
@@ -2102,6 +2688,116 @@ from src.core.floor import (
     _speak_chunk,
     _speak_watchdog,
 )
+
+
+def _observe_interim_transcript(
+    run: Dict[str, Any],
+    participant_id: str,
+    participant_name: str,
+    text: str,
+    is_final_segment: bool,
+) -> None:
+    """Record live ASR without allowing an incomplete fragment to speak.
+
+    Interim text is an early signal for routing and retrieval. Only
+    `_finalize_turn` may commit a turn or dispatch speech, so a fragment such
+    as "Tom, can you..." cannot make the avatar answer prematurely.
+    """
+    clean = (text or "").strip()
+    if not clean:
+        return
+    now = time.monotonic()
+    live_turns = run.setdefault("live_turns", {})
+    previous = live_turns.get(participant_id) or {}
+    candidate = detect_invocation(clean, run.get("bot_name") or DEFAULT_BOT_NAME)
+    entry = {
+        "participant_id": participant_id,
+        "speaker": participant_name,
+        "text": clean,
+        "updated_at": now,
+        "is_final_segment": is_final_segment,
+        "wake_candidate": candidate.addressed,
+        "matched_name": candidate.matched_name,
+        "wake_candidate_at": previous.get("wake_candidate_at"),
+        "first_interim_at": previous.get("first_interim_at", now),
+    }
+    if candidate.addressed and not previous.get("wake_candidate"):
+        entry["wake_candidate_at"] = now
+        logger.info(
+            "[Live Turn] wake candidate participant=%s name=%s text=%r",
+            participant_id,
+            participant_name,
+            clean[:160],
+        )
+    live_turns[participant_id] = entry
+
+    # With an explicit proactive-speaking preference, begin the expensive
+    # knowledge/answer preparation while the participant is still talking.
+    # This never dispatches audio. The finalized turn must later confirm the
+    # same thought before the prepared answer can be considered for speech.
+    if (
+        proactive_speaking_enabled(run)
+        and not candidate.addressed
+        and len(clean.split()) >= 6
+        and detect_speak_up_preference(clean) is None
+        and not detect_role_instruction(clean)
+    ):
+        _start_proactive_interim_prefetch(run, participant_id, participant_name, clean)
+
+
+def _start_proactive_interim_prefetch(
+    run: Dict[str, Any],
+    participant_id: str,
+    participant_name: str,
+    transcript: str,
+) -> None:
+    """Warm a candidate reply from interim speech without taking the floor."""
+    prefetches = run.setdefault("proactive_prefetches", {})
+    existing = prefetches.get(participant_id)
+    if existing and not existing.get("task").done():
+        return
+
+    ctx = run.get("user_context") or {}
+    history = run.get("history") or []
+    history_text = "\n".join(
+        f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
+        for turn in history[-12:]
+    )
+    catalog = build_entity_catalog(ctx)
+    bot_name = run.get("bot_name") or DEFAULT_BOT_NAME
+
+    async def prepare() -> Optional[str]:
+        try:
+            return await _generate_grounded_reply(
+                analysis=TurnAnalysis(
+                    response_action="respond",
+                    intent="company_knowledge",
+                    resolved_query=transcript,
+                    corrections=[],
+                ),
+                transcript=transcript,
+                speaker=participant_name,
+                bot_name=bot_name,
+                company_name=ctx.get("company_name", "SpikedAI"),
+                history_text=history_text,
+                catalog=catalog,
+                auth_token=run.get("token") or "",
+                client_id=run.get("client_id"),
+                preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                intel=run.get("intel"),
+                rag_timeout_s=AGENT_RAG_PREFETCH_TIMEOUT_S,
+                kyc_id=run.get("kyc_id"),
+                run=run,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.info("[Autospeak] Interim prefetch failed", exc_info=True)
+            return None
+
+    task = asyncio.create_task(prepare())
+    prefetches[participant_id] = {"text": transcript, "task": task}
+    logger.info("[Autospeak] Started interim prefetch participant_id=%s text=%r", participant_id, transcript[:120])
 
 
 def _ingest_utterance(
@@ -2231,6 +2927,7 @@ def _consider_insight(
                 intel=run.get("intel"),
                 rag_timeout_s=AGENT_RAG_PREFETCH_TIMEOUT_S,
                 kyc_id=run.get("kyc_id"),
+                run=run,
             )
             if reply:
                 run["pending_insight"] = {
@@ -2240,7 +2937,7 @@ def _consider_insight(
                     "created_at": time.monotonic(),
                 }
                 logger.info("[Insight] Warmed reply words=%d", len(reply.split()))
-                if run.get("autospeak_enabled"):
+                if proactive_speaking_enabled(run):
                     await _consider_autospeak(run, speaker, transcript, reply, history_text)
         except asyncio.CancelledError:
             raise
@@ -2249,7 +2946,7 @@ def _consider_insight(
             # and invoking regenerates from scratch.
             logger.warning("[Insight] Prefetch failed", exc_info=True)
 
-    asyncio.create_task(prefetch())
+    _track_background_task(run, prefetch())
 
 
 async def _consider_autospeak(
@@ -2296,6 +2993,8 @@ async def _consider_autospeak(
         history_text=history_text,
         bot_name=bot_name,
         preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        meeting_instructions=format_meeting_instructions(run),
+        persistent_memory=format_persistent_memory(run),
     )
     logger.info(
         "[Autospeak] Judged run_id=%s worth_interjecting=%s confidence=%.2f reason=%r",
@@ -2343,6 +3042,7 @@ def _consider_autospeak_candidate(
     speaker: str,
     transcript: str,
     history_snapshot: List[Dict[str, str]],
+    participant_id: Optional[str] = None,
 ) -> None:
     """Level 1.5's own trigger — independent of Level 1's cue gate.
 
@@ -2369,7 +3069,7 @@ def _consider_autospeak_candidate(
     now that a miss is cheap, in exchange for never structurally missing a
     real moment the way the combined old gate did.
     """
-    if not run.get("autospeak_enabled"):
+    if not proactive_speaking_enabled(run):
         return
     if run.get("state") != AgentState.LISTENING:
         return
@@ -2395,26 +3095,48 @@ def _consider_autospeak_candidate(
 
     async def prefetch_and_judge() -> None:
         try:
-            reply = await _generate_grounded_reply(
-                analysis=TurnAnalysis(
-                    response_action="respond",
-                    intent="company_knowledge",
-                    resolved_query=transcript,
-                    corrections=[],
-                ),
-                transcript=transcript,
-                speaker=speaker,
-                bot_name=bot_name,
-                company_name=ctx.get("company_name", "SpikedAI"),
-                history_text=history_text,
-                catalog=catalog,
-                auth_token=run.get("token") or "",
-                client_id=run.get("client_id"),
-                preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-                intel=run.get("intel"),
-                rag_timeout_s=AGENT_RAG_PREFETCH_TIMEOUT_S,
-                kyc_id=run.get("kyc_id"),
+            reply: Optional[str] = None
+            pending = (
+                (run.get("proactive_prefetches") or {}).pop(participant_id, None)
+                if participant_id is not None else None
             )
+            if pending:
+                candidate_words = str(pending.get("text") or "").casefold().split()
+                final_words = transcript.casefold().split()
+                compatible = (
+                    len(candidate_words) >= 5
+                    and len(final_words) >= len(candidate_words[:5])
+                    and final_words[:5] == candidate_words[:5]
+                )
+                task = pending.get("task")
+                if compatible and task:
+                    reply = await task
+                    logger.info("[Autospeak] Reused interim prefetch participant_id=%s", participant_id)
+                elif task and not task.done():
+                    task.cancel()
+
+            if not reply:
+                reply = await _generate_grounded_reply(
+                    analysis=TurnAnalysis(
+                        response_action="respond",
+                        intent="company_knowledge",
+                        resolved_query=transcript,
+                        corrections=[],
+                    ),
+                    transcript=transcript,
+                    speaker=speaker,
+                    bot_name=bot_name,
+                    company_name=ctx.get("company_name", "SpikedAI"),
+                    history_text=history_text,
+                    catalog=catalog,
+                    auth_token=run.get("token") or "",
+                    client_id=run.get("client_id"),
+                    preferred_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                    intel=run.get("intel"),
+                    rag_timeout_s=AGENT_RAG_PREFETCH_TIMEOUT_S,
+                    kyc_id=run.get("kyc_id"),
+                    run=run,
+                )
             if not reply:
                 return
             await _consider_autospeak(run, speaker, transcript, reply, history_text)
@@ -2423,7 +3145,7 @@ def _consider_autospeak_candidate(
         except Exception:
             logger.warning("[Autospeak] Declarative prefetch failed", exc_info=True)
 
-    asyncio.create_task(prefetch_and_judge())
+    _track_background_task(run, prefetch_and_judge())
 
 
 def _finalize_turn(
@@ -2446,6 +3168,17 @@ def _finalize_turn(
             now - speech_ended_at,
             participant_id,
         )
+    live_turn = (run.get("live_turns") or {}).get(participant_id) or {}
+    first_interim_at = live_turn.get("first_interim_at")
+    wake_candidate_at = live_turn.get("wake_candidate_at")
+    if first_interim_at is not None:
+        logger.info(
+            "[TIMING] live_interim_to_finalize=%.2fs wake_to_finalize=%s participant_id=%s",
+            now - first_interim_at,
+            f"{now - wake_candidate_at:.2f}s" if wake_candidate_at is not None else "none",
+            participant_id,
+        )
+    (run.get("live_turns") or {}).pop(participant_id, None)
 
     # A mute command is checked before anything else, including while already
     # muted — re-issuing it (or a different duration) always takes effect, the
@@ -2455,6 +3188,25 @@ def _finalize_turn(
         logger.info("[Turn Gate] Detected mute command text=%r seconds=%d", transcript[:200], mute_seconds)
         _set_mute(run, mute_seconds)
         _push_heard(run, participant_name, transcript, False, "mute_command")
+        return
+
+    # Explicit behavior instructions are useful even when the participant did
+    # not say Tom's name. They change the controller, so capture them before
+    # the ordinary wake-name and mute gates. An addressed instruction continues
+    # through the normal response path so Tom can confirm it conversationally.
+    explicit_speak_up = detect_speak_up_preference(transcript)
+    explicit_role = detect_role_instruction(transcript)
+    if (
+        (explicit_speak_up is not None or explicit_role)
+        and not detect_invocation(transcript, bot_name).addressed
+    ):
+        remember_meeting_instruction(
+            run,
+            transcript,
+            speak_up=explicit_speak_up,
+            role_profile=explicit_role,
+        )
+        _push_heard(run, participant_name, transcript, False, "memory_instruction")
         return
 
     if run.get("muted_until") is not None and now < run["muted_until"]:
@@ -2496,7 +3248,9 @@ def _finalize_turn(
     _push_heard(run, participant_name, transcript, decision.should_reply, decision.reason)
     if not decision.should_reply:
         _consider_insight(run, participant_name, transcript, history_snapshot)
-        _consider_autospeak_candidate(run, participant_name, transcript, history_snapshot)
+        _consider_autospeak_candidate(
+            run, participant_name, transcript, history_snapshot, participant_id
+        )
         return
 
     allowed, governor_reason = governor.allows_reply(now)
@@ -2522,7 +3276,16 @@ def _finalize_turn(
     turn_id = run["turn_counter"]
     run["active_turn_id"] = turn_id
     run["state"] = AgentState.THINKING
-    run.setdefault("turn_timing", {})[turn_id] = {"finalized_at": now}
+    timing = run.setdefault("turn_timing", {})
+    timing[turn_id] = {
+        "finalized_at": now,
+        "first_interim_at": first_interim_at,
+        "wake_candidate_at": wake_candidate_at,
+        "participant_id": participant_id,
+    }
+    # Keep diagnostics bounded during long meetings.
+    for old_turn_id in sorted(timing)[:-50]:
+        timing.pop(old_turn_id, None)
 
     async def respond() -> None:
         try:
@@ -2587,9 +3350,10 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
                 continue
             if event_type == "avatar_speak_started":
                 run["state"] = AgentState.SPEAKING
-                timing = (run.get("turn_timing") or {}).pop(turn_id, None) if turn_id is not None else None
+                timing = (run.get("turn_timing") or {}).get(turn_id) if turn_id is not None else None
                 if timing:
                     speak_started_at = time.monotonic()
+                    timing["speak_started_at"] = speak_started_at
                     dispatched_at = timing.get("dispatched_at")
                     finalized_at = timing.get("finalized_at")
                     if dispatched_at is not None:
@@ -2608,12 +3372,18 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
                     chunk_event = (run.get("chunk_events") or {}).get(chunk_id)
                     if chunk_event is not None:
                         chunk_event.set()
+                    timing = (run.get("turn_timing") or {}).get(turn_id)
+                    if timing:
+                        timing["last_chunk_ended_at"] = time.monotonic()
                     continue
                 # Legacy single-shot dispatch: this is the whole answer, so
                 # it opens the follow-up window immediately, same as before.
                 # _dispatch_reply appended it to history right before sending,
                 # so the last bot turn there is what was just spoken.
                 history = run.get("history") or []
+                timing = (run.get("turn_timing") or {}).get(turn_id)
+                if timing:
+                    timing["ended_at"] = time.monotonic()
                 last_reply = history[-1]["text"] if history and history[-1].get("participant_id") == "bot" else ""
                 _release_floor(run, reply_text=last_reply)
                 watchdog = run.get("watchdog_task")
@@ -2741,6 +3511,9 @@ async def recall_separate_audio_endpoint(
             if event_type == "participant_events.leave":
                 transcriber = transcribers.pop(participant_id, None)
                 detectors.pop(participant_id, None)
+                proactive = (run.get("proactive_prefetches") or {}).pop(participant_id, None)
+                if proactive and proactive.get("task") and not proactive["task"].done():
+                    proactive["task"].cancel()
                 stale = run.get("pending_turns", {}).pop(participant_id, None)
                 if stale and stale.get("timer") and not stale["timer"].done():
                     stale["timer"].cancel()
@@ -2786,6 +3559,9 @@ async def recall_separate_audio_endpoint(
                     participant_name,
                     keywords,
                     lambda pid, name, utterance: _ingest_utterance(run, pid, name, utterance),
+                    lambda pid, name, text, is_final: _observe_interim_transcript(
+                        run, pid, name, text, is_final
+                    ),
                 )
                 transcribers[participant_id] = transcriber
             await transcriber.send(pcm)

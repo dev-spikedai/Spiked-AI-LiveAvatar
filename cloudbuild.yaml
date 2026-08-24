@@ -6,6 +6,17 @@ steps:
       - '-c'
       - 'pip install --quiet --no-cache-dir -r requirements-dev.txt && pytest -q'
 
+  # Do not promote an orchestrator that cannot reach its configured warm RAG
+  # service.  The health endpoint is intentionally public and read-only; the
+  # authenticated /warm route is exercised by the runtime smoke test.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        curl --fail --silent --show-error "${_RAG_BACKEND_URL}/health" | grep -q '"status":"ok"'
+
   # Build the container image
   - name: 'gcr.io/cloud-builders/docker'
     args: [
@@ -56,13 +67,20 @@ steps:
       # confirmed this deploy's key is the latter. Verify against whichever
       # region RECALL_API_KEY's Recall.ai workspace actually is before
       # trusting this value; update both together if the key ever changes.
-      - 'LIVEAVATAR_AVATAR_ID=9650a758-1085-4d49-8bf3-f347565ec229,BOT_NAME=Tom,RECALL_BASE_URL=https://us-west-2.recall.ai'
+      - 'LIVEAVATAR_AVATAR_ID=9650a758-1085-4d49-8bf3-f347565ec229,BOT_NAME=Tom,LIVEAVATAR_API_URL=https://api.liveavatar.com,LIVEAVATAR_SANDBOX=false,DEFAULT_VIDEO_PROVIDER=liveavatar,DEFAULT_ANSWER_ENGINE=spiked,GEMINI_MODEL=gemini-3.5-flash-lite,PUBLIC_BASE_URL=https://spiked-ai-liveavatar-409019309412.us-central1.run.app,RECALL_BASE_URL=https://us-west-2.recall.ai,RAG_BACKEND_URL=${_RAG_BACKEND_URL},MCP_SERVER_URL=${_MCP_SERVER_URL}'
       - '--set-secrets'
       - 'DEEPGRAM_API=projects/409019309412/secrets/DEEPGRAM_API:latest,LIVEAVATAR_API_KEY=projects/409019309412/secrets/LIVEAVATAR_API_KEY:latest,RECALL_API_KEY=projects/409019309412/secrets/RECALL_API_KEY:latest,GEMINI_API_KEY=projects/409019309412/secrets/GEMINI_API_KEY:latest,SUPABASE_KEY=projects/409019309412/secrets/SUPABASE_KEY_TRANSCRIPT:latest,SUPABASE_URL=projects/409019309412/secrets/SUPABASE_URL_TRANSCRIPT:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:$COMMIT_SHA'
   - 'gcr.io/$PROJECT_ID/spiked-ai-liveavatar:latest'
+
+# Keep these explicit even while the legacy backend remains the safe default.
+# Promotion can override them with:
+#   --substitutions=_RAG_BACKEND_URL=<warm-service-url>,_MCP_SERVER_URL=<mcp-url>
+substitutions:
+  _RAG_BACKEND_URL: 'https://feat-fastembeddings-465168042653.us-central1.run.app'
+  _MCP_SERVER_URL: ''
 
 options:
   logging: CLOUD_LOGGING_ONLY

@@ -119,7 +119,13 @@ def detect_invocation(text: str, bot_name: str) -> InvocationDecision:
     aliases = {tuple(configured_words)}
     compact_name = "".join(configured_words)
     if compact_name == "tom":
-        aliases.add(("thom",))
+        # Nova occasionally renders a vocative "Tom" as "time", "tone", or
+        # "tome". These remain start-of-turn-only aliases below so ordinary
+        # words cannot steal the floor.
+        # These are accepted only at the start of a turn, where they can read
+        # as a name being called; accepting them anywhere would make ordinary
+        # sentences containing the words claim Tom's floor.
+        aliases.update({("thom",), ("time",), ("tone",), ("tome",)})
     if compact_name == "spikedai":
         # "spike AI" is a frequent, narrow STT repair for the SpikedAI brand.
         aliases.update({("spiked", "ai"), ("spike", "ai")})
@@ -127,6 +133,21 @@ def detect_invocation(text: str, bot_name: str) -> InvocationDecision:
     normalized_text = " ".join(normalized_words(text))
     for alias in sorted(aliases, key=lambda item: (len(item), len(" ".join(item))), reverse=True):
         name = " ".join(alias)
+        if alias in {("time",), ("tone",), ("tome",)} and not re.match(
+            rf"^{re.escape(name)}(?:$|\s)", normalized_text
+        ):
+            continue
+        if alias in {("time",), ("tone",), ("tome",)}:
+            remainder = normalized_text[len(name):].lstrip()
+            if remainder and not remainder.startswith((",", "?", "!")):
+                first_word = remainder.split()[0]
+                if first_word not in {
+                    "what", "how", "why", "when", "where", "who",
+                    "can", "could", "would", "will", "should", "do",
+                    "does", "did", "please", "tell", "explain", "are",
+                    "is",
+                }:
+                    continue
         if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", normalized_text):
             return InvocationDecision(True, name, "explicit_name")
     return InvocationDecision(False)
@@ -462,6 +483,12 @@ def is_probably_incomplete(text: str) -> bool:
     clean = (text or "").strip()
     if not clean:
         return True
+    # A question ending in a pronoun/preposition is still complete: “Tom, did
+    # you catch that?” is the canonical addressed-turn shape. Treating the
+    # final word as a dangling fragment here adds the slow merge delay to a
+    # valid question and makes the avatar feel hesitant.
+    if clean.endswith("?"):
+        return False
     if clean[-1] not in ".!?":
         return True
     words = _normalize_for_match(clean).split()
