@@ -111,10 +111,16 @@ def _build_index(embeddings: np.ndarray) -> Optional[faiss.Index]:
     return index
 
 
-def _search_index(index: faiss.Index, chunks: list, query_embedding: np.ndarray, source_ids, top_k):
+def _search_index(index: faiss.Index, chunks: list, embeddings: np.ndarray, query_embedding: np.ndarray, source_ids, top_k):
     """Shared by search() and search_small(): FAISS top-k, optionally
     restricted to source_ids via an IDSelector so filtering happens inside
-    the C++ search rather than by pre-slicing the embedding matrix."""
+    the C++ search rather than by pre-slicing the embedding matrix.
+
+    Includes each hit's own precomputed embedding in the result -- the
+    cognitive pipeline's grounding check (routers/search.py's
+    _grounding_fraction) can then skip re-embedding chunk content it already
+    has a vector for. embeddings is the same bucket["embeddings"] matrix
+    _build_index was built from, so row i here lines up with chunks[i]."""
     if source_ids:
         keep = set(source_ids)
         ids = np.array([i for i, c in enumerate(chunks) if c["source_id"] in keep], dtype=np.int64)
@@ -135,6 +141,7 @@ def _search_index(index: faiss.Index, chunks: list, query_embedding: np.ndarray,
             "filename": chunks[i]["filename"],
             "content": chunks[i]["content"],
             "similarity": float(s),
+            "embedding": embeddings[i],
         }
         for s, i in zip(sims[0], idx[0])
         if i != -1  # FAISS pads short result rows with -1, not a real hit
@@ -329,7 +336,7 @@ class _WarmIndex:
             return None
         if bucket["embeddings"].size == 0:
             return []
-        return _search_index(bucket["index"], bucket["chunks"], query_embedding, source_ids, top_k)
+        return _search_index(bucket["index"], bucket["chunks"], bucket["embeddings"], query_embedding, source_ids, top_k)
 
     def _load_from_disk(self):
         if not _CACHE_PATH.exists():
@@ -448,7 +455,7 @@ class _WarmIndex:
             self.kick_off_warm_load(user_id)
         if bucket["embeddings"].size == 0:
             return []
-        return _search_index(bucket["index"], bucket["chunks"], query_embedding, source_ids, top_k)
+        return _search_index(bucket["index"], bucket["chunks"], bucket["embeddings"], query_embedding, source_ids, top_k)
 
 
 warm_index = _WarmIndex()

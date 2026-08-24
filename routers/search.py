@@ -215,6 +215,16 @@ RAG_TOP_K_HANDSFREE_LIVE = 5
 _RAG_CACHE = {}
 RAG_CACHE_TTL_SECONDS = 120
 
+# Narrower cache of just the *query embedding vector*, one layer below
+# _RAG_CACHE. _RAG_CACHE's key includes top_k, so the live call
+# (RAG_TOP_K_LIVE) and the cognitive wide-retrieve call (COGNITIVE_WIDE_TOP_K)
+# for the identical question are guaranteed misses against each other there --
+# each would otherwise pay its own e5-large-v2 CPU forward pass for the exact
+# same text. TTL only needs to bridge that live->cognitive gap within one
+# request cycle, not act as a long-lived cache.
+_QUERY_EMBEDDING_CACHE = {}
+QUERY_EMBEDDING_CACHE_TTL_SECONDS = 60
+
 
 def _normalize_question(q: str) -> str:
     return " ".join((q or "").lower().split())
@@ -224,6 +234,24 @@ def _rag_cache_key(question, user_id, source_ids, client_id, top_k, query_augmen
     sid = ",".join(sorted(source_ids)) if source_ids else ""
     raw = f"{user_id}|{client_id}|{sid}|{top_k}|{query_augment}|{_normalize_question(question)}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def _get_query_embedding(user_id: str, question: str, query_augment: str, embed_query: str):
+    """Cache just the query embedding vector so the live retrieval call and
+    the cognitive wide-retrieve call for the same question (different top_k,
+    so different _RAG_CACHE entries -- see _QUERY_EMBEDDING_CACHE above)
+    don't each pay their own embedding model call. query_augment stays in
+    the key since it changes the actual text being embedded (KYC/persona
+    steering), so a differently-augmented embedding is never served across
+    contexts."""
+    key = (user_id, _normalize_question(question), query_augment)
+    now = time.time()
+    cached = _QUERY_EMBEDDING_CACHE.get(key)
+    if cached and now - cached["ts"] < QUERY_EMBEDDING_CACHE_TTL_SECONDS:
+        return cached["embedding"]
+    embedding = await get_embeddings([embed_query])
+    _QUERY_EMBEDDING_CACHE[key] = {"embedding": embedding, "ts": now}
+    return embedding
 
 
 def _build_query_augment(settings) -> str:
@@ -338,7 +366,7 @@ async def build_rag_context(
                 return None
             return _items_to_rag(small_items, cache_key, now)
 
-    query_embedding = await get_embeddings([embed_query])
+    query_embedding = await _get_query_embedding(user_id, question, query_augment, embed_query)
 
     # Warm path: this user's chunk embeddings are hot in memory -> skip the
     # network+DB round trip entirely and do the cosine search in-process.
@@ -662,9 +690,46 @@ async def _flash_rerank(question: str, chunks: list, top_n: int) -> list:
     return chunks[:top_n]
 
 
-async def _grounding_fraction(answer: str, chunk_texts: list) -> float:
+async def _resolve_chunk_embeddings(chunk_texts: list, chunk_embeddings: list | None, expected_dim: int) -> np.ndarray:
+    """Build the chunk-side embedding matrix for _grounding_fraction, reusing
+    each precomputed vector in chunk_embeddings where valid and recomputing
+    only the rest (missing, or wrong dimensionality) in a single batched
+    get_embeddings call -- not one call per chunk."""
+    if not chunk_embeddings:
+        return np.asarray(await get_embeddings(chunk_texts), dtype=np.float32)
+
+    resolved: list = [None] * len(chunk_texts)
+    missing_idx = []
+    for i, emb in enumerate(chunk_embeddings):
+        arr = np.asarray(emb, dtype=np.float32) if emb is not None else None
+        if arr is not None and arr.ndim == 1 and arr.shape[0] == expected_dim:
+            resolved[i] = arr
+        else:
+            missing_idx.append(i)
+
+    if missing_idx:
+        fresh = np.asarray(
+            await get_embeddings([chunk_texts[i] for i in missing_idx]), dtype=np.float32
+        )
+        for pos, i in enumerate(missing_idx):
+            resolved[i] = fresh[pos] if fresh.size else np.zeros(expected_dim, dtype=np.float32)
+
+    return np.stack(resolved) if resolved else np.zeros((0, expected_dim), dtype=np.float32)
+
+
+async def _grounding_fraction(answer: str, chunk_texts: list, chunk_embeddings: list | None = None) -> float:
     """Fraction of substantive answer sentences not supported by any chunk, via
-    e5 embedding cosine. Returns 0.0 (treat as grounded) if it can't run."""
+    e5 embedding cosine. Returns 0.0 (treat as grounded) if it can't run.
+
+    chunk_embeddings, if given, are precomputed vectors (one per chunk_texts
+    entry, or None where unavailable -- e.g. the RPC-fallback retrieval path
+    doesn't return an embedding column) threaded through from retrieval, so
+    this skips re-embedding chunk content it already has a vector for.
+    A precomputed vector is only reused if its dimensionality matches the
+    sentence embeddings' -- the locked-down small-model demo path's chunks
+    carry a different (384 vs 1024) embedding space, and reusing those here
+    would silently corrupt the cosine comparison rather than just being
+    slower, so a mismatch is treated the same as "missing" and recomputed."""
     if not answer or not chunk_texts:
         return 0.0
 
@@ -676,8 +741,12 @@ async def _grounding_fraction(answer: str, chunk_texts: list) -> float:
         return 0.0
 
     sent_emb = np.asarray(await get_embeddings(sentences), dtype=np.float32)
-    chunk_emb = np.asarray(await get_embeddings(chunk_texts), dtype=np.float32)
-    if sent_emb.size == 0 or chunk_emb.size == 0:
+    if sent_emb.size == 0:
+        return 0.0
+    expected_dim = sent_emb.shape[1]
+
+    chunk_emb = await _resolve_chunk_embeddings(chunk_texts, chunk_embeddings, expected_dim)
+    if chunk_emb.size == 0:
         return 0.0
 
     # A degenerate (zero-norm) embedding normalizes to NaN/inf, which makes the
@@ -696,10 +765,12 @@ async def _grounding_fraction(answer: str, chunk_texts: list) -> float:
     return unsupported / len(sentences)
 
 
-async def _verify_and_revise(answer: str, context_text: str, reranked_texts: list) -> str:
+async def _verify_and_revise(
+    answer: str, context_text: str, reranked_texts: list, reranked_embeddings: list | None = None
+) -> str:
     """Grounding check + one conditional revise. Returns the (possibly revised)
     answer, and always falls back to the original draft on any internal failure."""
-    flagged = await _grounding_fraction(answer, reranked_texts)
+    flagged = await _grounding_fraction(answer, reranked_texts, reranked_embeddings)
     if flagged <= GROUNDING_FLAG_FRACTION:
         return answer
     logger.warning(f"[COG] {flagged:.0%} of sentences unsupported → revising")
@@ -722,11 +793,13 @@ async def _run_cognitive_pipeline(
     source_ids: list | None,
     client_id: str | None,
 ):
-    """Returns (answer, context_used, reranked_texts). Each stage degrades
-    gracefully so a generation almost always happens even if retrieval/rerank
-    fail. Verification is intentionally NOT done here (see generate_cognitive_answer)."""
+    """Returns (answer, context_used, reranked_texts, reranked_embeddings). Each
+    stage degrades gracefully so a generation almost always happens even if
+    retrieval/rerank fail. Verification is intentionally NOT done here (see
+    generate_cognitive_answer)."""
     context_text = live_context_text
     reranked_texts = None
+    reranked_embeddings = None
 
     # 1) Wide retrieve — falls back to the live context if unavailable.
     if user_id:
@@ -741,6 +814,11 @@ async def _run_cognitive_pipeline(
                 selected = await _flash_rerank(question, wide["chunks"], COGNITIVE_RERANK_TOP_K)
                 context_text = format_context(selected)
                 reranked_texts = [c.get("content") or "" for c in selected]
+                # Carried through so the grounding check below can skip
+                # re-embedding chunk content it already has a vector for
+                # (warm-index hits carry one; RPC-fallback hits don't -- see
+                # _resolve_chunk_embeddings' per-entry fallback).
+                reranked_embeddings = [c.get("embedding") for c in selected]
         except Exception as e:
             logger.warning(f"[COG] wide retrieve/rerank failed ({e}); using live context")
 
@@ -755,12 +833,14 @@ async def _run_cognitive_pipeline(
         system_prompt=build_reasoning_sales_prompt(settings),
     )
     if not answer:
-        return None, context_text, None
+        return None, context_text, None, None
 
-    return answer, context_text, reranked_texts
+    return answer, context_text, reranked_texts, reranked_embeddings
 
 
-async def _verify_and_update(cognitive_key: str, answer: str, context_text: str, reranked_texts: list):
+async def _verify_and_update(
+    cognitive_key: str, answer: str, context_text: str, reranked_texts: list, reranked_embeddings: list | None = None
+):
     """Best-effort grounding check + revise, run AFTER the answer is already
     persisted as 'done'. If it produces a revision, update the row; if it times
     out or errors (e.g. CPU-starved embeddings), the persisted draft simply
@@ -769,7 +849,7 @@ async def _verify_and_update(cognitive_key: str, answer: str, context_text: str,
         return
     try:
         revised = await asyncio.wait_for(
-            _verify_and_revise(answer, context_text, reranked_texts),
+            _verify_and_revise(answer, context_text, reranked_texts, reranked_embeddings),
             timeout=COGNITIVE_VERIFY_TIMEOUT,
         )
         if revised and revised != answer:
@@ -793,7 +873,7 @@ async def generate_cognitive_answer(
         # Generation only (wide retrieve → flash rerank → grounded generation),
         # hard-bounded. Verification is intentionally excluded from this bound so a
         # slow/uncancellable grounding pass can't discard an answer that generated.
-        response, used_context, reranked_texts = await asyncio.wait_for(
+        response, used_context, reranked_texts, reranked_embeddings = await asyncio.wait_for(
             _run_cognitive_pipeline(
                 question, context_text, settings, user_id, source_ids, client_id
             ),
@@ -809,7 +889,7 @@ async def generate_cognitive_answer(
 
         # Refine in the background; never blocks availability, never fails the answer.
         asyncio.create_task(
-            _verify_and_update(cognitive_key, response, used_context, reranked_texts)
+            _verify_and_update(cognitive_key, response, used_context, reranked_texts, reranked_embeddings)
         )
 
         # Fire-and-forget RAG classifier. Runs after the answer is cached
