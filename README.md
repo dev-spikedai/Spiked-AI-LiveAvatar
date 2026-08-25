@@ -34,7 +34,12 @@ AGENT_BARGE_IN_MS=700
 AGENT_ENDPOINTING_MS=500
 AGENT_UTTERANCE_END_MS=1000
 AGENT_MAX_REPLY_WORDS=45
+ENABLE_APP_LOGS=false
 ```
+
+Set `ENABLE_APP_LOGS=true` to create one per-meeting file under `logs/`, named
+`app-<run_id>-<timestamp>.log`. File logging is off by default; console logs
+remain enabled.
 
 `RECALL_WEBHOOK_SECRET` is recommended. Workspaces without one use a cryptographically random per-run token embedded only in Recall’s realtime endpoint URL.
 
@@ -51,6 +56,51 @@ AGENT_MAX_REPLY_WORDS=45
 ```bash
 uvicorn src.live_avatar:app --host 0.0.0.0 --port 8080 --reload
 ```
+
+## Transcript simulator
+
+Replay a multi-participant meeting through Tom's real turn gate, Gemini/RAG
+path, autospeak logic, and simulated speech transport:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\replay_meeting.py examples\meeting_scenario.json
+```
+
+Use offline mode to test the stream timing, waits, assertions, and barge-in
+behavior without calling Gemini, Supabase, or RAG:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\replay_meeting.py examples\meeting_scenario.json --offline
+```
+
+Use `--json` for machine-readable event output:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\replay_meeting.py examples\meeting_scenario.json --offline --json
+```
+
+Scenarios are ordered JSON `steps` in
+`examples/meeting_scenario.json`. A `turn` injects a participant utterance;
+`wait_for` waits for Tom's filler, answer, or interjection; `expect` asserts
+that Tom says matching text; and `barge_in` interrupts Tom mid-response. For
+example:
+
+```json
+{
+  "turn": {
+    "participant_id": "client",
+    "speaker": "Client",
+    "say": "Tom, what is the migration approach?"
+  },
+  "wait_for": [
+    { "kind": "tom_speech", "phase": "filler", "timeout_s": 30 },
+    { "kind": "tom_answer", "contains": "migration", "timeout_s": 45 }
+  ]
+}
+```
+
+See `docs/REPLAY_TESTING.md` for the complete scenario schema and barge-in
+examples. The original flat `turns` fixture format remains supported.
 
 ## Deployment
 

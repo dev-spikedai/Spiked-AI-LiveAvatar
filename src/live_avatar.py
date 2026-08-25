@@ -62,6 +62,7 @@ from src.providers import registry as provider_registry
 from src.providers.base import RunContext, TurnContext, VideoProvider, VideoSession
 
 from src.core import mcp_tools, persona, protocol, speech
+from src.core.session_logging import open_session_log
 from src.core.asr import (
     AGENT_ENDPOINTING_MS,
     AGENT_UTTERANCE_END_MS,
@@ -82,24 +83,15 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-# Setup logging: terminal keeps today's exact output, and every process start
-# (a fresh `npm start` launch, or a --reload respawn on file save) also gets
-# its own on-disk copy at logs/app.log -- opened in "w" (truncate), not
-# append or size-rotation, so each run starts a clean file instead of
-# yesterday's session still being at the top when you scroll for today's.
-_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
-_LOG_DIR.mkdir(exist_ok=True)
+# Setup logging: console output is always available. Per-meeting files are
+# opt-in via ENABLE_APP_LOGS and are opened after a run_id exists.
 _LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-_file_handler = logging.FileHandler(_LOG_DIR / "app.log", mode="w", encoding="utf-8")
-_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-_file_handler.setLevel(logging.INFO)
 
 _console_handler = logging.StreamHandler(sys.stdout)
 _console_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 _console_handler.setLevel(logging.INFO)
 
-logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler])
 logger = logging.getLogger("SpikedMeetingAgent")
 
 # Environment variables
@@ -2116,6 +2108,7 @@ async def _deploy_live_avatar_bot(
     The provider triple is per-run, not per-deploy: one service can drive a
     LiveAvatar meeting and an Anam meeting concurrently.
     """
+    session_log_handler = None
     try:
         if not RECALL_API_KEY:
             raise HTTPException(status_code=500, detail="RECALL_API_KEY is not configured")
@@ -2124,6 +2117,7 @@ async def _deploy_live_avatar_bot(
             user_id = extract_user_id_from_jwt(token)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        session_log_handler = open_session_log(run_id)
         recall_ws_token = uuid.uuid4().hex
         logger.info(
             "[RAG][START] client_id=%s frontend_source_ids=%d",
@@ -2174,6 +2168,7 @@ async def _deploy_live_avatar_bot(
         # 2. Store session credentials for Recall's avatar.html
         _ACTIVE_RUNS[run_id] = {
             "run_id": run_id,
+            "session_log_handler": session_log_handler,
             "avatar_id": avatar_id,
             "user_id": user_id,
             "client_id": client_id,
@@ -2436,6 +2431,9 @@ async def _deploy_live_avatar_bot(
                     await provider_set.video.close(video_session)
                 except Exception:
                     logger.warning("Failed to close video session after partial startup", exc_info=True)
+            if session_log_handler is not None:
+                from src.core.session_logging import close_session_log
+                close_session_log(session_log_handler)
         if isinstance(e, (HTTPException, asyncio.CancelledError)):
             raise
         logger.error(f"Error deploying live avatar bot: {e}", exc_info=True)

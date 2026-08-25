@@ -10,6 +10,7 @@ import os
 from typing import Any, Dict, Optional
 
 import httpx
+from src.core.session_logging import close_session_log
 
 logger = logging.getLogger("SpikedMeetingAgent")
 
@@ -127,6 +128,7 @@ async def _teardown_run(run_id: str) -> Dict[str, Any]:
 
     _ACTIVE_RUNS.pop(run_id, None)
     logger.info("[Teardown] Run %s released (%d still active)", run_id, len(_ACTIVE_RUNS))
+    close_session_log(run.get("session_log_handler"))
     return {
         "ok": True,
         "run_id": run_id,

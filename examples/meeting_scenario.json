@@ -1,0 +1,73 @@
+{
+  "settings": {
+    "bot_name": "Tom",
+    "autospeak_enabled": true,
+    "auto_barge_in": true,
+    "speech_scale": 0.35,
+    "client_id": "replace-with-client-id",
+    "source_ids": [],
+    "meeting_preferences": {
+      "speak_up_when_helpful": true
+    },
+    "role_profile": "solution architect",
+    "persistent_memory": []
+  },
+  "user_context": {
+    "company_name": "SpikedAI",
+    "products_services": "Amazon Bedrock, Amazon Aurora, Amazon SageMaker"
+  },
+  "steps": [
+    {
+      "turn": {
+        "participant_id": "rep",
+        "speaker": "Sai",
+        "say": "Tom, can you explain how we reduce implementation cost and migration risk?"
+      },
+      "wait_for": [
+        { "kind": "tom_speech", "phase": "filler", "timeout_s": 30 },
+        { "kind": "tom_answer", "contains": "cost", "timeout_s": 45 }
+      ]
+    },
+    {
+      "turn": {
+        "participant_id": "client",
+        "speaker": "Client",
+        "say": "We are also worried about the AWS migration timeline."
+      },
+      "wait_for": [
+        { "kind": "tom_interjection", "source": "autonomous", "contains": "", "timeout_s": 45 }
+      ]
+    },
+    {
+      "turn": {
+        "participant_id": "person-3",
+        "speaker": "Engineering",
+        "say": "Tom, which customer case study is most relevant to this migration?"
+      },
+      "wait_for": [
+        { "kind": "tom_speech", "phase": "filler", "timeout_s": 30 }
+      ]
+    },
+    {
+      "barge_in": {
+        "participant_id": "client",
+        "speaker": "Client",
+        "say": "Sorry, Tom, stop there. We need to clarify the timeline first.",
+        "after_s": 0.2
+      },
+      "expect": [
+        { "kind": "tom_interrupted", "timeout_s": 5 }
+      ]
+    },
+    {
+      "turn": {
+        "participant_id": "rep",
+        "speaker": "Sai",
+        "say": "Tom, did you catch that?"
+      },
+      "wait_for": [
+        { "kind": "tom_answer", "timeout_s": 45 }
+      ]
+    }
+  ]
+}
