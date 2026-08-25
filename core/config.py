@@ -32,7 +32,6 @@ GEMINI_FLASH_MODEL = "gemini-1.5-flash-latest"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "openai/gpt-oss-120b"
-OPENAI_CHAT_MODEL = "gpt-4o-search-preview"
 BASE_URL = os.getenv("BASE_URL", "https://spikedai-production-application-409019309412.us-central1.run.app").strip()
 CHUNK_INSERT_BATCH_SIZE = 100
 DEFAULT_TEST_USER_ID = "fd3ff615-b248-4e8f-84f1-ff458bf30d48"

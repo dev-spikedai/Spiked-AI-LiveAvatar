@@ -83,33 +83,39 @@ async def bench_gemini():
 
 
 async def bench_groq(model: str):
-    from openai import AsyncOpenAI
+    import httpx
 
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return None
-    client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
     times = []
-    for i in range(N_RUNS):
-        t0 = time.perf_counter()
-        try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "Respond only with valid JSON matching this schema: " + json.dumps(RESPONSE_SCHEMA)},
-                    {"role": "user", "content": SYNTHETIC_PROMPT},
-                ],
-                max_tokens=1024,
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            print(f"  [{model}] ERROR: {e}")
-            return None
-        elapsed = time.perf_counter() - t0
-        times.append(elapsed)
-        if i == 0:
-            print(f"  [{model} sample output] {resp.choices[0].message.content[:200]!r}")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i in range(N_RUNS):
+            t0 = time.perf_counter()
+            try:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": "Respond only with valid JSON matching this schema: " + json.dumps(RESPONSE_SCHEMA)},
+                            {"role": "user", "content": SYNTHETIC_PROMPT},
+                        ],
+                        "max_tokens": 1024,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                print(f"  [{model}] ERROR: {e}")
+                return None
+            elapsed = time.perf_counter() - t0
+            times.append(elapsed)
+            if i == 0:
+                print(f"  [{model} sample output] {content[:200]!r}")
     return times
 
 

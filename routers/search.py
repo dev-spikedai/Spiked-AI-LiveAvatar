@@ -8,11 +8,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from openai._exceptions import APIError, RateLimitError, APIConnectionError
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 
-from core.config import get_g_vars, TOP_K, BASE_URL, OPENAI_CHAT_MODEL
+from core.config import get_g_vars, TOP_K, BASE_URL
 from core.dependencies import get_user_id_from_token, get_current_user_settings
 from core.kyc_database import get_client_kyc_config, MANUAL_KYC_ID
 from core.persona_styles import render_persona, render_styles
@@ -913,21 +912,6 @@ async def generate_cognitive_answer(
         logger.error(f"Cognitive generation timeout for key {cognitive_key}", exc_info=True)
 
         await _cog_write(cognitive_key, "failed", error="timeout")
-
-    except RateLimitError as e:
-        logger.error(f"OpenAI rate limit hit for cognitive key {cognitive_key}", exc_info=True)
-
-        await _cog_write(cognitive_key, "failed", error="rate_limit")
-
-    except APIConnectionError as e:
-        logger.error(f"OpenAI connection error for cognitive key {cognitive_key}", exc_info=True)
-
-        await _cog_write(cognitive_key, "failed", error="connection_error")
-
-    except APIError as e:
-        logger.error(f"OpenAI API error for cognitive key {cognitive_key}: {e}", exc_info=True)
-
-        await _cog_write(cognitive_key, "failed", error="api_error")
 
     except Exception as e:
         logger.error(f"Unexpected cognitive generation error for key {cognitive_key}: {e}", exc_info=True)
