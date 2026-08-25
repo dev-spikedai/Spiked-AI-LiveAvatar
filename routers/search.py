@@ -21,6 +21,7 @@ from models.schemas import AskRequest, SettingsModel
 from services.ai_helpers import (
     get_embeddings,
     stream_groq_response,
+    stream_gemini_response,
     call_gemini_flash_llm
 )
 from services.rag_classifier import classify_and_log
@@ -1119,17 +1120,11 @@ async def ask_regular(
         ).encode()
     ).hexdigest()
 
-    await launch_cognitive_background(
-        cognitive_key,
-        question,
-        context_text,
-        settings,
-        endpoint="regular",
-        client_id=request.client_id,
-        meeting_log_id=None,
-        user_id=user_id,
-        source_ids=request.source_ids,
-    )
+    # launch_cognitive_background disabled: the live answer already comes from
+    # Gemini now (see stream_gemini_response), so firing this too was a second,
+    # redundant Gemini call on every request for a fallback path
+    # (AGENT_COGNITIVE_FALLBACK) that's off by default anyway. Note this also
+    # drops the classify_and_log() RAG-quality logging that rode on its output.
 
     system_prompt = build_cognitive_prompt(settings)
 
@@ -1139,7 +1134,7 @@ async def ask_regular(
     ]
 
     return StreamingResponse(
-        stream_groq_response(messages),
+        stream_gemini_response(messages),
         media_type="text/event-stream",
         headers={
             "X-Sources": sources_json,

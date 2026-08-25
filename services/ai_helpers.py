@@ -189,7 +189,7 @@ async def stream_gemini_response(messages: List[dict]) -> AsyncGenerator[str, No
 
     try:
         stream = await client.aio.models.generate_content_stream(
-            model="gemini-3-flash-preview",
+            model="gemini-3.5-flash-lite",
             contents=user_content,
             config={
                 "system_instruction": system_prompt,
