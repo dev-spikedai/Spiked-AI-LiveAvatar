@@ -55,7 +55,11 @@ def make_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "client_id": settings.get("client_id"), "source_ids": settings.get("source_ids") or [],
         "user_context": user_context, "intel": None, "floor": FloorState(),
         "echo": EchoSuppressor(similarity_threshold=0.9, tail_seconds=8),
-        "governor": SpeechGovernor(cooldown_seconds=2, max_replies_per_window=4, window_seconds=30),
+        "governor": SpeechGovernor(
+            cooldown_seconds=max(0.1, 2.0 * float(settings.get("speech_scale", 1.0))),
+            max_replies_per_window=4,
+            window_seconds=max(1.0, 30.0 * float(settings.get("speech_scale", 1.0))),
+        ),
     }
 
 
@@ -74,6 +78,8 @@ class ReplayControlWS:
             _event(self.events, "tom_interrupted", turn_id=message.get("turn_id"))
 
 
+from contextlib import asynccontextmanager
+
 def install_recorder(run: Dict[str, Any], events: List[Dict[str, Any]], speech_scale: float) -> None:
     """Replace only output transport, while retaining reasoning and RAG."""
     run["control_ws"] = ReplayControlWS(run, events)
@@ -85,7 +91,7 @@ def install_recorder(run: Dict[str, Any], events: List[Dict[str, Any]], speech_s
         phase = "filler" if chunk_id.endswith("-filler") else "answer"
         _event(events, "tom_speech", turn_id=turn_id, chunk_id=chunk_id, phase=phase, text=text)
         if phase == "answer":
-            _event(events, "tom_answer", turn_id=turn_id, source="addressed", text=text)
+            _event(events, "tom_answer_chunk", turn_id=turn_id, source="addressed", text=text)
         words = max(1, len(text.split()))
         await asyncio.sleep(max(0.05, words / 3.0 * speech_scale))
         return target_run.get("active_turn_id") == turn_id and target_run.get("state") in (AgentState.THINKING, AgentState.SPEAKING)
@@ -94,7 +100,13 @@ def install_recorder(run: Dict[str, Any], events: List[Dict[str, Any]], speech_s
         _event(events, "tom_answer", turn_id=turn_id, source=source, text=answer)
         target_run.setdefault("history", []).append({"speaker": target_run.get("bot_name", "Tom"), "participant_id": "bot", "text": answer})
         target_run["echo"].note_bot_speech(answer, time.monotonic())
-        target_run["governor"].note_reply(answer, time.monotonic())
+        # Back-date the governor timestamp by the full cooldown so the next
+        # turn sees the governor as ready immediately.  In a real call the
+        # spoken audio takes `cooldown_seconds` of wall time; in replay the
+        # speech_scale already compressed that wait, so we compensate here.
+        governor: SpeechGovernor = target_run["governor"]
+        backdated = time.monotonic() - governor.cooldown_seconds
+        governor.note_reply(answer, backdated)
         live_avatar._release_floor(target_run, reply_text=answer)
         return True
 
@@ -111,6 +123,24 @@ def install_recorder(run: Dict[str, Any], events: List[Dict[str, Any]], speech_s
     floor_module._speak_chunk = record_chunk
     live_avatar._dispatch_reply = record_dispatch
     live_avatar._take_floor_and_speak = record_autospeak
+
+
+@asynccontextmanager
+async def patch_recorder(run: Dict[str, Any], events: List[Dict[str, Any]], speech_scale: float):
+    """Context manager that installs the replay recorder and restores original module functions on exit."""
+    orig_live_speak = live_avatar._speak_chunk
+    orig_floor_speak = getattr(floor_module, "_speak_chunk", None)
+    orig_dispatch = live_avatar._dispatch_reply
+    orig_take_floor = live_avatar._take_floor_and_speak
+    try:
+        install_recorder(run, events, speech_scale)
+        yield
+    finally:
+        live_avatar._speak_chunk = orig_live_speak
+        if orig_floor_speak is not None:
+            floor_module._speak_chunk = orig_floor_speak
+        live_avatar._dispatch_reply = orig_dispatch
+        live_avatar._take_floor_and_speak = orig_take_floor
 
 
 def install_offline_brain() -> None:
@@ -133,6 +163,19 @@ def install_offline_brain() -> None:
 
     live_avatar.process_transcript_with_gemini = fake_process
     live_avatar._generate_grounded_reply = fake_grounded_reply
+
+
+@asynccontextmanager
+async def patch_offline_brain():
+    """Context manager that installs the offline brain and restores original handlers on exit."""
+    orig_process = live_avatar.process_transcript_with_gemini
+    orig_grounded = live_avatar._generate_grounded_reply
+    try:
+        install_offline_brain()
+        yield
+    finally:
+        live_avatar.process_transcript_with_gemini = orig_process
+        live_avatar._generate_grounded_reply = orig_grounded
 
 
 def normalize_steps(config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -201,12 +244,9 @@ async def do_turn(run: Dict[str, Any], events: List[Dict[str, Any]], turn: Dict[
     await settle(run)
 
 
-async def replay(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    run, events = make_run(config), []
-    settings = config.get("settings") or {}
-    install_recorder(run, events, float(settings.get("speech_scale", 1.0)))
-    if config.get("offline"):
-        install_offline_brain()
+async def _run_replay_steps(
+    run: Dict[str, Any], events: List[Dict[str, Any]], config: Dict[str, Any], settings: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     auto_barge_in, started, seen = bool(settings.get("auto_barge_in", True)), time.monotonic(), 0
     for index, step in enumerate(normalize_steps(config), start=1):
         if "sleep" in step:
@@ -236,6 +276,18 @@ async def replay(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         event.pop("at", None)
     print(f"Replay complete: {len(normalize_steps(config))} steps in {elapsed:.2f}s")
     return events
+
+
+async def replay(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    run, events = make_run(config), []
+    settings = config.get("settings") or {}
+    speech_scale = float(settings.get("speech_scale", 1.0))
+    async with patch_recorder(run, events, speech_scale):
+        if config.get("offline"):
+            async with patch_offline_brain():
+                return await _run_replay_steps(run, events, config, settings)
+        else:
+            return await _run_replay_steps(run, events, config, settings)
 
 
 def main() -> None:

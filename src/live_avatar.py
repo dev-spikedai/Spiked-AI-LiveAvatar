@@ -62,7 +62,7 @@ from src.providers import registry as provider_registry
 from src.providers.base import RunContext, TurnContext, VideoProvider, VideoSession
 
 from src.core import mcp_tools, persona, protocol, speech
-from src.core.session_logging import open_session_log
+from src.core.session_logging import open_session_log, set_current_session_id
 from src.core.asr import (
     AGENT_ENDPOINTING_MS,
     AGENT_UTTERANCE_END_MS,
@@ -2117,6 +2117,7 @@ async def _deploy_live_avatar_bot(
             user_id = extract_user_id_from_jwt(token)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        set_current_session_id(run_id)
         session_log_handler = open_session_log(run_id)
         recall_ws_token = uuid.uuid4().hex
         logger.info(

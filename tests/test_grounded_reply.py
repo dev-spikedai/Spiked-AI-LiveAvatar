@@ -450,8 +450,15 @@ class RecordingWS:
 def _insight_fired(run, text):
     console = next(iter(run["rep_sockets"]))
     async def drive():
-        live_avatar._consider_insight(run, "Lisa", text, [])
-        await asyncio.sleep(0)
+        orig_query = live_avatar.query_spiked_rag
+        async def fake_rag(*args, **kwargs):
+            return "Grounded insight reply."
+        live_avatar.query_spiked_rag = fake_rag
+        try:
+            live_avatar._consider_insight(run, "Lisa", text, [])
+            await asyncio.sleep(0)
+        finally:
+            live_avatar.query_spiked_rag = orig_query
 
     asyncio.run(drive())
     return any(m.get("type") == "insight_available" for m in console.sent)
