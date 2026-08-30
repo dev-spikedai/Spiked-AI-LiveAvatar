@@ -145,15 +145,13 @@ def test_speaks_when_judged_worthy_and_confident(monkeypatch):
 
     assert len(calls) == 1
     question, speaker, kwargs = calls[0]
-    assert question == "Hey, can I hop in on that?"
+    assert question == "the transcript"
     assert speaker == "Lisa"
-    assert kwargs["warm_reply"] == "Hey, can I hop in on that?"
-    assert kwargs["source"] == "autonomous_offer"
+    assert kwargs["warm_reply"] == "warmed reply"
+    assert kwargs["source"] == "autonomous"
     assert run["autospeak_count"] == 1
     assert run["last_autospeak_at"] is not None
     assert run["pending_insight"] is None
-    assert run["pending_floor_offer"]["question"] == "the transcript"
-    assert run["pending_floor_offer"]["reply"] == "warmed reply"
     reasoning = [m for m in next(iter(run["rep_sockets"])).sent if m["type"] == "autospeak_reasoning"]
     assert len(reasoning) == 1
     assert reasoning[0]["worth_interjecting"] is True
@@ -180,16 +178,8 @@ def test_explicit_speak_up_preference_overrides_discretionary_judge(monkeypatch)
         run, "Lisa", "the transcript", "warmed reply", "history"
     ))
 
-    assert calls and calls[0][0] == "Hey, can I hop in on that?"
+    assert calls and calls[0][0] == "the transcript"
     assert run["autospeak_count"] == 1
-    assert run["pending_floor_offer"]["reply"] == "warmed reply"
-
-
-def test_permission_detector_requires_explicit_agreement():
-    assert live_avatar._explicit_floor_permission("Yes, go ahead") is True
-    assert live_avatar._explicit_floor_permission("That would be helpful") is True
-    assert live_avatar._explicit_floor_permission("Understood") is False
-    assert live_avatar._explicit_floor_permission("Sure, continuing with the agenda") is True
 
 
 def test_stays_silent_when_judged_not_worthy(monkeypatch):

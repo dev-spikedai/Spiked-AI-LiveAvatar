@@ -79,7 +79,7 @@ images:
 # Promotion can override them with:
 #   --substitutions=_RAG_BACKEND_URL=<warm-service-url>,_MCP_SERVER_URL=<mcp-url>
 substitutions:
-  _RAG_BACKEND_URL: 'https://feat-fastembeddings-465168042653.us-central1.run.app'
+  _RAG_BACKEND_URL: 'https://feat-fastembeddings-cowwwkwqaq-uc.a.run.app'
   _MCP_SERVER_URL: ''
 
 options:

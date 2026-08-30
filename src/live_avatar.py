@@ -997,24 +997,6 @@ def proactive_speaking_enabled(run: Optional[Dict[str, Any]]) -> bool:
     return bool(run.get("autospeak_enabled") or prefs.get("speak_up_when_helpful") is True)
 
 
-def _explicit_floor_permission(text: str) -> bool:
-    """Recognize a clear acceptance of Tom's request to join the discussion.
-
-    This intentionally does not treat a generic acknowledgement ("understood",
-    "right", or "okay") as permission. The offer is a social turn, so only an
-    unambiguous yes/please-go-ahead style response should release the held answer.
-    """
-    clean = re.sub(r"[^a-z0-9']+", " ", (text or "").casefold()).strip()
-    if not clean:
-        return False
-    return bool(re.search(
-        r"^(?:yes|yeah|yep|sure|absolutely|please do|go ahead|"
-        r"you can|that(?:'s| is) helpful|that would be helpful|"
-        r"yes tom|sure tom|go ahead tom)(?:\s|$)",
-        clean,
-    ))
-
-
 async def _send_join_greeting(run: Dict[str, Any], websocket: WebSocket) -> None:
     """Give Tom one natural opening line after the avatar output is ready."""
     try:
@@ -2292,9 +2274,6 @@ async def _deploy_live_avatar_bot(
             # Level 1: a warmed answer the agent is holding but was not invited
             # to give. Consumed by the invoke endpoint, expired by TTL.
             "pending_insight": None,
-            # A proactive contribution is announced first and held until a
-            # participant explicitly gives Tom the floor.
-            "pending_floor_offer": None,
             "greeting_sent": False,
             "last_insight_at": None,
             # Level 1.5: opt-in per run (see CreateBotWithLiveAvatarRequest).
@@ -3120,8 +3099,8 @@ async def _consider_autospeak(
     warmed_reply: str,
     history_text: str,
 ) -> None:
-    """Level 1.5: decide whether to auto-accept the Level 1 insight just
-    warmed above, i.e. take the floor unprompted instead of only cueing.
+    """Level 1.5: take the floor for a useful room turn unless the social judge
+    gives Tom a concrete reason to stay silent.
 
     Only ever called for a run that opted in (autospeak_enabled) and only
     after the Level 1 heuristic + a successful RAG warm already passed —
@@ -3195,54 +3174,22 @@ async def _consider_autospeak(
         logger.info("[Autospeak] Skipped run_id=%s reason=governor_after_judgment:%s", run_id, governor_reason)
         return
 
-    # Human conversation rule: Tom does not answer the room's question over
-    # everybody's heads. He asks to join, then holds the grounded answer until
-    # a participant explicitly gives him the floor.
     run["autospeak_count"] = run.get("autospeak_count", 0) + 1
     run["last_autospeak_at"] = time.monotonic()
-    run["pending_floor_offer"] = {
-        "speaker": speaker,
-        "question": transcript,
-        "reply": warmed_reply,
-        "created_at": time.monotonic(),
-    }
     run["pending_insight"] = None
-    offer = "Hey, can I hop in on that?"
 
     logger.info(
-        "[Autospeak] Asking for floor speaker=%s confidence=%.2f reason=%r",
-        speaker, judgment.confidence, judgment.reason,
+        "[Autospeak] Taking floor speaker=%s confidence=%.2f reason=%r count=%d",
+        speaker, judgment.confidence, judgment.reason, run["autospeak_count"],
     )
     try:
         await _take_floor_and_speak(
-            run, offer, speaker, coaching=False, warm_reply=offer, source="autonomous_offer",
+            run, transcript, speaker, coaching=False, warm_reply=warmed_reply, source="autonomous",
         )
     except FloorUnavailable:
         # Lost the floor between the recheck above and here (no await in
         # between today, but this keeps the function honest if that changes).
         logger.info("[Autospeak] Floor unavailable at the last moment; staying silent")
-
-
-async def _accept_floor_offer(run: Dict[str, Any], speaker: str) -> None:
-    """Deliver the answer held behind Tom's explicit permission request."""
-    offer = run.get("pending_floor_offer") or {}
-    run["pending_floor_offer"] = None
-    if not offer:
-        return
-    now = time.monotonic()
-    if now - offer.get("created_at", 0) > AGENT_INSIGHT_TTL_S:
-        logger.info("[Autospeak] Permission arrived after offer expired")
-        return
-    try:
-        await _take_floor_and_speak(
-            run,
-            offer.get("question") or "the question just raised",
-            offer.get("speaker") or speaker,
-            warm_reply=offer.get("reply"),
-            source="autonomous_approved",
-        )
-    except FloorUnavailable:
-        logger.info("[Autospeak] Permission accepted but floor was unavailable")
 
 
 def _consider_autospeak_candidate(
@@ -3442,17 +3389,6 @@ def _finalize_turn(
     history_snapshot = list(history[-20:])
     history.append({"speaker": participant_name, "participant_id": participant_id, "text": transcript})
     del history[:-40]
-
-    # A pending offer is a one-turn social handshake. An explicit acceptance
-    # releases the already-grounded answer; any other room turn means the
-    # conversation moved on, so Tom drops the offer and stays quiet.
-    if run.get("pending_floor_offer"):
-        if _explicit_floor_permission(transcript):
-            _push_heard(run, participant_name, transcript, False, "accepted_floor_offer")
-            _track_background_task(run, _accept_floor_offer(run, participant_name))
-            return
-        run["pending_floor_offer"] = None
-        logger.info("[Autospeak] Floor offer abandoned because the room moved on")
 
     logger.info(
         "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s reply=%s reason=%s matched_name=%s text=%r",
