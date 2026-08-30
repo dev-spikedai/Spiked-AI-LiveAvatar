@@ -2801,6 +2801,71 @@ def _start_proactive_interim_prefetch(
         f"{turn.get('speaker', 'Participant')}: {turn.get('text', '')}"
         for turn in history[-12:]
     )
+
+
+class ScreenShareRequest(BaseModel):
+    """A fixed demo selection; callers never provide an arbitrary URL."""
+    demo_key: Literal["livenote", "platform", "intelligence"]
+    duration_seconds: int = Field(default=120, ge=10, le=900)
+
+
+SCREEN_SHARE_DEMOS = {
+    "livenote": ("LiveNote", "/videos/video1.mp4"),
+    "platform": ("SpikedAI platform", "/videos/video2.mp4"),
+    "intelligence": ("Conversation intelligence", "/videos/video3.mp4"),
+}
+
+
+def _screen_share_command(text: str) -> Optional[str]:
+    clean = (text or "").casefold()
+    if not any(word in clean for word in ("show", "share", "bring up", "pull up", "play")):
+        return None
+    if any(word in clean for word in ("livenote", "livenot", "live note", "live notes")):
+        return "livenote"
+    if "conversation intelligence" in clean:
+        return "intelligence"
+    if "platform" in clean or "overview" in clean:
+        return "platform"
+    return None
+
+
+async def _start_screen_share(run: Dict[str, Any], payload: ScreenShareRequest) -> None:
+    """Tell the Recall webpage output to play one approved demo clip."""
+    control_ws = run.get("control_ws")
+    if not control_ws:
+        raise HTTPException(status_code=409, detail="Avatar output page is not connected")
+    base_url = os.getenv("SCREEN_SHARE_ASSET_BASE_URL", "").strip().rstrip("/")
+    if not base_url.startswith("https://"):
+        raise HTTPException(status_code=503, detail="Screen-share asset origin is not configured")
+    title, path = SCREEN_SHARE_DEMOS[payload.demo_key]
+    previous = run.get("screen_share_task")
+    if previous and not previous.done():
+        previous.cancel()
+    await control_ws.send_json(protocol.screen_share(f"{base_url}{path}", title, payload.duration_seconds))
+    run["active_screen_share"] = {"demo_key": payload.demo_key, "title": title, "duration_seconds": payload.duration_seconds}
+
+    async def expire() -> None:
+        try:
+            await asyncio.sleep(payload.duration_seconds)
+            if run.get("control_ws") is control_ws:
+                await control_ws.send_json(protocol.screen_share("", "", 0))
+            run["active_screen_share"] = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("[Screen share] Failed to restore avatar output", exc_info=True)
+
+    run["screen_share_task"] = _track_background_task(run, expire())
+
+
+@app.post("/api/runs/{run_id}/screen-share")
+async def screen_share_endpoint(run_id: str, payload: ScreenShareRequest):
+    """Start a safe, time-boxed demo clip in the meeting's avatar output."""
+    run = _ACTIVE_RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Unknown run")
+    await _start_screen_share(run, payload)
+    return {"shared": True, "demo_key": payload.demo_key, "duration_seconds": payload.duration_seconds}
     catalog = build_entity_catalog(ctx)
     bot_name = run.get("bot_name") or DEFAULT_BOT_NAME
 
@@ -3339,6 +3404,12 @@ def _finalize_turn(
 
     async def respond() -> None:
         try:
+            demo_key = _screen_share_command(transcript)
+            if demo_key:
+                try:
+                    await _start_screen_share(run, ScreenShareRequest(demo_key=demo_key))
+                except HTTPException as exc:
+                    logger.info("[Screen share] Command ignored: %s", exc.detail)
             answer = await process_transcript_with_gemini(
                 transcript=transcript,
                 speaker=participant_name,

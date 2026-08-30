@@ -26,6 +26,7 @@ Only the control socket is part of the provider contract.
 | `heard` | `speaker`, `text`, `reply`, `reason` | Gate verdict for the in-meeting overlay. In avatar mode this is the only path a transcript reaches any frontend. |
 | `agent_muted` | `muted_until_epoch_ms`, `seconds` | Epoch deadline, not a duration: the page renders a countdown and a duration would drift by the message's flight time. |
 | `agent_unmuted` | `reason` | |
+| `screen_share` | `video_url`, `title`, `duration_seconds` | The page temporarily replaces the avatar feed with an approved demo clip. An empty `video_url` restores the avatar. |
 
 `agent_muted`/`agent_unmuted` go to the control socket as well as the rep
 console because the mute countdown is drawn on the meeting video feed, which

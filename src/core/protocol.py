@@ -24,6 +24,7 @@ CONTROL_AVATAR_USER_MESSAGE = "avatar_user_message"
 CONTROL_HEARD = "heard"
 CONTROL_AGENT_MUTED = "agent_muted"
 CONTROL_AGENT_UNMUTED = "agent_unmuted"
+CONTROL_SCREEN_SHARE = "screen_share"
 
 # Page -> backend
 CONTROL_AVATAR_SPEAK_STARTED = "avatar_speak_started"
@@ -68,3 +69,12 @@ def avatar_speak_end(turn_id: int, chunk_id: Optional[str] = None) -> Dict[str, 
 
 def avatar_user_message(text: str, turn_id: int) -> Dict[str, Any]:
     return {"type": CONTROL_AVATAR_USER_MESSAGE, "text": text, "turn_id": turn_id}
+
+
+def screen_share(video_url: str, title: str, duration_seconds: int) -> Dict[str, Any]:
+    return {
+        "type": CONTROL_SCREEN_SHARE,
+        "video_url": video_url,
+        "title": title,
+        "duration_seconds": duration_seconds,
+    }

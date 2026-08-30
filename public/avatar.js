@@ -19,6 +19,39 @@ const PROTOCOL_VERSION = 1;
   const statusDot = document.getElementById("status-dot");
   const statusText = document.getElementById("status-text");
   const videoEl = document.getElementById("avatar-video");
+  const screenShareEl = document.getElementById("screen-share-video");
+  const screenShareLabel = document.getElementById("screen-share-label");
+  let screenShareActive = false;
+
+  function stopScreenShare() {
+    screenShareActive = false;
+    screenShareEl.pause();
+    screenShareEl.removeAttribute("src");
+    screenShareEl.load();
+    screenShareEl.style.display = "none";
+    screenShareLabel.style.display = "none";
+    videoEl.style.display = "block";
+    updateStatus("Listening...", "active");
+  }
+
+  function startScreenShare(data) {
+    if (!data?.video_url) {
+      stopScreenShare();
+      return;
+    }
+    screenShareActive = true;
+    videoEl.style.display = "none";
+    screenShareEl.src = data.video_url;
+    screenShareLabel.textContent = `Sharing: ${data.title || "Demo"}`;
+    screenShareLabel.style.display = "block";
+    screenShareEl.style.display = "block";
+    updateStatus("Sharing demo", "active");
+    screenShareEl.play().catch((err) => console.warn("[Screen share] playback blocked:", err));
+    screenShareEl.onended = stopScreenShare;
+    if (Number.isFinite(Number(data.duration_seconds)) && Number(data.duration_seconds) > 0) {
+      setTimeout(() => { if (screenShareActive) stopScreenShare(); }, Number(data.duration_seconds) * 1000);
+    }
+  }
 
   function updateStatus(text, state = "pending") {
     statusText.textContent = text;
@@ -177,6 +210,9 @@ const PROTOCOL_VERSION = 1;
 
       try {
         switch (data.type) {
+          case "screen_share":
+            startScreenShare(data);
+            break;
           case "heard":
             renderHeard(data);
             break;
