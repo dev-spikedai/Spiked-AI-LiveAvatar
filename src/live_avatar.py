@@ -360,8 +360,9 @@ class CreateBotWithLiveAvatarRequest(BaseModel):
     source_ids: Optional[List[str]] = Field(default=None, description="Verified document source IDs for scoped RAG")
     kyc_id: Optional[str] = Field(default=None, description="Active KYC overlay for buyer-aware answers; backend falls back to the manual overlay when absent")
     bot_name: str = Field(default=DEFAULT_BOT_NAME, description="Name of the bot in the meeting")
+    meeting_context: Optional[str] = Field(default=None, description="Optional purpose and behavior brief for this meeting, such as a product demo")
     avatar_id: Optional[str] = Field(default=None, description="Specific LiveAvatar avatar ID")
-    autospeak_enabled: bool = Field(default=False, description="Level 1.5: let the agent take the floor unprompted for high-value moments, capped per run")
+    autospeak_enabled: bool = Field(default=False, description="Let the agent participate proactively when useful, with permission and hard rate limits")
     video_provider: Optional[str] = Field(default=None, description="Face: liveavatar | anam | simli")
     tts_provider: Optional[str] = Field(default=None, description="Voice; required only for video providers that just lip-sync")
     answer_engine: Optional[str] = Field(default=None, description="Brain: spiked | anam_native")
@@ -975,6 +976,8 @@ def format_meeting_instructions(run: Optional[Dict[str, Any]]) -> str:
         return ""
     prefs = run.get("meeting_preferences") or {}
     lines: List[str] = []
+    if run.get("meeting_context"):
+        lines.append(f"Meeting purpose and context: {run['meeting_context']}")
     if prefs.get("speak_up_when_helpful") is True:
         lines.append("The user explicitly prefers Tom to speak up when he can materially help.")
     elif prefs.get("speak_up_when_helpful") is False:
@@ -987,11 +990,55 @@ def format_meeting_instructions(run: Optional[Dict[str, Any]]) -> str:
 
 
 def proactive_speaking_enabled(run: Optional[Dict[str, Any]]) -> bool:
-    """Explicit meeting preference can opt into the autonomous path."""
+    """Whether the human-participation path is enabled for this meeting."""
     if not run:
         return False
     prefs = run.get("meeting_preferences") or {}
     return bool(run.get("autospeak_enabled") or prefs.get("speak_up_when_helpful") is True)
+
+
+def _explicit_floor_permission(text: str) -> bool:
+    """Recognize a clear acceptance of Tom's request to join the discussion.
+
+    This intentionally does not treat a generic acknowledgement ("understood",
+    "right", or "okay") as permission. The offer is a social turn, so only an
+    unambiguous yes/please-go-ahead style response should release the held answer.
+    """
+    clean = re.sub(r"[^a-z0-9']+", " ", (text or "").casefold()).strip()
+    if not clean:
+        return False
+    return bool(re.search(
+        r"^(?:yes|yeah|yep|sure|absolutely|please do|go ahead|"
+        r"you can|that(?:'s| is) helpful|that would be helpful|"
+        r"yes tom|sure tom|go ahead tom)(?:\s|$)",
+        clean,
+    ))
+
+
+async def _send_join_greeting(run: Dict[str, Any], websocket: WebSocket) -> None:
+    """Give Tom one natural opening line after the avatar output is ready."""
+    try:
+        # The control socket opens before the provider has finished rendering;
+        # a short delay avoids racing the browser's provider connection.
+        await asyncio.sleep(1.5)
+        if run.get("control_ws") is not websocket or run.get("greeting_sent"):
+            return
+        if run.get("state") != AgentState.LISTENING:
+            return
+        run["greeting_sent"] = True
+        await _take_floor_and_speak(
+            run,
+            "joining the meeting",
+            "the meeting",
+            warm_reply="Hey everyone, I’m Tom. I’ll listen in and jump in when I can add something useful.",
+            source="greeting",
+        )
+    except asyncio.CancelledError:
+        raise
+    except FloorUnavailable:
+        logger.info("[Greeting] Avatar was not ready to speak; staying silent")
+    except Exception:
+        logger.warning("[Greeting] Failed to greet run=%s", run.get("run_id"), exc_info=True)
 
 
 async def hydrate_persistent_memory(
@@ -2096,6 +2143,7 @@ async def _deploy_live_avatar_bot(
     source_ids: Optional[List[str]] = None,
     kyc_id: Optional[str] = None,
     bot_name: str = DEFAULT_BOT_NAME,
+    meeting_context: Optional[str] = None,
     avatar_id: Optional[str] = None,
     autospeak_enabled: bool = False,
     video_provider: Optional[str] = None,
@@ -2117,6 +2165,9 @@ async def _deploy_live_avatar_bot(
             user_id = extract_user_id_from_jwt(token)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        clean_meeting_context = re.sub(r"\s+", " ", meeting_context or "").strip()
+        if len(clean_meeting_context) > 2000:
+            clean_meeting_context = clean_meeting_context[:2000].rstrip()
         set_current_session_id(run_id)
         session_log_handler = open_session_log(run_id)
         recall_ws_token = uuid.uuid4().hex
@@ -2188,6 +2239,7 @@ async def _deploy_live_avatar_bot(
             "providers": provider_set,
             "video_session": video_session,
             "bot_name": bot_name,
+            "meeting_context": clean_meeting_context,
             "recall_ws_token": recall_ws_token,
             "state": AgentState.LISTENING,
             "history": [],
@@ -2240,6 +2292,10 @@ async def _deploy_live_avatar_bot(
             # Level 1: a warmed answer the agent is holding but was not invited
             # to give. Consumed by the invoke endpoint, expired by TTL.
             "pending_insight": None,
+            # A proactive contribution is announced first and held until a
+            # participant explicitly gives Tom the floor.
+            "pending_floor_offer": None,
+            "greeting_sent": False,
             "last_insight_at": None,
             # Level 1.5: opt-in per run (see CreateBotWithLiveAvatarRequest).
             # Off by default — the agent taking the floor with no human in the
@@ -2458,6 +2514,7 @@ async def start_bot_endpoint(
         client_id = None
         kyc_id = None
         bot_name = DEFAULT_BOT_NAME
+        meeting_context = None
         avatar_id = None
         autospeak_enabled = False
         video_provider = None
@@ -2472,6 +2529,7 @@ async def start_bot_endpoint(
             source_ids = body.get("source_ids")
             kyc_id = body.get("kyc_id")
             bot_name = body.get("bot_name", DEFAULT_BOT_NAME)
+            meeting_context = body.get("meeting_context")
             avatar_id = body.get("avatar_id")
             autospeak_enabled = bool(body.get("autospeak_enabled", False))
             video_provider = body.get("video_provider")
@@ -2490,6 +2548,7 @@ async def start_bot_endpoint(
                 source_ids = [item.strip() for item in str(raw_source_ids).split(",") if item.strip()]
             kyc_id = form.get("kyc_id")
             bot_name = form.get("bot_name", DEFAULT_BOT_NAME)
+            meeting_context = form.get("meeting_context")
             avatar_id = form.get("avatar_id")
             autospeak_enabled = str(form.get("autospeak_enabled", "")).strip().lower() in ("true", "1", "on")
             video_provider = form.get("video_provider")
@@ -2508,6 +2567,7 @@ async def start_bot_endpoint(
             source_ids=source_ids,
             kyc_id=kyc_id,
             bot_name=bot_name,
+            meeting_context=meeting_context,
             avatar_id=avatar_id,
             autospeak_enabled=autospeak_enabled,
             video_provider=video_provider,
@@ -2541,6 +2601,7 @@ async def create_live_avatar_bot(
         source_ids=payload.source_ids,
         kyc_id=payload.kyc_id,
         bot_name=payload.bot_name,
+        meeting_context=payload.meeting_context,
         avatar_id=payload.avatar_id,
         autospeak_enabled=payload.autospeak_enabled,
         video_provider=payload.video_provider,
@@ -3134,22 +3195,54 @@ async def _consider_autospeak(
         logger.info("[Autospeak] Skipped run_id=%s reason=governor_after_judgment:%s", run_id, governor_reason)
         return
 
+    # Human conversation rule: Tom does not answer the room's question over
+    # everybody's heads. He asks to join, then holds the grounded answer until
+    # a participant explicitly gives him the floor.
     run["autospeak_count"] = run.get("autospeak_count", 0) + 1
     run["last_autospeak_at"] = time.monotonic()
-    run["pending_insight"] = None  # being spoken now, not offered
+    run["pending_floor_offer"] = {
+        "speaker": speaker,
+        "question": transcript,
+        "reply": warmed_reply,
+        "created_at": time.monotonic(),
+    }
+    run["pending_insight"] = None
+    offer = "Hey, can I hop in on that?"
 
     logger.info(
-        "[Autospeak] Taking floor speaker=%s confidence=%.2f reason=%r count=%d",
-        speaker, judgment.confidence, judgment.reason, run["autospeak_count"],
+        "[Autospeak] Asking for floor speaker=%s confidence=%.2f reason=%r",
+        speaker, judgment.confidence, judgment.reason,
     )
     try:
         await _take_floor_and_speak(
-            run, transcript, speaker, coaching=False, warm_reply=warmed_reply, source="autonomous",
+            run, offer, speaker, coaching=False, warm_reply=offer, source="autonomous_offer",
         )
     except FloorUnavailable:
         # Lost the floor between the recheck above and here (no await in
         # between today, but this keeps the function honest if that changes).
         logger.info("[Autospeak] Floor unavailable at the last moment; staying silent")
+
+
+async def _accept_floor_offer(run: Dict[str, Any], speaker: str) -> None:
+    """Deliver the answer held behind Tom's explicit permission request."""
+    offer = run.get("pending_floor_offer") or {}
+    run["pending_floor_offer"] = None
+    if not offer:
+        return
+    now = time.monotonic()
+    if now - offer.get("created_at", 0) > AGENT_INSIGHT_TTL_S:
+        logger.info("[Autospeak] Permission arrived after offer expired")
+        return
+    try:
+        await _take_floor_and_speak(
+            run,
+            offer.get("question") or "the question just raised",
+            offer.get("speaker") or speaker,
+            warm_reply=offer.get("reply"),
+            source="autonomous_approved",
+        )
+    except FloorUnavailable:
+        logger.info("[Autospeak] Permission accepted but floor was unavailable")
 
 
 def _consider_autospeak_candidate(
@@ -3350,6 +3443,17 @@ def _finalize_turn(
     history.append({"speaker": participant_name, "participant_id": participant_id, "text": transcript})
     del history[:-40]
 
+    # A pending offer is a one-turn social handshake. An explicit acceptance
+    # releases the already-grounded answer; any other room turn means the
+    # conversation moved on, so Tom drops the offer and stays quiet.
+    if run.get("pending_floor_offer"):
+        if _explicit_floor_permission(transcript):
+            _push_heard(run, participant_name, transcript, False, "accepted_floor_offer")
+            _track_background_task(run, _accept_floor_offer(run, participant_name))
+            return
+        run["pending_floor_offer"] = None
+        logger.info("[Autospeak] Floor offer abandoned because the room moved on")
+
     logger.info(
         "[Turn Gate] participant_id=%s participant_name=%s bot_name=%s reply=%s reason=%s matched_name=%s text=%r",
         participant_id,
@@ -3462,6 +3566,8 @@ async def avatar_control_endpoint(websocket: WebSocket, run_id: str):
     await websocket.accept()
     run["control_ws"] = websocket
     logger.info("[Control WS] Avatar connected run_id=%s", run_id)
+    if proactive_speaking_enabled(run) and not run.get("greeting_sent"):
+        _track_background_task(run, _send_join_greeting(run, websocket))
     try:
         while True:
             event = await websocket.receive_json()
